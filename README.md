@@ -1,4 +1,4 @@
-# Synapse Context Compiler (SCC)
+# Synapse Context Compiler
 
 A Go binary that acts as a reverse proxy between AI clients (Cline, Ollama, any OpenAI-compatible tool) and upstream models. It intercepts API calls, scores and prunes conversation history using a 4-factor model, and returns a compiled, token-budgeted context to the model instead of the raw noisy history.
 
