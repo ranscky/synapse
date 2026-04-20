@@ -1,0 +1,118 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/yourhandle/synapse/schemas/memory-trace.schema.json",
+  "title": "Synapse Memory Trace",
+  "description": "Schema for Synapse Context Compiler memory trace output",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema version"
+    },
+    "sessionId": {
+      "type": "string",
+      "description": "Unique session identifier"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of trace creation"
+    },
+    "inputContext": {
+      "type": "object",
+      "description": "Original context before compilation",
+      "properties": {
+        "messages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              }
+            },
+            "required": ["role", "content"]
+          }
+        },
+        "tokenCount": {
+          "type": "integer",
+          "description": "Total tokens in input context"
+        }
+      },
+      "required": ["messages", "tokenCount"]
+    },
+    "compiledContext": {
+      "type": "object",
+      "description": "Compiled context after 4-factor scoring",
+      "properties": {
+        "messages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              }
+            },
+            "required": ["role", "content"]
+          }
+        },
+        "tokenCount": {
+          "type": "integer",
+          "description": "Total tokens in compiled context"
+        }
+      },
+      "required": ["messages", "tokenCount"]
+    },
+    "scoring": {
+      "type": "object",
+      "description": "Scoring breakdown for selected memories",
+      "properties": {
+        "memories": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "scores": {
+                "type": "object",
+                "properties": {
+                  "semanticSimilarity": {
+                    "type": "number"
+                  },
+                  "recency": {
+                    "type": "number"
+                  },
+                  "importance": {
+                    "type": "number"
+                  },
+                  "taskAlignment": {
+                    "type": "number"
+                  },
+                  "finalScore": {
+                    "type": "number"
+                  }
+                },
+                "required": ["semanticSimilarity", "recency", "importance", "taskAlignment", "finalScore"]
+              }
+            },
+            "required": ["id", "content", "scores"]
+          }
+        }
+      },
+      "required": ["memories"]
+    }
+  },
+  "required": ["version", "sessionId", "timestamp", "inputContext", "compiledContext", "scoring"]
+}

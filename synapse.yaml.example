@@ -1,14 +1,26 @@
 # Synapse Context Compiler Configuration Example
 # Copy this to synapse.yaml and modify as needed
 
-proxy:
-  bind-address: "127.0.0.1:8080"  # Default bind address
+# Required: Upstream model server URL (must start with http:// or https://)
+upstream-url: "http://localhost:11434"
 
-embedder:
-  type: "onnx"                    # "onnx", "openai", or "hash"
-  onnx-model-path: "./models/all-MiniLM-L6-v2.onnx"
-  openai-api-key: ""             # Required if using OpenAI
-  openai-model: "text-embedding-3-small"
+# Listen address for the proxy (must default to 127.0.0.1 for security)
+listen-addr: "127.0.0.1:8080"
 
-store:
-  db-path: "~/.synapse/memories.db"  # Path to SQLite database file
+# Maximum tokens in compiled context
+token-budget: 3000
+
+# Embedding backend: "onnx" or "openai"
+embedder-type: "onnx"
+
+# OpenAI API key (can also be set via OPENAI_API_KEY environment variable)
+openai-api-key: ""
+
+# Weights for the 4-factor scoring model
+weight-semantic-similarity: 0.4
+weight-recency: 0.2
+weight-importance: 0.2
+weight-task-alignment: 0.2
+
+# Logging level: debug, info, warn, error
+log-level: "info"

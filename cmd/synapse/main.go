@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,14 +16,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"gopkg.in/yaml.v3"
 	"synapse/internal/config"
-	"synapse/internal/embedder"
 	"synapse/internal/proxy"
-	"synapse/internal/store"
 )
 
 var (
 	configPath = flag.String("config", "synapse.yaml", "Path to configuration file")
-	targetURL  = flag.String("target", "http://localhost:3000", "Target upstream server URL")
+	upstream   = flag.String("upstream", "", "Override upstream URL")
+	port       = flag.String("port", "", "Override port")
 )
 
 func main() {
@@ -34,42 +35,55 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Override with flags if provided
+	if *upstream != "" {
+		cfg.UpstreamURL = *upstream
+	}
+	if *port != "" {
+		// Update the listen address with the new port
+		host := "127.0.0.1"
+		if cfg.ListenAddr != "" {
+			if h, _, err := net.SplitHostPort(cfg.ListenAddr); err == nil {
+				host = h
+			}
+		}
+		cfg.ListenAddr = host + ":" + *port
+	}
+
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		slog.Error("Invalid configuration", "error", err)
 		os.Exit(1)
 	}
 
-	// Create store
-	storeInstance, err := store.NewStore(cfg.Store.DBPath)
-	if err != nil {
-		slog.Error("Failed to create store", "error", err)
-		os.Exit(1)
-	}
-	defer storeInstance.Close()
-
-	// Create embedder
-	embedderInstance, err := embedder.NewEmbedder(cfg.Embedder)
-	if err != nil {
-		slog.Error("Failed to create embedder", "error", err)
+	// Ensure upstream URL is provided
+	if cfg.UpstreamURL == "" {
+		slog.Error("Upstream URL is required (provide via config or --upstream flag)")
 		os.Exit(1)
 	}
 
-	// Create proxy
-	proxyInstance, err := proxy.NewProxy(*targetURL, storeInstance, embedderInstance)
+	// Validate upstream URL format
+	if _, err := url.ParseRequestURI(cfg.UpstreamURL); err != nil {
+		slog.Error("Invalid upstream URL format", "error", err)
+		os.Exit(1)
+	}
+
+	// For Phase 0, we don't need the full proxy with embedder/store
+	// Create a simple passthrough proxy
+	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL)
 	if err != nil {
 		slog.Error("Failed to create proxy", "error", err)
 		os.Exit(1)
 	}
-	defer proxyInstance.Close()
 
 	// Create router
 	r := chi.NewRouter()
 	
-	// Add health check endpoint
+	// Add health check endpoint: GET /health → 200 {"status":"ok"}
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		w.Write([]byte(`{"status":"ok"}`))
 	})
 
 	// Register proxy routes
@@ -77,13 +91,13 @@ func main() {
 
 	// Start server
 	server := &http.Server{
-		Addr:    cfg.Proxy.BindAddress,
+		Addr:    cfg.ListenAddr,
 		Handler: r,
 	}
 
 	// Start server in goroutine
 	go func() {
-		slog.Info("Starting Synapse proxy", "address", cfg.Proxy.BindAddress, "target", *targetURL)
+		slog.Info("Starting Synapse proxy", "address", cfg.ListenAddr, "upstream", cfg.UpstreamURL)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("Server failed", "error", err)
 			os.Exit(1)
@@ -124,6 +138,11 @@ func loadConfig(path string) (*config.Config, error) {
 	var cfg config.Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// If OpenAI API key not in config, try environment variable
+	if cfg.OpenAIAPIKey == "" {
+		cfg.OpenAIAPIKey = os.Getenv("OPENAI_API_KEY")
 	}
 
 	return &cfg, nil

@@ -7,8 +7,6 @@ import (
 	"math"
 	"net/http"
 	"os"
-
-	"synapse/internal/config"
 )
 
 // Embedder interface defines the contract for embedding generation
@@ -36,16 +34,16 @@ type HashEmbedder struct {
 }
 
 // NewEmbedder creates an embedder based on configuration
-func NewEmbedder(cfg config.EmbedderConfig) (Embedder, error) {
-	switch cfg.Type {
+func NewEmbedder(embedderType, openAIAPIKey, onnxModelPath, openAIModel string) (Embedder, error) {
+	switch embedderType {
 	case "onnx":
-		return newONNXEmbedder(cfg.ONNXModelPath)
+		return newONNXEmbedder(onnxModelPath)
 	case "openai":
-		return NewOpenAIEmbedder(cfg.OpenAIAPIKey, cfg.OpenAIModel), nil
+		return NewOpenAIEmbedder(openAIAPIKey, openAIModel), nil
 	case "hash":
 		return NewHashEmbedder(384), nil // Same dimension as ONNX model
 	default:
-		slog.Warn("Unknown embedder type, falling back to hash embedder", "type", cfg.Type)
+		slog.Warn("Unknown embedder type, falling back to hash embedder", "type", embedderType)
 		return NewHashEmbedder(384), nil
 	}
 }

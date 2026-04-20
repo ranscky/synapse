@@ -3,74 +3,68 @@ package config
 import (
 	"fmt"
 	"os"
-	"path/filepath"
+	"strings"
 )
 
 // Config represents the application configuration
 type Config struct {
-	Proxy      ProxyConfig      `yaml:"proxy"`
-	Embedder   EmbedderConfig   `yaml:"embedder"`
-	Store      StoreConfig      `yaml:"store"`
-}
-
-// ProxyConfig holds proxy-specific configuration
-type ProxyConfig struct {
-	BindAddress string `yaml:"bind-address"`
-}
-
-// EmbedderConfig holds embedding-related configuration
-type EmbedderConfig struct {
-	Type        string `yaml:"type"` // "onnx", "openai", "hash"
-	ONNXModelPath string `yaml:"onnx-model-path"`
-	OpenAIAPIKey  string `yaml:"openai-api-key"`
-	OpenAIModel   string `yaml:"openai-model"`
-}
-
-// StoreConfig holds memory store configuration
-type StoreConfig struct {
-	DBPath string `yaml:"db-path"`
+	UpstreamURL              string  `yaml:"upstream-url"`
+	ListenAddr               string  `yaml:"listen-addr"`
+	TokenBudget              int     `yaml:"token-budget"`
+	EmbedderType             string  `yaml:"embedder-type"`
+	OpenAIAPIKey             string  `yaml:"openai-api-key"`
+	WeightSemanticSimilarity float64 `yaml:"weight-semantic-similarity"`
+	WeightRecency            float64 `yaml:"weight-recency"`
+	WeightImportance         float64 `yaml:"weight-importance"`
+	WeightTaskAlignment      float64 `yaml:"weight-task-alignment"`
+	LogLevel                 string  `yaml:"log-level"`
 }
 
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		homeDir = "."
-	}
-	
-	defaultDBPath := filepath.Join(homeDir, ".synapse", "memories.db")
+	// Try to get OpenAI API key from environment variable
+	openAIAPIKey := os.Getenv("OPENAI_API_KEY")
 	
 	return &Config{
-		Proxy: ProxyConfig{
-			BindAddress: "127.0.0.1:8080",
-		},
-		Embedder: EmbedderConfig{
-			Type:          "onnx",
-			ONNXModelPath: "./models/all-MiniLM-L6-v2.onnx",
-			OpenAIModel:   "text-embedding-3-small",
-		},
-		Store: StoreConfig{
-			DBPath: defaultDBPath,
-		},
+		UpstreamURL:              "", // Must be provided via config or flag
+		ListenAddr:               "127.0.0.1:8080",
+		TokenBudget:              3000,
+		EmbedderType:             "onnx",
+		OpenAIAPIKey:             openAIAPIKey,
+		WeightSemanticSimilarity: 0.4,
+		WeightRecency:            0.2,
+		WeightImportance:         0.2,
+		WeightTaskAlignment:      0.2,
+		LogLevel:                 "info",
 	}
 }
 
 // Validate validates the configuration
 func (c *Config) Validate() error {
-	if c.Proxy.BindAddress == "" {
-		return fmt.Errorf("proxy.bind-address is required")
+	if c.ListenAddr == "" {
+		return fmt.Errorf("listen-addr is required")
 	}
 	
-	if c.Embedder.Type == "" {
-		return fmt.Errorf("embedder.type is required")
+	// Validate ListenAddr defaults to 127.0.0.1
+	if !strings.HasPrefix(c.ListenAddr, "127.0.0.1") && !strings.HasPrefix(c.ListenAddr, "localhost") {
+		return fmt.Errorf("listen-addr must default to 127.0.0.1 for security reasons")
 	}
 	
-	if c.Embedder.Type == "openai" && c.Embedder.OpenAIAPIKey == "" {
-		return fmt.Errorf("embedder.openai-api-key is required when using OpenAI embedder")
+	if c.EmbedderType == "" {
+		return fmt.Errorf("embedder-type is required")
 	}
 	
-	if c.Store.DBPath == "" {
-		return fmt.Errorf("store.db-path is required")
+	if c.EmbedderType != "onnx" && c.EmbedderType != "openai" {
+		return fmt.Errorf("embedder-type must be 'onnx' or 'openai'")
+	}
+	
+	if c.EmbedderType == "openai" && c.OpenAIAPIKey == "" {
+		return fmt.Errorf("openai-api-key is required when using OpenAI embedder")
+	}
+	
+	// Validate upstream URL scheme if provided
+	if c.UpstreamURL != "" && !strings.HasPrefix(c.UpstreamURL, "http://") && !strings.HasPrefix(c.UpstreamURL, "https://") {
+		return fmt.Errorf("upstream-url must start with http:// or https://")
 	}
 	
 	return nil
