@@ -1,0 +1,64 @@
+# Synapse Context Compiler — .clinerules
+# Drop this in the project root. Cline reads it at session start.
+
+## Tech stack & versions
+- Go 1.22+
+- sqlite-vec v0.1.x (github.com/asg017/sqlite-vec-go-bindings)
+- onnxruntime-go v1.x (github.com/yalue/onnxruntime_go) — all-MiniLM-L6-v2 ONNX
+- tiktoken-go v0.x (github.com/pkoukk/tiktoken-go)
+- chi v5 (github.com/go-chi/chi/v5) — HTTP router for REST API
+- go-yaml v3 (gopkg.in/yaml.v3) — config parsing
+- testify v1 (github.com/stretchr/testify) — assertions
+- Node.js (none — no JS build pipeline; web UI is single-file vanilla HTML/JS)
+
+## Folder structure
+synapse/
+├── cmd/
+│   └── synapse/
+│       └── main.go          # Binary entrypoint, flag parsing
+├── internal/
+│   ├── proxy/               # Reverse proxy handler, request interception
+│   ├── classifier/          # Intent classifier (TF-IDF + keyword rules)
+│   ├── scorer/              # 4-Factor Sieve — S, R, I, T computation
+│   ├── store/               # sqlite-vec memory store, embedding write/read
+│   ├── embedder/            # ONNX embedding model wrapper + OpenAI fallback
+│   ├── dedup/               # Cosine deduplication pass
+│   ├── budget/              # tiktoken-go token counter + greedy fill
+│   ├── compiler/            # Assembles compiled messages[] + Trace manifest
+│   ├── api/                 # REST API handlers (chi router)
+│   └── config/              # YAML config loader + defaults
+├── ui/
+│   └── index.html           # Single-file trace inspector (vanilla HTML/JS)
+├── schemas/
+│   └── memory-trace.schema.json  # Published JSON Schema for trace output
+├── testdata/                # Sample sessions for benchmark tests
+├── .clinerules              # This file
+├── synapse.yaml.example     # Annotated example config
+└── README.md
+
+## Coding style
+- async patterns: use goroutines + channels, not callbacks
+- functional over stateful structs where practical — pure functions for scoring
+- camelCase for unexported, PascalCase for exported; kebab-case for config keys
+- max 300 lines per file — split by responsibility if approaching limit
+- interfaces for every external dependency (store, embedder, classifier) — enables mocking in tests
+- no global state — pass config/deps via constructor injection
+- comments on all exported types and functions; inline comments only for non-obvious logic
+
+## Error handling
+- always wrap errors: `fmt.Errorf("scorer: %w", err)`
+- return errors up the stack — do not log + swallow
+- top-level handlers log at ERROR level and return 500 with a sanitized message (never leak internals)
+- use slog (stdlib) for structured logging — no third-party logger
+- startup validation: if config is invalid, log.Fatal with clear message — no silent defaults that hide misconfiguration
+- never log Authorization headers or bearer tokens at any log level
+
+## Guardrails
+- do not install new dependencies without asking — the binary size and single-binary goal matter
+- do not touch files outside the current phase's scope
+- no hardcoded secrets, API keys, or localhost URLs — everything via config or env
+- do not refactor working code from a prior phase unless a bug requires it
+- Authorization headers must NEVER appear in log output — this is a security requirement, not a preference
+- proxy default binding is 127.0.0.1 — never change default to 0.0.0.0
+- all config files written by Synapse must be created with 0600 permissions
+- Memory Trace JSON is in-memory only by default; persistence requires explicit --persist-traces flag

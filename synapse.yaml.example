@@ -1,0 +1,14 @@
+# Synapse Context Compiler Configuration Example
+# Copy this to synapse.yaml and modify as needed
+
+proxy:
+  bind-address: "127.0.0.1:8080"  # Default bind address
+
+embedder:
+  type: "onnx"                    # "onnx", "openai", or "hash"
+  onnx-model-path: "./models/all-MiniLM-L6-v2.onnx"
+  openai-api-key: ""             # Required if using OpenAI
+  openai-model: "text-embedding-3-small"
+
+store:
+  db-path: "~/.synapse/memories.db"  # Path to SQLite database file
