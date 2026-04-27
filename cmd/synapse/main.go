@@ -16,7 +16,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"gopkg.in/yaml.v3"
 	"synapse/internal/config"
+	"synapse/internal/embedder"
 	"synapse/internal/proxy"
+	"synapse/internal/store"
 )
 
 var (
@@ -68,9 +70,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	// For Phase 0, we don't need the full proxy with embedder/store
-	// Create a simple passthrough proxy
-	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL)
+	// Initialize store
+	storeInstance, err := store.NewStore("synapse.db")
+	if err != nil {
+		slog.Error("Failed to create store", "error", err)
+		os.Exit(1)
+	}
+	defer storeInstance.Close()
+
+	// Initialize embedder
+	embedderInstance, err := embedder.NewEmbedder(cfg.EmbedderType, cfg.OpenAIAPIKey, "", "")
+	if err != nil {
+		slog.Error("Failed to create embedder", "error", err)
+		os.Exit(1)
+	}
+
+	// Create proxy with store and embedder
+	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, embedderInstance)
 	if err != nil {
 		slog.Error("Failed to create proxy", "error", err)
 		os.Exit(1)

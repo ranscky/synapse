@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/yourhandle/synapse/schemas/memory-trace.schema.json",
+  "$id": "https://github.com/ranscky/synapse/schemas/memory-trace.schema.json",
   "title": "Synapse Memory Trace",
   "description": "Schema for Synapse Context Compiler memory trace output",
   "type": "object",
