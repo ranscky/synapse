@@ -17,6 +17,7 @@ type Config struct {
 	WeightRecency            float64 `yaml:"weight-recency"`
 	WeightImportance         float64 `yaml:"weight-importance"`
 	WeightTaskAlignment      float64 `yaml:"weight-task-alignment"`
+	DeduplicationThreshold   float64 `yaml:"deduplication-threshold"`
 	LogLevel                 string  `yaml:"log-level"`
 }
 
@@ -35,6 +36,7 @@ func DefaultConfig() *Config {
 		WeightRecency:            0.2,
 		WeightImportance:         0.2,
 		WeightTaskAlignment:      0.2,
+		DeduplicationThreshold:   0.92, // Default deduplication threshold
 		LogLevel:                 "info",
 	}
 }

@@ -14,6 +14,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"synapse/internal/classifier"
+	"synapse/internal/compiler"
+	"synapse/internal/config"
+	"synapse/internal/dedup"
+	"synapse/internal/budget"
 	"synapse/internal/scorer"
 	"synapse/internal/store"
 )
@@ -47,10 +51,11 @@ type Proxy struct {
 	upstream *httputil.ReverseProxy
 	store    MemoryStore
 	embedder Embedder
+	config   *config.Config
 }
 
 // NewProxy creates a new proxy instance
-func NewProxy(targetURL string, memStore MemoryStore, emb Embedder) (*Proxy, error) {
+func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.Config) (*Proxy, error) {
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target URL: %w", err)
@@ -65,6 +70,7 @@ func NewProxy(targetURL string, memStore MemoryStore, emb Embedder) (*Proxy, err
 		target:   target,
 		store:    memStore,
 		embedder: emb,
+		config:   cfg,
 	}
 
 	// Create reverse proxy with simple director
@@ -98,8 +104,10 @@ func (p *Proxy) director(req *http.Request) {
 	// But we never log its value anywhere
 }
 
-// HandleMessages handles POST /v1/messages requests with 4-factor scoring
+// HandleMessages handles POST /v1/messages requests with full pipeline
 func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	
 	ctx := r.Context()
 
 	// Read the request body
@@ -171,8 +179,54 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			"confidence", confidence)
 	}
 
-	// 5. Store results in context for Phase 3
-	ctx = context.WithValue(ctx, ScoredMemoriesKey, scoredMemories)
+	// 5. Deduplicate memories
+	dedupStart := time.Now()
+	dedupThreshold := p.config.DeduplicationThreshold
+	deduplicated := dedup.Deduplicate(scoredMemories, dedupThreshold)
+	dedupDuration := time.Since(dedupStart)
+
+	// 6. Apply token budget
+	budgetStart := time.Now()
+	tokenBudget := p.config.TokenBudget
+	selectedMemories, totalTokens := budget.Fill(deduplicated, tokenBudget)
+	budgetDuration := time.Since(budgetStart)
+
+	// 7. Compile final context
+	compileStart := time.Now()
+	compiledMessages := compiler.Compile(selectedMemories, lastUserMessage)
+	compileDuration := time.Since(compileStart)
+
+	// 8. Log timing information
+	totalDuration := time.Since(startTime)
+	slog.Info("Pipeline completed",
+		"total_duration_ms", totalDuration.Milliseconds(),
+		"dedup_duration_ms", dedupDuration.Milliseconds(),
+		"budget_duration_ms", budgetDuration.Milliseconds(),
+		"compile_duration_ms", compileDuration.Milliseconds(),
+		"original_candidates", len(scoredMemories),
+		"deduplicated_count", len(deduplicated),
+		"selected_count", len(selectedMemories),
+		"total_tokens", totalTokens)
+
+	// Log warnings for performance issues
+	if totalDuration > 100*time.Millisecond {
+		slog.Warn("Pipeline slow (>100ms)",
+			"total_duration_ms", totalDuration.Milliseconds(),
+			"dedup_duration_ms", dedupDuration.Milliseconds(),
+			"budget_duration_ms", budgetDuration.Milliseconds(),
+			"compile_duration_ms", compileDuration.Milliseconds())
+	} else if totalDuration > 50*time.Millisecond {
+		slog.Info("Pipeline timing info (<50ms)",
+			"total_duration_ms", totalDuration.Milliseconds())
+	}
+
+	// Handle edge cases
+	if len(selectedMemories) == 0 {
+		slog.Warn("All candidates deduplicated - compiling with just last user message")
+	}
+
+	// Store results in context for downstream use
+	ctx = context.WithValue(ctx, ScoredMemoriesKey, compiledMessages)
 	ctx = context.WithValue(ctx, IntentKey, intent)
 	ctx = context.WithValue(ctx, ConfidenceKey, confidence)
 
