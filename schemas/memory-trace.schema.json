@@ -5,114 +5,141 @@
   "description": "Schema for Synapse Context Compiler memory trace output",
   "type": "object",
   "properties": {
-    "version": {
+    "request_id": {
       "type": "string",
-      "description": "Schema version"
-    },
-    "sessionId": {
-      "type": "string",
-      "description": "Unique session identifier"
+      "format": "uuid",
+      "description": "Unique request identifier"
     },
     "timestamp": {
       "type": "string",
       "format": "date-time",
       "description": "ISO 8601 timestamp of trace creation"
     },
-    "inputContext": {
-      "type": "object",
-      "description": "Original context before compilation",
-      "properties": {
-        "messages": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "role": {
-                "type": "string"
-              },
-              "content": {
-                "type": "string"
-              }
-            },
-            "required": ["role", "content"]
+    "detected_intent": {
+      "type": "string",
+      "enum": ["debug", "plan", "code", "write", "generic"],
+      "description": "Detected user intent"
+    },
+    "intent_confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Confidence level of intent detection"
+    },
+    "candidates_retrieved": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of candidate memories retrieved"
+    },
+    "candidates_after_dedup": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of candidates after deduplication"
+    },
+    "memories_compiled": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of memories included in final compilation"
+    },
+    "tokens_used": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of tokens used in compilation"
+    },
+    "token_budget": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Token budget for this compilation"
+    },
+    "compile_duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Compilation duration in milliseconds"
+    },
+    "memories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Memory entry identifier"
+          },
+          "memory_type": {
+            "type": "string",
+            "description": "Type of memory entry"
+          },
+          "content_preview": {
+            "type": "string",
+            "maxLength": 100,
+            "description": "First 100 characters of memory content"
+          },
+          "score_semantic": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Semantic similarity score"
+          },
+          "score_recency": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Recency score"
+          },
+          "score_importance": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Importance score"
+          },
+          "score_task_alignment": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Task alignment score"
+          },
+          "score_total": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Total combined score"
+          },
+          "included": {
+            "type": "boolean",
+            "description": "Whether this memory was included in compilation"
+          },
+          "exclusion_reason": {
+            "type": "string",
+            "enum": ["deduped", "budget_exceeded", "null"],
+            "description": "Reason for exclusion if not included"
           }
         },
-        "tokenCount": {
-          "type": "integer",
-          "description": "Total tokens in input context"
-        }
-      },
-      "required": ["messages", "tokenCount"]
-    },
-    "compiledContext": {
-      "type": "object",
-      "description": "Compiled context after 4-factor scoring",
-      "properties": {
-        "messages": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "role": {
-                "type": "string"
-              },
-              "content": {
-                "type": "string"
-              }
-            },
-            "required": ["role", "content"]
-          }
-        },
-        "tokenCount": {
-          "type": "integer",
-          "description": "Total tokens in compiled context"
-        }
-      },
-      "required": ["messages", "tokenCount"]
-    },
-    "scoring": {
-      "type": "object",
-      "description": "Scoring breakdown for selected memories",
-      "properties": {
-        "memories": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "id": {
-                "type": "string"
-              },
-              "content": {
-                "type": "string"
-              },
-              "scores": {
-                "type": "object",
-                "properties": {
-                  "semanticSimilarity": {
-                    "type": "number"
-                  },
-                  "recency": {
-                    "type": "number"
-                  },
-                  "importance": {
-                    "type": "number"
-                  },
-                  "taskAlignment": {
-                    "type": "number"
-                  },
-                  "finalScore": {
-                    "type": "number"
-                  }
-                },
-                "required": ["semanticSimilarity", "recency", "importance", "taskAlignment", "finalScore"]
-              }
-            },
-            "required": ["id", "content", "scores"]
-          }
-        }
-      },
-      "required": ["memories"]
+        "required": [
+          "id",
+          "memory_type",
+          "content_preview",
+          "score_semantic",
+          "score_recency",
+          "score_importance",
+          "score_task_alignment",
+          "score_total",
+          "included"
+        ]
+      }
     }
   },
-  "required": ["version", "sessionId", "timestamp", "inputContext", "compiledContext", "scoring"]
+  "required": [
+    "request_id",
+    "timestamp",
+    "detected_intent",
+    "intent_confidence",
+    "candidates_retrieved",
+    "candidates_after_dedup",
+    "memories_compiled",
+    "tokens_used",
+    "token_budget",
+    "compile_duration_ms",
+    "memories"
+  ]
 }

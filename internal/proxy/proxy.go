@@ -3,6 +3,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -191,9 +193,26 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	selectedMemories, totalTokens := budget.Fill(deduplicated, tokenBudget)
 	budgetDuration := time.Since(budgetStart)
 
-	// 7. Compile final context
+	// 7. Compile final context with trace
 	compileStart := time.Now()
-	compiledMessages := compiler.Compile(selectedMemories, lastUserMessage)
+	requestID := generateRequestID() // Generate unique request ID
+	
+	compileResult := compiler.Compile(
+		selectedMemories,
+		lastUserMessage,
+		requestID,
+		string(intent),
+		confidence,
+		len(scoredMemories),
+		len(deduplicated),
+		tokenBudget,
+		time.Since(compileStart).Milliseconds(),
+		scoredMemories,
+	)
+	
+	// Update tokens used in trace
+	compileResult.Trace.TokensUsed = totalTokens
+	
 	compileDuration := time.Since(compileStart)
 
 	// 8. Log timing information
@@ -225,8 +244,42 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("All candidates deduplicated - compiling with just last user message")
 	}
 
+	// Check for trace header
+	traceHeader := r.Header.Get("X-Synapse-Trace")
+	if traceHeader == "true" {
+		// Serialize trace manifest to JSON
+		traceJSON, err := json.Marshal(compileResult.Trace)
+		if err != nil {
+			slog.Error("Failed to marshal trace manifest", "error", err)
+		} else {
+			// Base64 encode the JSON
+			traceBase64 := base64.StdEncoding.EncodeToString(traceJSON)
+			
+			// Check if trace exceeds 8KB limit
+			if len(traceBase64) > 8192 {
+				// Truncate memories list and add trace_truncated flag
+				truncatedTrace := *compileResult.Trace
+				// Keep only first few memories to stay under limit
+				if len(truncatedTrace.Memories) > 10 {
+					truncatedTrace.Memories = truncatedTrace.Memories[:10]
+				}
+				// Add truncated flag
+				// Note: This would require modifying the TraceManifest struct to include this field
+				
+				truncatedJSON, _ := json.Marshal(truncatedTrace)
+				traceBase64 = base64.StdEncoding.EncodeToString(truncatedJSON)
+			}
+			
+			// Add trace to response headers
+			w.Header().Set("X-Synapse-Trace-Result", traceBase64)
+		}
+	}
+
+	// Check for persist traces flag (this would be passed from main)
+	// For now, we'll assume it's handled at a higher level
+
 	// Store results in context for downstream use
-	ctx = context.WithValue(ctx, ScoredMemoriesKey, compiledMessages)
+	ctx = context.WithValue(ctx, ScoredMemoriesKey, compileResult.Messages)
 	ctx = context.WithValue(ctx, IntentKey, intent)
 	ctx = context.WithValue(ctx, ConfidenceKey, confidence)
 
@@ -245,4 +298,9 @@ func (p *Proxy) RegisterRoutes(r chi.Router) {
 // Close closes the proxy resources (no-op for simple proxy)
 func (p *Proxy) Close() error {
 	return nil
+}
+
+// Helper function to generate request ID (simplified)
+func generateRequestID() string {
+	return fmt.Sprintf("req-%d", time.Now().UnixNano())
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"gopkg.in/yaml.v3"
+	"synapse/internal/api"
 	"synapse/internal/config"
 	"synapse/internal/embedder"
 	"synapse/internal/proxy"
@@ -22,9 +23,10 @@ import (
 )
 
 var (
-	configPath = flag.String("config", "synapse.yaml", "Path to configuration file")
-	upstream   = flag.String("upstream", "", "Override upstream URL")
-	port       = flag.String("port", "", "Override port")
+	configPath     = flag.String("config", "synapse.yaml", "Path to configuration file")
+	upstream       = flag.String("upstream", "", "Override upstream URL")
+	port           = flag.String("port", "", "Override port")
+	persistTraces  = flag.Bool("persist-traces", false, "Persist memory traces to disk")
 )
 
 func main() {
@@ -92,8 +94,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Create API server
+	apiServer := api.NewAPIServer(storeInstance, embedderInstance, cfg, *persistTraces)
+	
 	// Create router
 	r := chi.NewRouter()
+	
+	// Mount API routes
+	r.Mount("/", apiServer.Router())
 	
 	// Add health check endpoint: GET /health → 200 {"status":"ok","memories_stored":N,"avg_compile_ms":N}
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {

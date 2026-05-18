@@ -61,16 +61,27 @@ func TestCompile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := Compile(tt.selected, tt.lastUserMessage)
+			result := Compile(
+				tt.selected,
+				tt.lastUserMessage,
+				"test-request-id",
+				"generic",
+				0.5,
+				len(tt.selected),
+				len(tt.selected),
+				3000,
+				10,
+				tt.selected,
+			)
 			
-			if len(result) != tt.expectedLength {
-				t.Errorf("Compile() returned %d messages, want %d", len(result), tt.expectedLength)
+			if len(result.Messages) != tt.expectedLength {
+				t.Errorf("Compile() returned %d messages, want %d", len(result.Messages), tt.expectedLength)
 			}
 			
 			// Check that memories are sorted by timestamp (oldest first)
-			if len(result) > 1 && len(tt.selected) > 1 {
+			if len(result.Messages) > 1 && len(tt.selected) > 1 {
 				// Check that the first memory message has content from mem1 (older)
-				firstMemMsg := result[0]
+				firstMemMsg := result.Messages[0]
 				if content, ok := firstMemMsg["content"].(string); ok {
 					if !contains(content, "First memory content") {
 						t.Errorf("Expected first message to contain 'First memory content', got %s", content)
@@ -118,15 +129,27 @@ func TestCompileWithContext(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := CompileWithContext(tt.systemMessage, tt.selected, tt.lastUserMessage)
+			result := CompileWithContext(
+				tt.systemMessage,
+				tt.selected,
+				tt.lastUserMessage,
+				"test-request-id",
+				"generic",
+				0.5,
+				len(tt.selected),
+				len(tt.selected),
+				3000,
+				10,
+				tt.selected,
+			)
 			
-			if len(result) != tt.expectedLength {
-				t.Errorf("CompileWithContext() returned %d messages, want %d", len(result), tt.expectedLength)
+			if len(result.Messages) != tt.expectedLength {
+				t.Errorf("CompileWithContext() returned %d messages, want %d", len(result.Messages), tt.expectedLength)
 			}
 			
 			// Check system message presence
 			if tt.systemMessage != "" {
-				systemMsg := result[0]
+				systemMsg := result.Messages[0]
 				if role, ok := systemMsg["role"].(string); !ok || role != "system" {
 					t.Errorf("Expected first message to be system role, got %v", role)
 				}
@@ -147,14 +170,25 @@ func TestMemoryHeaders(t *testing.T) {
 		Total: 0.87,
 	}
 	
-	result := Compile([]scorer.ScoredMemory{mem1}, "User message")
+	result := Compile(
+		[]scorer.ScoredMemory{mem1},
+		"User message",
+		"test-request-id",
+		"generic",
+		0.5,
+		1,
+		1,
+		3000,
+		10,
+		[]scorer.ScoredMemory{mem1},
+	)
 	
-	if len(result) < 1 {
+	if len(result.Messages) < 1 {
 		t.Fatalf("Expected at least one message")
 	}
 	
 	// Check that the memory message includes the header
-	memoryMsg := result[0]
+	memoryMsg := result.Messages[0]
 	if content, ok := memoryMsg["content"].(string); ok {
 		if !contains(content, "[Memory | Type: decision | Score: 0.87]") {
 			t.Errorf("Expected memory message to contain header, got %s", content)
@@ -166,4 +200,3 @@ func TestMemoryHeaders(t *testing.T) {
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
-

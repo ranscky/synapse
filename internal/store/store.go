@@ -221,6 +221,31 @@ func DetectMemoryType(content string) string {
 	return "context"
 }
 
+// Delete removes all memories for a specific session
+func (s *Store) Delete(ctx context.Context, sessionID string) error {
+	query := `DELETE FROM memories WHERE session_id = ?`
+	
+	_, err := s.db.ExecContext(ctx, query, sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to delete memories for session %s: %w", sessionID, err)
+	}
+	
+	return nil
+}
+
+// CountMemories counts the total number of memories in the store
+func (s *Store) CountMemories(ctx context.Context) (int, error) {
+	query := `SELECT COUNT(*) FROM memories`
+	
+	var count int
+	err := s.db.QueryRowContext(ctx, query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count memories: %w", err)
+	}
+	
+	return count, nil
+}
+
 // Close closes the database connection
 func (s *Store) Close() error {
 	return s.db.Close()

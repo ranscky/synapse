@@ -1,0 +1,388 @@
+openapi: 3.0.0
+info:
+  title: Synapse Context Compiler API
+  description: A Go reverse proxy that compiles AI conversation history into a token-budgeted context using 4-factor scoring, deduplication, and a Memory Trace manifest for explainability.
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+paths:
+  /v1/compile:
+    post:
+      summary: Compile messages with context
+      description: Takes a list of messages and session ID, runs the full pipeline, and returns compiled messages with trace manifest.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompileRequest'
+      responses:
+        '200':
+          description: Successful compilation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompileResponse'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          headers:
+            Retry-After:
+              description: Number of seconds to wait before retrying
+              schema:
+                type: integer
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/memories:
+    get:
+      summary: Get recent memories for a session
+      description: Returns recent memories for a specific session.
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+            pattern: '^[a-zA-Z0-9\-]+$'
+          description: Session identifier
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Maximum number of memories to return
+      responses:
+        '200':
+          description: List of memories
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MemoryEntry'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          headers:
+            Retry-After:
+              description: Number of seconds to wait before retrying
+              schema:
+                type: integer
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    
+    delete:
+      summary: Clear all memories for a session
+      description: Deletes all memories associated with a specific session.
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+            pattern: '^[a-zA-Z0-9\-]+$'
+          description: Session identifier
+      responses:
+        '204':
+          description: Memories cleared successfully
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          headers:
+            Retry-After:
+              description: Number of seconds to wait before retrying
+              schema:
+                type: integer
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/stats:
+    get:
+      summary: Get pipeline statistics
+      description: Returns detailed pipeline statistics.
+      responses:
+        '200':
+          description: Pipeline statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsResponse'
+        '429':
+          description: Rate limit exceeded
+          headers:
+            Retry-After:
+              description: Number of seconds to wait before retrying
+              schema:
+                type: integer
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /openapi.yaml:
+    get:
+      summary: Get OpenAPI specification
+      description: Returns this OpenAPI specification document.
+      responses:
+        '200':
+          description: OpenAPI specification
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  /health:
+    get:
+      summary: Health check
+      description: Returns service health status.
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  memories_stored:
+                    type: integer
+                    example: 150
+                  avg_compile_ms:
+                    type: integer
+                    example: 45
+
+components:
+  schemas:
+    CompileRequest:
+      type: object
+      required:
+        - messages
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        session_id:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9\-]+$'
+          description: Session identifier (alphanumeric + hyphens, max 64 chars)
+
+    Message:
+      type: object
+      required:
+        - role
+        - content
+      properties:
+        role:
+          type: string
+          enum: [user, assistant, system]
+        content:
+          type: string
+          maxLength: 32768
+          description: Message content (max 32KB)
+
+    CompileResponse:
+      type: object
+      required:
+        - compiled_messages
+        - trace
+      properties:
+        compiled_messages:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        trace:
+          $ref: '#/components/schemas/TraceManifest'
+
+    TraceManifest:
+      type: object
+      required:
+        - request_id
+        - timestamp
+        - detected_intent
+        - intent_confidence
+        - candidates_retrieved
+        - candidates_after_dedup
+        - memories_compiled
+        - tokens_used
+        - token_budget
+        - compile_duration_ms
+        - memories
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+        detected_intent:
+          type: string
+          enum: [debug, plan, code, write, generic]
+        intent_confidence:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+        candidates_retrieved:
+          type: integer
+          minimum: 0
+        candidates_after_dedup:
+          type: integer
+          minimum: 0
+        memories_compiled:
+          type: integer
+          minimum: 0
+        tokens_used:
+          type: integer
+          minimum: 0
+        token_budget:
+          type: integer
+          minimum: 0
+        compile_duration_ms:
+          type: integer
+          minimum: 0
+        memories:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceMemory'
+        trace_truncated:
+          type: boolean
+
+    TraceMemory:
+      type: object
+      required:
+        - id
+        - memory_type
+        - content_preview
+        - score_semantic
+        - score_recency
+        - score_importance
+        - score_task_alignment
+        - score_total
+        - included
+      properties:
+        id:
+          type: string
+          format: uuid
+        memory_type:
+          type: string
+        content_preview:
+          type: string
+          maxLength: 100
+        score_semantic:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+        score_recency:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+        score_importance:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+        score_task_alignment:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+        score_total:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+        included:
+          type: boolean
+        exclusion_reason:
+          type: string
+          enum: [deduped, budget_exceeded, null]
+
+    MemoryEntry:
+      type: object
+      required:
+        - id
+        - session_id
+        - content
+        - memory_type
+        - timestamp
+      properties:
+        id:
+          type: string
+        session_id:
+          type: string
+        content:
+          type: string
+        memory_type:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        importance:
+          type: number
+
+    StatsResponse:
+      type: object
+      required:
+        - status
+        - memories_stored
+        - avg_compile_ms
+      properties:
+        status:
+          type: string
+        memories_stored:
+          type: integer
+        avg_compile_ms:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization

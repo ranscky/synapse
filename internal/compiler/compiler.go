@@ -3,12 +3,33 @@ package compiler
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"synapse/internal/scorer"
+	"synapse/internal/trace"
 )
 
+// CompileResult holds both the compiled messages and trace manifest
+type CompileResult struct {
+	Messages []map[string]interface{}
+	Trace    *trace.TraceManifest
+}
+
 // Compile assembles the final message context from original messages, selected memories, and last user message
-func Compile(selected []scorer.ScoredMemory, lastUserMessage string) []map[string]interface{} {
+func Compile(
+	selected []scorer.ScoredMemory,
+	lastUserMessage string,
+	requestID string,
+	intent string,
+	confidence float64,
+	candidatesRetrieved int,
+	candidatesAfterDedup int,
+	tokenBudget int,
+	compileDurationMs int64,
+	allScoredMemories []scorer.ScoredMemory,
+) *CompileResult {
+	compileStart := time.Now()
+	
 	// Result slice for compiled messages
 	result := make([]map[string]interface{}, 0)
 	
@@ -44,11 +65,44 @@ func Compile(selected []scorer.ScoredMemory, lastUserMessage string) []map[strin
 		})
 	}
 	
-	return result
+	// Calculate final compile duration
+	finalCompileDuration := compileDurationMs + time.Since(compileStart).Milliseconds()
+	
+	// Create trace manifest
+	traceManifest := trace.NewTraceManifest(
+		requestID,
+		intent,
+		confidence,
+		candidatesRetrieved,
+		candidatesAfterDedup,
+		len(selected),
+		0, // tokensUsed - will be calculated by caller
+		tokenBudget,
+		finalCompileDuration,
+		allScoredMemories,
+		selected,
+	)
+	
+	return &CompileResult{
+		Messages: result,
+		Trace:    traceManifest,
+	}
 }
 
 // CompileWithContext includes system message if present
-func CompileWithContext(systemMessage string, selected []scorer.ScoredMemory, lastUserMessage string) []map[string]interface{} {
+func CompileWithContext(
+	systemMessage string,
+	selected []scorer.ScoredMemory,
+	lastUserMessage string,
+	requestID string,
+	intent string,
+	confidence float64,
+	candidatesRetrieved int,
+	candidatesAfterDedup int,
+	tokenBudget int,
+	compileDurationMs int64,
+	allScoredMemories []scorer.ScoredMemory,
+) *CompileResult {
 	result := make([]map[string]interface{}, 0)
 	
 	// Add system message if present
@@ -60,8 +114,20 @@ func CompileWithContext(systemMessage string, selected []scorer.ScoredMemory, la
 	}
 	
 	// Add compiled memories and last user message
-	messages := Compile(selected, lastUserMessage)
-	result = append(result, messages...)
+	compileResult := Compile(
+		selected,
+		lastUserMessage,
+		requestID,
+		intent,
+		confidence,
+		candidatesRetrieved,
+		candidatesAfterDedup,
+		tokenBudget,
+		compileDurationMs,
+		allScoredMemories,
+	)
+	result = append(result, compileResult.Messages...)
 	
-	return result
+	compileResult.Messages = result
+	return compileResult
 }
