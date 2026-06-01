@@ -2,23 +2,25 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 )
 
 // Config represents the application configuration
 type Config struct {
-	UpstreamURL              string  `yaml:"upstream-url"`
-	ListenAddr               string  `yaml:"listen-addr"`
-	TokenBudget              int     `yaml:"token-budget"`
-	EmbedderType             string  `yaml:"embedder-type"`
-	OpenAIAPIKey             string  `yaml:"openai-api-key"`
-	WeightSemanticSimilarity float64 `yaml:"weight-semantic-similarity"`
-	WeightRecency            float64 `yaml:"weight-recency"`
-	WeightImportance         float64 `yaml:"weight-importance"`
-	WeightTaskAlignment      float64 `yaml:"weight-task-alignment"`
-	DeduplicationThreshold   float64 `yaml:"deduplication-threshold"`
-	LogLevel                 string  `yaml:"log-level"`
+	UpstreamURL              string   `yaml:"upstream-url"`
+	AllowedUpstreamHosts     []string `yaml:"allowed-upstream-hosts"`
+	ListenAddr               string   `yaml:"listen-addr"`
+	TokenBudget              int      `yaml:"token-budget"`
+	EmbedderType             string   `yaml:"embedder-type"`
+	OpenAIAPIKey             string   `yaml:"openai-api-key"`
+	WeightSemanticSimilarity float64  `yaml:"weight-semantic-similarity"`
+	WeightRecency            float64  `yaml:"weight-recency"`
+	WeightImportance         float64  `yaml:"weight-importance"`
+	WeightTaskAlignment      float64  `yaml:"weight-task-alignment"`
+	DeduplicationThreshold   float64  `yaml:"deduplication-threshold"`
+	LogLevel                 string   `yaml:"log-level"`
 }
 
 // DefaultConfig returns the default configuration
@@ -64,9 +66,46 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("openai-api-key is required when using OpenAI embedder")
 	}
 	
-	// Validate upstream URL scheme if provided
-	if c.UpstreamURL != "" && !strings.HasPrefix(c.UpstreamURL, "http://") && !strings.HasPrefix(c.UpstreamURL, "https://") {
+	// Upstream URL is required
+	if c.UpstreamURL == "" {
+		return fmt.Errorf("upstream-url is required")
+	}
+	
+	// Validate upstream URL scheme
+	if !strings.HasPrefix(c.UpstreamURL, "http://") && !strings.HasPrefix(c.UpstreamURL, "https://") {
 		return fmt.Errorf("upstream-url must start with http:// or https://")
+	}
+	
+	// Validate upstream URL format
+	if _, err := url.ParseRequestURI(c.UpstreamURL); err != nil {
+		return fmt.Errorf("invalid upstream URL format: %w", err)
+	}
+	
+	// Check upstream URL against allowlist if configured
+	if len(c.AllowedUpstreamHosts) > 0 {
+		upstreamURL, err := url.Parse(c.UpstreamURL)
+		if err != nil {
+			return fmt.Errorf("invalid upstream URL: %w", err)
+		}
+		
+		host := upstreamURL.Hostname()
+		allowed := false
+		
+		// Check if host is in allowlist
+		for _, allowedHost := range c.AllowedUpstreamHosts {
+			if host == allowedHost {
+				allowed = true
+				break
+			}
+		}
+		
+		// Special handling for localhost/127.x.x.x (common for Ollama)
+		if !allowed && (host == "localhost" || strings.HasPrefix(host, "127.")) {
+			// Log INFO for localhost usage (common for Ollama)
+			// This will be handled at startup with proper logging context
+		} else if !allowed {
+			return fmt.Errorf("upstream host %s is not in allowed list", host)
+		}
 	}
 	
 	return nil

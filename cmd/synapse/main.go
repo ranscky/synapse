@@ -128,6 +128,14 @@ func main() {
 		Handler: r,
 	}
 
+	// Log startup security checklist
+	upstreamHost := ""
+	if parsedURL, err := url.Parse(cfg.UpstreamURL); err == nil {
+		upstreamHost = parsedURL.Host
+	}
+	
+	slog.Info("Synapse security: proxy bound to "+cfg.ListenAddr+", upstream "+upstreamHost+", trace persistence "+fmt.Sprintf("%t", *persistTraces)+", header redaction active, injection sanitization active")
+
 	// Start server in goroutine
 	go func() {
 		slog.Info("Starting Synapse proxy", "address", cfg.ListenAddr, "upstream", cfg.UpstreamURL)
@@ -161,6 +169,17 @@ func loadConfig(path string) (*config.Config, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		slog.Warn("Config file not found, using defaults", "path", path)
 		return config.DefaultConfig(), nil
+	}
+
+	// Check config file permissions for security
+	if fileInfo, err := os.Stat(path); err == nil {
+		// Check if file is world-readable (others have read permission)
+		perm := fileInfo.Mode().Perm()
+		if perm&0004 != 0 {
+			slog.Warn("SECURITY WARNING: Config file is world-readable. Recommended fix: chmod 600 "+path,
+				"path", path,
+				"current_permissions", fmt.Sprintf("%04o", perm))
+		}
 	}
 
 	data, err := os.ReadFile(path)

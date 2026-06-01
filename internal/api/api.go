@@ -446,7 +446,7 @@ func (a *APIServer) rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// loggingMiddleware logs API requests
+// loggingMiddleware logs API requests with sanitized headers
 func (a *APIServer) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

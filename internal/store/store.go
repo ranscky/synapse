@@ -88,7 +88,17 @@ func (s *Store) initSchema() error {
 
 // Write stores a memory entry
 func (s *Store) Write(ctx context.Context, entry MemoryEntry) error {
-	// Truncate content if it exceeds 2048 bytes
+	// Sanitize content before writing
+	sanitizedContent := s.Sanitize(entry.Content)
+	
+	// Log warning if content was sanitized
+	if sanitizedContent == "[SANITIZED]" && entry.Content != "[SANITIZED]" {
+		slog.Warn("Memory content sanitized due to prompt injection", "memory_id", entry.ID)
+	}
+	
+	entry.Content = sanitizedContent
+
+	// Truncate content if it exceeds 2048 bytes (double-check after sanitization)
 	if len(entry.Content) > 2048 {
 		// Find the last rune boundary within the limit
 		truncated := entry.Content[:2048]
@@ -244,6 +254,45 @@ func (s *Store) CountMemories(ctx context.Context) (int, error) {
 	}
 	
 	return count, nil
+}
+
+// Sanitize sanitizes memory content before writing
+func (s *Store) Sanitize(content string) string {
+	// Strip null bytes
+	content = strings.ReplaceAll(content, "\x00", "")
+	
+	// Check for prompt injection patterns
+	injectionPatterns := []string{
+		"ignore previous",
+		"ignore all",
+		"disregard",
+		"you are now",
+		"new instructions:",
+		"system:",
+		"###instruction",
+	}
+	
+	lowerContent := strings.ToLower(content)
+	for _, pattern := range injectionPatterns {
+		if strings.Contains(lowerContent, pattern) {
+			// Log warning with memory ID (content is not logged for security)
+			slog.Warn("Prompt injection detected and neutralized", "pattern", pattern)
+			return "[SANITIZED]"
+		}
+	}
+	
+	// Cap at 2048 bytes (already enforced in Write, but double-check here)
+	if len(content) > 2048 {
+		// Find the last rune boundary within the limit
+		truncated := content[:2048]
+		// Ensure we don't cut off a multi-byte UTF-8 character
+		for len(truncated) > 0 && !utf8.ValidString(truncated) {
+			truncated = truncated[:len(truncated)-1]
+		}
+		return truncated
+	}
+	
+	return content
 }
 
 // Close closes the database connection

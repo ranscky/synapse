@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -209,6 +210,52 @@ func TestValidateSessionID(t *testing.T) {
 				t.Errorf("validateSessionID() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestFuzzValidateSessionID performs fuzzing tests for session ID validation
+func TestFuzzValidateSessionID(t *testing.T) {
+	// Test 100 random strings to ensure invalid ones return 400
+	invalidCount := 0
+	
+	for i := 0; i < 100; i++ {
+		// Generate random invalid session ID
+		invalidChars := []rune{'@', '#', '$', '%', '^', '&', '*', '(', ')', '!', '~', '`', '[', ']', '{', '}', '|', '\\', ';', ':', '"', '\'', '<', '>', ',', '.', '?', '/'}
+		
+		// Create invalid session ID with special characters
+		sessionID := fmt.Sprintf("test%d%cinvalid", i, invalidChars[i%len(invalidChars)])
+		
+		err := validateSessionID(sessionID)
+		if err != nil {
+			invalidCount++
+		}
+	}
+	
+	// Also test some edge cases
+	edgeCases := []string{
+		"test session",           // space
+		"test\nsession",          // newline
+		"test\tsession",          // tab
+		"test/session",           // slash
+		"test?session",           // question mark
+		"test#session",           // hash
+		"test=session",           // equals
+		"test+session",           // plus
+		"test_session",           // underscore (should be valid but let's check)
+		string(make([]byte, 65)), // too long (null bytes)
+	}
+	
+	for _, sessionID := range edgeCases {
+		err := validateSessionID(sessionID)
+		if err != nil {
+			invalidCount++
+		}
+	}
+	
+	// All should be invalid
+	expectedInvalid := 100 + len(edgeCases)
+	if invalidCount != expectedInvalid {
+		t.Errorf("Expected %d invalid session IDs, got %d", expectedInvalid, invalidCount)
 	}
 }
 
