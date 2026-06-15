@@ -5,42 +5,947 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Synapse Context Compiler - Trace Inspector</title>
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+        :root {
+            --bg-primary: #ffffff;
+            --bg-secondary: #f8f9fa;
+            --bg-tertiary: #e9ecef;
+            --text-primary: #212529;
+            --text-secondary: #6c757d;
+            --border: #dee2e6;
+            --accent: #0d6efd;
+            --success: #198754;
+            --warning: #ffc107;
+            --danger: #dc3545;
+            --info: #0dcaf0;
+            
+            --panel-bg: var(--bg-primary);
+            --panel-border: var(--border);
+            --header-bg: var(--bg-secondary);
+        }
+
+        [data-theme="dark"] {
+            --bg-primary: #121212;
+            --bg-secondary: #1e1e1e;
+            --bg-tertiary: #2d2d2d;
+            --text-primary: #e9ecef;
+            --text-secondary: #adb5bd;
+            --border: #495057;
+            --panel-bg: #1e1e1e;
+            --panel-border: #495057;
+            --header-bg: #2d2d2d;
+        }
+
+        * {
+            box-sizing: border-box;
             margin: 0;
-            padding: 20px;
-            background-color: #f5f5f5;
+            padding: 0;
         }
+
+        body {
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            padding: 20px;
+            transition: background-color 0.3s, color 0.3s;
+        }
+
         .container {
-            max-width: 1200px;
+            max-width: 1400px;
             margin: 0 auto;
-            background: white;
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
             border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+
+        .header {
+            background: var(--header-bg);
             padding: 20px;
+            border-bottom: 1px solid var(--panel-border);
         }
-        h1 {
-            color: #333;
-            text-align: center;
+
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 8px;
         }
-        .placeholder {
-            text-align: center;
-            color: #666;
-            font-style: italic;
-            padding: 40px;
-            border: 2px dashed #ddd;
+
+        .header p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .theme-toggle {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
             border-radius: 4px;
-            margin: 20px 0;
+            padding: 8px 12px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.9rem;
+            color: var(--text-primary);
+        }
+
+        .panels {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 1px;
+            background: var(--border);
+            min-height: 600px;
+        }
+
+        .panel {
+            background: var(--panel-bg);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .panel-header {
+            margin-bottom: 20px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .panel-header h2 {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .panel-header p {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+
+        /* Session Browser Panel */
+        .session-browser .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .session-browser input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.9rem;
+        }
+
+        .session-browser button {
+            padding: 8px 16px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        .session-browser button:hover {
+            opacity: 0.9;
+        }
+
+        .session-browser button:disabled {
+            background: var(--bg-tertiary);
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+
+        .memory-list {
+            flex: 1;
+            overflow-y: auto;
+            max-height: 400px;
+        }
+
+        .memory-item {
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .memory-item:hover {
+            background: var(--bg-secondary);
+        }
+
+        .memory-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+
+        .memory-type-badge {
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            text-transform: uppercase;
+        }
+
+        .memory-type-decision { background: #0d6efd; color: white; }
+        .memory-type-error { background: #dc3545; color: white; }
+        .memory-type-fact { background: #198754; color: white; }
+        .memory-type-preference { background: #ffc107; color: black; }
+        .memory-type-context { background: #6c757d; color: white; }
+
+        .memory-timestamp {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .memory-content {
+            font-size: 0.85rem;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+
+        /* Compile Playground Panel */
+        .compile-playground .input-group {
+            margin-bottom: 15px;
+        }
+
+        .compile-playground label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        .compile-playground textarea {
+            width: 100%;
+            height: 150px;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+            font-size: 0.85rem;
+            resize: vertical;
+        }
+
+        .compile-playground input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.9rem;
+        }
+
+        .compile-button-container {
+            display: flex;
+            gap: 10px;
+            margin: 15px 0;
+        }
+
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid transparent;
+            border-top: 2px solid var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            display: none;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .compile-results {
+            flex: 1;
+            overflow-y: auto;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 15px;
+            font-size: 0.85rem;
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+        }
+
+        .result-item {
+            margin-bottom: 10px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .result-item:last-child {
+            margin-bottom: 0;
+            padding-bottom: 0;
+            border-bottom: none;
+        }
+
+        .result-label {
+            font-weight: 500;
+            color: var(--text-primary);
+            margin-bottom: 4px;
+        }
+
+        .result-value {
+            color: var(--accent);
+            font-weight: 500;
+        }
+
+        /* Trace Viewer Panel */
+        .trace-viewer .summary-stats {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 20px;
+            font-size: 0.85rem;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            text-align: center;
+        }
+
+        .stat-item {
+            padding: 10px;
+        }
+
+        .stat-value {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: var(--accent);
+            margin-bottom: 4px;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
+
+        .intent-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 16px;
+            background: var(--accent);
+            color: white;
+            font-size: 0.8rem;
+            font-weight: 500;
+            margin-bottom: 15px;
+        }
+
+        .confidence-high { background: var(--success); }
+        .confidence-medium { background: var(--warning); color: black; }
+        .confidence-low { background: var(--danger); }
+
+        .memory-trace-list {
+            flex: 1;
+            overflow-y: auto;
+            max-height: 400px;
+        }
+
+        .trace-memory-item {
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            margin-bottom: 8px;
+        }
+
+        .trace-memory-item.excluded {
+            opacity: 0.6;
+            background: var(--bg-secondary);
+        }
+
+        .trace-memory-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .trace-memory-info {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .exclusion-badge {
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.7rem;
+            background: var(--danger);
+            color: white;
+        }
+
+        .score-bar {
+            height: 20px;
+            background: var(--bg-tertiary);
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 10px 0;
+            display: flex;
+        }
+
+        .score-segment {
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.6rem;
+            color: white;
+            font-weight: 500;
+        }
+
+        .score-s { background: #0d6efd; } /* Semantic */
+        .score-r { background: #198754; } /* Recency */
+        .score-i { background: #ffc107; color: black; } /* Importance */
+        .score-t { background: #6f42c1; } /* Task Alignment */
+
+        .score-details {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+            font-size: 0.75rem;
+            margin-top: 8px;
+        }
+
+        .score-detail {
+            text-align: center;
+        }
+
+        .score-label {
+            color: var(--text-secondary);
+            margin-bottom: 2px;
+        }
+
+        .score-value {
+            font-weight: 500;
+        }
+
+        /* Modal/Drawer */
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            display: none;
+        }
+
+        .modal-content {
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            width: 90%;
+            max-width: 600px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--panel-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-header h3 {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+
+        .close-button {
+            background: none;
+            border: none;
+            font-size: 1.5rem;
+            cursor: pointer;
+            color: var(--text-primary);
+        }
+
+        .modal-body {
+            padding: 20px;
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+            font-size: 0.9rem;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        /* Error handling */
+        .error-message {
+            background: rgba(220, 53, 69, 0.1);
+            border: 1px solid var(--danger);
+            border-radius: 4px;
+            padding: 12px;
+            color: var(--danger);
+            margin: 10px 0;
+            font-size: 0.85rem;
+        }
+
+        /* Responsive design */
+        @media (max-width: 1200px) {
+            .panels {
+                grid-template-columns: 1fr;
+                gap: 20px;
+            }
+            
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 10px;
+            }
+            
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .score-details {
+                grid-template-columns: 1fr 1fr;
+            }
         }
     </style>
 </head>
 <body>
+    <button class="theme-toggle" id="themeToggle">🌙 Dark Mode</button>
+    
     <div class="container">
-        <h1>Synapse Context Compiler - Trace Inspector</h1>
-        <div class="placeholder">
-            <p>This is a placeholder for the Synapse Trace Inspector UI.</p>
-            <p>Future implementation will display memory traces, compilation results, and context scoring visualizations.</p>
+        <div class="header">
+            <h1>Synapse Context Compiler - Trace Inspector</h1>
+            <p>Inspect AI conversation history compilation, memory traces, and context scoring</p>
+        </div>
+        
+        <div class="panels">
+            <!-- Panel 1: Session Browser -->
+            <div class="panel session-browser">
+                <div class="panel-header">
+                    <h2>Session Browser</h2>
+                    <p>Browse stored memories by session ID</p>
+                </div>
+                
+                <div class="input-group">
+                    <input type="text" id="sessionIdInput" placeholder="Enter session ID..." />
+                    <button id="fetchMemoriesBtn">Fetch</button>
+                </div>
+                
+                <div class="memory-list" id="memoryList">
+                    <div class="empty-state">Enter a session ID and click Fetch to load memories</div>
+                </div>
+            </div>
+            
+            <!-- Panel 2: Compile Playground -->
+            <div class="panel compile-playground">
+                <div class="panel-header">
+                    <h2>Compile Playground</h2>
+                    <p>Test the context compilation pipeline</p>
+                </div>
+                
+                <div class="input-group">
+                    <label for="messagesJson">Messages JSON Array:</label>
+                    <textarea id="messagesJson" placeholder='[{"role": "user", "content": "Hello"}, ...]'></textarea>
+                </div>
+                
+                <div class="input-group">
+                    <label for="compileSessionId">Session ID (optional):</label>
+                    <input type="text" id="compileSessionId" placeholder="Enter session ID..." />
+                </div>
+                
+                <div class="compile-button-container">
+                    <button id="compileBtn">Compile</button>
+                    <div class="spinner" id="compileSpinner"></div>
+                </div>
+                
+                <div class="error-message" id="compileError" style="display: none;"></div>
+                
+                <div class="compile-results" id="compileResults">
+                    <div class="empty-state">Compile a session to see results</div>
+                </div>
+            </div>
+            
+            <!-- Panel 3: Trace Viewer -->
+            <div class="panel trace-viewer">
+                <div class="panel-header">
+                    <h2>Trace Viewer</h2>
+                    <p>Visualize the compilation trace and scoring</p>
+                </div>
+                
+                <div id="traceContent">
+                    <div class="empty-state">Compile a session to view trace data</div>
+                </div>
+            </div>
         </div>
     </div>
+    
+    <!-- Memory Detail Modal -->
+    <div class="modal" id="memoryModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Memory Details</h3>
+                <button class="close-button" id="closeModal">&times;</button>
+            </div>
+            <div class="modal-body" id="memoryDetailContent"></div>
+        </div>
+    </div>
+    
+    <script>
+        // Theme management
+        const themeToggle = document.getElementById('themeToggle');
+        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        
+        function setTheme(theme) {
+            document.body.setAttribute('data-theme', theme);
+            localStorage.setItem('theme', theme);
+            themeToggle.textContent = theme === 'dark' ? '☀️ Light Mode' : '🌙 Dark Mode';
+        }
+        
+        // Initialize theme
+        const savedTheme = localStorage.getItem('theme');
+        if (savedTheme) {
+            setTheme(savedTheme);
+        } else {
+            setTheme(prefersDark ? 'dark' : 'light');
+        }
+        
+        themeToggle.addEventListener('click', () => {
+            const currentTheme = document.body.getAttribute('data-theme');
+            setTheme(currentTheme === 'dark' ? 'light' : 'dark');
+        });
+        
+        // Session Browser functionality
+        const sessionIdInput = document.getElementById('sessionIdInput');
+        const fetchMemoriesBtn = document.getElementById('fetchMemoriesBtn');
+        const memoryList = document.getElementById('memoryList');
+        
+        fetchMemoriesBtn.addEventListener('click', async () => {
+            const sessionId = sessionIdInput.value.trim();
+            if (!sessionId) {
+                alert('Please enter a session ID');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/v1/memories?session_id=${encodeURIComponent(sessionId)}&limit=20`);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+                }
+                
+                const memories = await response.json();
+                displayMemories(memories);
+            } catch (error) {
+                memoryList.innerHTML = `<div class="error-message">Error: ${error.message}</div>`;
+            }
+        });
+        
+        function displayMemories(memories) {
+            if (!memories || memories.length === 0) {
+                memoryList.innerHTML = '<div class="empty-state">No memories found for this session</div>';
+                return;
+            }
+            
+            memoryList.innerHTML = memories.map(memory => `
+                <div class="memory-item" data-memory='${JSON.stringify(memory)}'>
+                    <div class="memory-header">
+                        <span class="memory-type-badge memory-type-${memory.memory_type}">${memory.memory_type}</span>
+                        <span class="memory-timestamp">${new Date(memory.timestamp).toLocaleString()}</span>
+                    </div>
+                    <div class="memory-content">${memory.content.substring(0, 80)}${memory.content.length > 80 ? '...' : ''}</div>
+                </div>
+            `).join('');
+            
+            // Add click handlers for memory items
+            document.querySelectorAll('.memory-item').forEach(item => {
+                item.addEventListener('click', () => {
+                    const memory = JSON.parse(item.getAttribute('data-memory'));
+                    showMemoryDetail(memory);
+                });
+            });
+        }
+        
+        // Memory detail modal
+        const memoryModal = document.getElementById('memoryModal');
+        const memoryDetailContent = document.getElementById('memoryDetailContent');
+        const closeModal = document.getElementById('closeModal');
+        
+        function showMemoryDetail(memory) {
+            memoryDetailContent.textContent = JSON.stringify(memory, null, 2);
+            memoryModal.style.display = 'flex';
+        }
+        
+        closeModal.addEventListener('click', () => {
+            memoryModal.style.display = 'none';
+        });
+        
+        memoryModal.addEventListener('click', (e) => {
+            if (e.target === memoryModal) {
+                memoryModal.style.display = 'none';
+            }
+        });
+        
+        // Compile Playground functionality
+        const messagesJson = document.getElementById('messagesJson');
+        const compileSessionId = document.getElementById('compileSessionId');
+        const compileBtn = document.getElementById('compileBtn');
+        const compileSpinner = document.getElementById('compileSpinner');
+        const compileError = document.getElementById('compileError');
+        const compileResults = document.getElementById('compileResults');
+        
+        // Load sample data
+        messagesJson.value = JSON.stringify([
+            {
+                "role": "system",
+                "content": "You are a helpful assistant."
+            },
+            {
+                "role": "user",
+                "content": "Hello, how are you?"
+            },
+            {
+                "role": "assistant",
+                "content": "I'm doing well, thank you for asking! How can I help you today?"
+            },
+            {
+                "role": "user",
+                "content": "Can you explain what Synapse does?"
+            }
+        ], null, 2);
+        
+        compileBtn.addEventListener('click', async () => {
+            const sessionId = compileSessionId.value.trim();
+            
+            try {
+                let messages;
+                try {
+                    messages = JSON.parse(messagesJson.value);
+                    if (!Array.isArray(messages)) {
+                        throw new Error('Messages must be an array');
+                    }
+                } catch (parseError) {
+                    throw new Error('Invalid JSON: ' + parseError.message);
+                }
+                
+                // Show loading state
+                compileBtn.disabled = true;
+                compileSpinner.style.display = 'block';
+                compileError.style.display = 'none';
+                
+                const requestBody = {
+                    messages: messages,
+                    session_id: sessionId || undefined
+                };
+                
+                const response = await fetch('/v1/compile', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(requestBody)
+                });
+                
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`HTTP ${response.status}: ${errorText}`);
+                }
+                
+                const result = await response.json();
+                displayCompileResults(result);
+                
+                // Also display trace in the trace viewer
+                if (result.trace) {
+                    displayTrace(result.trace);
+                }
+                
+            } catch (error) {
+                compileError.textContent = `Error: ${error.message}`;
+                compileError.style.display = 'block';
+            } finally {
+                compileBtn.disabled = false;
+                compileSpinner.style.display = 'none';
+            }
+        });
+        
+        function displayCompileResults(result) {
+            const compiledCount = result.compiled_messages ? result.compiled_messages.length : 0;
+            const tokensUsed = result.trace ? result.trace.tokens_used : 0;
+            const tokenBudget = result.trace ? result.trace.token_budget : 0;
+            const compileDuration = result.trace ? result.trace.compile_duration_ms : 0;
+            
+            compileResults.innerHTML = `
+                <div class="result-item">
+                    <div class="result-label">Compiled Messages</div>
+                    <div class="result-value">${compiledCount}</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-label">Tokens Used / Budget</div>
+                    <div class="result-value">${tokensUsed} / ${tokenBudget}</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-label">Compile Duration</div>
+                    <div class="result-value">${compileDuration} ms</div>
+                </div>
+                <div class="result-item">
+                    <div class="result-label">Request ID</div>
+                    <div class="result-value">${result.trace?.request_id || 'N/A'}</div>
+                </div>
+            `;
+        }
+        
+        // Trace Viewer functionality
+        const traceContent = document.getElementById('traceContent');
+        
+        function displayTrace(trace) {
+            if (!trace) {
+                traceContent.innerHTML = '<div class="empty-state">No trace data available</div>';
+                return;
+            }
+            
+            // Intent badge with confidence coloring
+            let confidenceClass = 'confidence-low';
+            if (trace.intent_confidence >= 0.8) confidenceClass = 'confidence-high';
+            else if (trace.intent_confidence >= 0.5) confidenceClass = 'confidence-medium';
+            
+            // Summary stats
+            traceContent.innerHTML = `
+                <div class="summary-stats">
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <div class="stat-value">${trace.candidates_retrieved}</div>
+                            <div class="stat-label">Candidates</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value">${trace.candidates_after_dedup}</div>
+                            <div class="stat-label">After Dedup</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value">${trace.memories_compiled}</div>
+                            <div class="stat-label">Compiled</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value">${trace.tokens_used}/${trace.token_budget}</div>
+                            <div class="stat-label">Tokens</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="intent-badge ${confidenceClass}">
+                    Intent: ${trace.detected_intent} (${(trace.intent_confidence * 100).toFixed(1)}%)
+                </div>
+                
+                <div class="memory-trace-list" id="memoryTraceList">
+                    ${trace.memories.map(memory => renderMemoryTrace(memory)).join('')}
+                </div>
+            `;
+        }
+        
+        function renderMemoryTrace(memory) {
+            // Calculate segment widths for the score bar
+            const totalScore = memory.score_total || 0.001; // Avoid division by zero
+            const sWidth = (memory.score_semantic / totalScore) * 100;
+            const rWidth = (memory.score_recency / totalScore) * 100;
+            const iWidth = (memory.score_importance / totalScore) * 100;
+            const tWidth = (memory.score_task_alignment / totalScore) * 100;
+            
+            return `
+                <div class="trace-memory-item ${memory.included ? '' : 'excluded'}">
+                    <div class="trace-memory-header">
+                        <div class="trace-memory-info">
+                            <span class="memory-type-badge memory-type-${memory.memory_type}">${memory.memory_type}</span>
+                            <span class="memory-content">${memory.content_preview.substring(0, 60)}${memory.content_preview.length > 60 ? '...' : ''}</span>
+                        </div>
+                        ${!memory.included ? `<span class="exclusion-badge">${memory.exclusion_reason || 'excluded'}</span>` : ''}
+                    </div>
+                    
+                    <div class="score-bar">
+                        <div class="score-segment score-s" style="width: ${sWidth}%">${memory.score_semantic.toFixed(2)}</div>
+                        <div class="score-segment score-r" style="width: ${rWidth}%">${memory.score_recency.toFixed(2)}</div>
+                        <div class="score-segment score-i" style="width: ${iWidth}%">${memory.score_importance.toFixed(2)}</div>
+                        <div class="score-segment score-t" style="width: ${tWidth}%">${memory.score_task_alignment.toFixed(2)}</div>
+                    </div>
+                    
+                    <div class="score-details">
+                        <div class="score-detail">
+                            <div class="score-label">Total</div>
+                            <div class="score-value">${memory.score_total.toFixed(2)}</div>
+                        </div>
+                        <div class="score-detail">
+                            <div class="score-label">S</div>
+                            <div class="score-value">${memory.score_semantic.toFixed(2)}</div>
+                        </div>
+                        <div class="score-detail">
+                            <div class="score-label">R</div>
+                            <div class="score-value">${memory.score_recency.toFixed(2)}</div>
+                        </div>
+                        <div class="score-detail">
+                            <div class="score-label">I</div>
+                            <div class="score-value">${memory.score_importance.toFixed(2)}</div>
+                        </div>
+                        <div class="score-detail">
+                            <div class="score-label">T</div>
+                            <div class="score-value">${memory.score_task_alignment.toFixed(2)}</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+        
+        // Handle rate limiting and other HTTP errors
+        async function fetchWithRetry(url, options = {}) {
+            const maxRetries = 3;
+            let retries = 0;
+            
+            while (retries < maxRetries) {
+                try {
+                    const response = await fetch(url, options);
+                    
+                    if (response.status === 429) {
+                        const retryAfter = response.headers.get('Retry-After') || 1;
+                        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+                        retries++;
+                        continue;
+                    }
+                    
+                    return response;
+                } catch (error) {
+                    if (retries === maxRetries - 1) throw error;
+                    retries++;
+                    await new Promise(resolve => setTimeout(resolve, 1000 * retries));
+                }
+            }
+        }
+    </script>
 </body>
 </html>

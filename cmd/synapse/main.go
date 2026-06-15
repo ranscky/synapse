@@ -22,6 +22,8 @@ import (
 	"synapse/internal/store"
 )
 
+var uiHTML []byte
+
 var (
 	configPath     = flag.String("config", "synapse.yaml", "Path to configuration file")
 	upstream       = flag.String("upstream", "", "Override upstream URL")
@@ -31,6 +33,22 @@ var (
 
 func main() {
 	flag.Parse()
+
+	// Load UI HTML file
+	var err error
+	uiHTML, err = os.ReadFile("ui/index.html")
+	if err != nil {
+		// Try alternative path for when running from cmd/synapse directory
+		uiHTML, err = os.ReadFile("../../ui/index.html")
+		if err != nil {
+			// Try path when binary is in project root
+			uiHTML, err = os.ReadFile("../ui/index.html")
+			if err != nil {
+				slog.Warn("Failed to load UI file, UI will not be available", "error", err)
+				uiHTML = []byte("<html><body><h1>UI not available</h1></body></html>")
+			}
+		}
+	}
 
 	// Load configuration
 	cfg, err := loadConfig(*configPath)
@@ -121,6 +139,16 @@ func main() {
 
 	// Register proxy routes
 	proxyInstance.RegisterRoutes(r)
+
+	// Serve UI at GET /ui
+	r.Get("/ui", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write(uiHTML)
+	})
+
+	// Add link to UI in startup log
+	slog.Info("Trace inspector available at http://" + cfg.ListenAddr + "/ui")
 
 	// Start server
 	server := &http.Server{
