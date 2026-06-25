@@ -50,8 +50,9 @@ func Fill(candidates []scorer.ScoredMemory, budgetTokens int) ([]scorer.ScoredMe
 			totalTokens = budgetTokens / 2
 			break
 		} else {
-			// Budget exceeded and we already have some memories, stop here
-			break
+			// else: this candidate doesn't fit, but smaller lower-ranked candidates
+			// might still fit in the remaining space — keep checking instead of
+			// stopping the whole selection here.
 		}
 	}
 

@@ -44,10 +44,21 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Set file permissions to 0600
-	if err := os.Chmod(dbPath, 0600); err != nil {
-		slog.Warn("Failed to set database file permissions", "error", err)
+	// SQLite's :memory: database is per-connection, not per-process. Without
+	// this, concurrent requests can cause Go's database/sql to open additional
+	// connections, each getting its own empty, schema-less in-memory database
+	// (since initSchema only ran against the first connection). Forcing a
+	// single connection keeps :memory: behaving as one shared database.
+	if dbPath == ":memory:" {
+		db.SetMaxOpenConns(1)
 	}
+
+	// Set file permissions to 0600
+	if dbPath != ":memory:" {
+    if err := os.Chmod(dbPath, 0600); err != nil {
+        slog.Warn("Failed to set database file permissions", "error", err)
+    }
+}
 
 	store := &Store{db: db}
 	

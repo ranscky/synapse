@@ -85,9 +85,10 @@ func TestClassify(t *testing.T) {
 			maxConfidence:  0.05, // Should be below threshold
 		},
 		{
-			name:           "Mixed keywords - should pick highest scoring",
+			name:           "Mixed keywords - tied score, resolved by fixed priority order",
 			input:          "Fix the error and implement the function",
-			expectedIntent: Code, // Code actually has higher score due to more keywords
+			expectedIntent: Debug, // Debug and Code tie 2-2 ("fix"/"error" vs "implement"/"function");
+			                       // resolved deterministically by priorityOrder in Classify, which favors Debug
 			minConfidence:  0.1,
 			maxConfidence:  1.0,
 		},

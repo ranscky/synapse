@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,11 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"synapse/internal/config"
+	"synapse/internal/store"
+	"synapse/internal/trace"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"synapse/internal/config"
-	"synapse/internal/store"
 )
 
 // mockStore implements MemoryStore for testing
@@ -198,7 +201,13 @@ func TestProxyUpstreamUnavailable(t *testing.T) {
 
 // TestProxyContextValues tests that intent and scored memories are handled correctly
 func TestProxyContextValues(t *testing.T) {
-	// Test that the proxy can handle a typical request flow
+	// NOTE: context.WithValue is an in-process Go construct. Because
+	// p.upstream.ServeHTTP forwards the request over a real HTTP connection
+	// to testServer, the upstream handler receives a brand-new *http.Request
+	// with a fresh context — Go context values cannot survive serialization
+	// over the wire. So intent/confidence can't be observed from the mock
+	// upstream's handler; they can only be verified via the trace header,
+	// which is the actual externally-observable channel for this data.
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("response"))
@@ -215,16 +224,37 @@ func TestProxyContextValues(t *testing.T) {
 	server := httptest.NewServer(r)
 	defer server.Close()
 
-	// Send a request that should trigger debug intent classification
-	resp, err := http.Post(server.URL+"/v1/messages", "application/json",
+	// Send a request that should trigger debug intent classification,
+	// with tracing enabled so we can inspect the result.
+	req, err := http.NewRequest("POST", server.URL+"/v1/messages",
 		bytes.NewBufferString(`{"messages":[{"role":"user","content":"fix this error in the code"}]}`))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Synapse-Trace", "true")
+
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	
+
 	// Verify the response body
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	assert.Equal(t, "response", string(body))
+
+	// Verify intent classification happened and is reported correctly via
+	// the trace header (the actual externally-observable result).
+	traceHeader := resp.Header.Get("X-Synapse-Trace-Result")
+	require.NotEmpty(t, traceHeader, "trace header should be present when X-Synapse-Trace is set")
+
+	decodedTrace, err := base64.StdEncoding.DecodeString(traceHeader)
+	require.NoError(t, err)
+
+	var traceData trace.TraceManifest
+	err = json.Unmarshal(decodedTrace, &traceData)
+	require.NoError(t, err)
+
+	assert.Equal(t, "debug", traceData.DetectedIntent,
+		"message containing 'fix this error in the code' should classify as debug intent")
 }

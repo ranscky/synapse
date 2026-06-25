@@ -23,18 +23,21 @@ type ScoredMemory struct {
 }
 
 // Scorer handles the 4-factor scoring of memory candidates
+// Scorer needs confidence as input
 type Scorer struct {
-	weights Weights
-	now     time.Time
-	intent  classifier.Intent
+	weights    Weights
+	now        time.Time
+	intent     classifier.Intent
+	confidence float64 // NEW
 }
 
 // NewScorer creates a new scorer with the specified weights and intent
-func NewScorer(weights Weights, intent classifier.Intent, now time.Time) *Scorer {
+func NewScorer(weights Weights, intent classifier.Intent, confidence float64, now time.Time) *Scorer {
 	return &Scorer{
-		weights: weights,
-		now:     now,
-		intent:  intent,
+		weights:    weights,
+		now:        now,
+		intent:     intent,
+		confidence: confidence,
 	}
 }
 
@@ -133,6 +136,15 @@ func (s *Scorer) scoreMemory(query []float32, memory store.MemoryEntry, minHours
 	}
 	scoreR := 1.0 / (1.0 + hoursSince)
 	
+	// T (Task Alignment): blend the intent-specific weight with the generic
+	// fallback weight, proportional to classifier confidence. Low confidence
+	// means we trust the detected intent less, so we lean toward the
+	// intent-agnostic baseline instead of fully committing to a possibly-wrong
+	// task alignment signal.
+	intentWeight := GetTaskAlignmentWeight(s.intent, MemoryType(memory.MemoryType))
+	genericWeight := GetTaskAlignmentWeight(classifier.Generic, MemoryType(memory.MemoryType))
+	scoreT := s.confidence*intentWeight + (1-s.confidence)*genericWeight
+
 	// Normalize recency score to 0.0-1.0 range
 	if maxHours > minHours {
 		scoreR = (scoreR - (1.0/(1.0+maxHours))) / ((1.0/(1.0+minHours)) - (1.0/(1.0+maxHours)))
@@ -144,7 +156,7 @@ func (s *Scorer) scoreMemory(query []float32, memory store.MemoryEntry, minHours
 	scoreI := getImportanceScore(MemoryType(memory.MemoryType))
 
 	// T (Task Alignment): TaskWeights[intent][memory.MemoryType]
-	scoreT := GetTaskAlignmentWeight(s.intent, MemoryType(memory.MemoryType))
+	// scoreT := GetTaskAlignmentWeight(s.intent, MemoryType(memory.MemoryType))
 
 	// Total = S*wS + R*wR + I*wI + T*wT
 	total := scoreS*s.weights.SemanticSimilarity +

@@ -167,7 +167,7 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	var scoredMemories []scorer.ScoredMemory
 	if len(candidates) > 0 && len(queryEmbedding) > 0 {
 		weights := scorer.GetWeights(0.4, 0.2, 0.2, 0.2)
-		scorerInstance := scorer.NewScorer(weights, intent, time.Now())
+		scorerInstance := scorer.NewScorer(weights, intent, float64(confidence), time.Now())
 		scoredMemories = scorerInstance.Score(ctx, queryEmbedding, candidates)
 
 		slog.Info("4-factor sieve completed",

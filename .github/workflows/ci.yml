@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go-version: [1.22]
+    
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ matrix.go-version }}
+    
+    - name: Download dependencies
+      run: go mod download
+    
+    - name: Run tests
+      run: go test -v ./...
+    
+    - name: Build binary
+      run: go build -o synapse ./cmd/synapse
+    
+    - name: Check binary size
+      shell: bash
+      run: |
+        binary_size=$(du -k synapse | cut -f1)
+        if [ $binary_size -gt 51200 ]; then
+          echo "Binary size ($binary_size KB) exceeds 50MB limit"
+          exit 1
+        else
+          echo "Binary size ($binary_size KB) is within 50MB limit"
+        fi
+      if: matrix.os != 'windows-latest'
+    
+    - name: Check binary size (Windows)
+      shell: pwsh
+      run: |
+        $binary_size = (Get-Item synapse.exe).Length / 1KB
+        if ($binary_size -gt 51200) {
+          Write-Error "Binary size ($binary_size KB) exceeds 50MB limit"
+        } else {
+          Write-Output "Binary size ($binary_size KB) is within 50MB limit"
+        }
+      if: matrix.os == 'windows-latest'
+
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.22
+    
+    - name: Download dependencies
+      run: go mod download
+    
+    - name: Build benchmark tool
+      run: go build -o benchmark ./cmd/benchmark
+    
+    - name: Run benchmark on debug session
+      run: ./benchmark testdata/session_debug.json
+    
+    - name: Run benchmark on code session
+      run: ./benchmark testdata/session_code.json
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.22
+    
+    - name: Smoke test go install
+      run: |
+        go install ./cmd/synapse
+        which synapse
+        synapse --help

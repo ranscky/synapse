@@ -1,6 +1,8 @@
 package dedup
 
 import (
+	"math"
+
 	"synapse/internal/scorer"
 )
 
@@ -12,7 +14,7 @@ func Deduplicate(scored []scorer.ScoredMemory, threshold float64) []scorer.Score
 
 	// Result slice to hold non-duplicated memories
 	result := make([]scorer.ScoredMemory, 0, len(scored))
-	
+
 	// For each memory, check similarity against already accepted memories
 	for _, current := range scored {
 		// Check if current memory is similar to any already accepted memory
@@ -24,13 +26,13 @@ func Deduplicate(scored []scorer.ScoredMemory, threshold float64) []scorer.Score
 				break
 			}
 		}
-		
+
 		// If not a duplicate, add to result
 		if !isDuplicate {
 			result = append(result, current)
 		}
 	}
-	
+
 	return result
 }
 
@@ -51,5 +53,5 @@ func cosineSimilarity(a, b []float32) float64 {
 		return 0.0
 	}
 
-	return dotProduct / (float64(normA) * float64(normB))
+	return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB))
 }

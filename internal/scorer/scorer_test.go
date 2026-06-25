@@ -5,10 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/stretchr/testify/assert"
 	"synapse/internal/classifier"
 	"synapse/internal/store"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestCosineSimilarity(t *testing.T) {
@@ -108,7 +109,7 @@ func TestScorerScore(t *testing.T) {
 
 	// Create scorer with debug intent (high weight for errors)
 	weights := GetWeights(0.4, 0.2, 0.2, 0.2)
-	scorer := NewScorer(weights, classifier.Debug, now)
+	scorer := NewScorer(weights, classifier.Debug, float64(0.9), now)
 
 	// Score the memories
 	ctx := context.Background()
@@ -133,7 +134,7 @@ func TestScorerScore(t *testing.T) {
 
 func TestScorerEmptyCandidates(t *testing.T) {
 	weights := GetWeights(0.4, 0.2, 0.2, 0.2)
-	scorer := NewScorer(weights, classifier.Generic, time.Now())
+	scorer := NewScorer(weights, classifier.Generic, float64(0.5), time.Now())
 	
 	ctx := context.Background()
 	scored := scorer.Score(ctx, []float32{1.0}, []store.MemoryEntry{})
