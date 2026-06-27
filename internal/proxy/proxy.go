@@ -31,6 +31,8 @@ const (
 	ScoredMemoriesKey ContextKey = "scored_memories"
 	IntentKey         ContextKey = "intent"
 	ConfidenceKey     ContextKey = "confidence"
+	SessionIDKey      ContextKey = "session_id"
+	UserMessageKey    ContextKey = "user_message"
 )
 
 // Embedder is the interface for generating text embeddings.
@@ -75,10 +77,14 @@ func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.
 		config:   cfg,
 	}
 
-	// Create reverse proxy with simple director
+	// Create reverse proxy with director and response capture
 	proxy.upstream = &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			proxy.director(req)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			proxy.captureResponse(resp)
+			return nil
 		},
 	}
 
@@ -106,6 +112,90 @@ func (p *Proxy) director(req *http.Request) {
 	// But we never log its value anywhere
 }
 
+// captureResponse reads the upstream's response, extracts the assistant's
+// reply, and writes it to the store as a memory entry — completing the
+// write path so memory captures both sides of the conversation, not just
+// the user's outgoing message. Best-effort: any failure here is logged but
+// never blocks the response from reaching the original client, since
+// resp.Body must still be readable by whoever called Synapse.
+func (p *Proxy) captureResponse(resp *http.Response) {
+	if p.store == nil {
+		return
+	}
+
+	req := resp.Request
+	if req == nil {
+		return
+	}
+
+	ctx := req.Context()
+	sessionID, _ := ctx.Value(SessionIDKey).(string)
+	if sessionID == "" {
+		sessionID = "default-session"
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Error("Failed to read upstream response body for memory capture", "error", err)
+		return
+	}
+	resp.Body.Close()
+	// Restore the body so the original client still receives it.
+	resp.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	assistantReply := extractAssistantReply(body)
+	if assistantReply == "" {
+		// Couldn't find a reply in the expected shape - nothing to write,
+		// but the response to the client is unaffected either way.
+		return
+	}
+
+	var embedding []float32
+	if p.embedder != nil {
+		embedding, err = p.embedder.Embed(ctx, assistantReply)
+		if err != nil {
+			slog.Error("Failed to generate embedding for assistant reply", "error", err)
+		}
+	}
+
+	memEntry := store.MemoryEntry{
+		ID:         generateRequestID(),
+		SessionID:  sessionID,
+		Content:    assistantReply,
+		MemoryType: store.DetectMemoryType(assistantReply),
+		Timestamp:  time.Now(),
+		Embedding:  embedding,
+	}
+
+	if writeErr := p.store.Write(ctx, memEntry); writeErr != nil {
+		slog.Error("Failed to write assistant reply to memory", "error", writeErr)
+	}
+}
+
+// extractAssistantReply parses an OpenAI-shaped chat completion response
+// body and returns the assistant's message content. Returns an empty
+// string if the body doesn't match the expected shape, rather than erroring -
+// this is a best-effort extraction, not a strict contract with the upstream.
+func extractAssistantReply(body []byte) string {
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return ""
+	}
+
+	if len(parsed.Choices) == 0 {
+		return ""
+	}
+
+	return parsed.Choices[0].Message.Content
+}
+
 // HandleMessages handles POST /v1/messages requests with full pipeline
 func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
@@ -123,8 +213,29 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// Restore body for upstream (since we consumed it)
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
-	// Extract the last user message for classification
-	lastUserMessage := string(body) // Simplified - in reality parse JSON properly
+	// Parse the request body to extract the actual last user message,
+	// rather than using the raw JSON body (which previously fed the entire
+	// request structure into the classifier/embedder, diluting any real
+	// signal with JSON syntax, role labels, and unrelated message history).
+	var parsedRequest struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+
+	lastUserMessage := ""
+	if err := json.Unmarshal(body, &parsedRequest); err != nil {
+		slog.Warn("Failed to parse request body as JSON, falling back to raw body for classification", "error", err)
+		lastUserMessage = string(body)
+	} else {
+		for i := len(parsedRequest.Messages) - 1; i >= 0; i-- {
+			if parsedRequest.Messages[i].Role == "user" {
+				lastUserMessage = parsedRequest.Messages[i].Content
+				break
+			}
+		}
+	}
 
 	// 1. Classify the intent
 	classifyResult := classifier.Classify(lastUserMessage)
@@ -138,10 +249,12 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Get candidates from store (only if store is available)
+	// sessionID is declared at function scope (not just inside this block)
+	// because it's needed again later when writing the assistant's reply
+	// via ModifyResponse.
+	sessionID := "default-session"
 	var candidates []store.MemoryEntry
 	if p.store != nil {
-		// In a real implementation, you'd extract session ID from headers/context
-		sessionID := "default-session"
 		candidates, err = p.store.GetRecent(ctx, sessionID, 20)
 		if err != nil {
 			slog.Error("Failed to get candidates from store", "error", err)
@@ -160,6 +273,24 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// Continue with passthrough if embedding fails
 			p.upstream.ServeHTTP(w, r)
 			return
+		}
+	}
+
+	// 3b. Write this message to the store so memory actually accumulates
+	// from real traffic. Best-effort: a write failure shouldn't block the
+	// request from being forwarded upstream, but it is logged so silent
+	// data loss doesn't go unnoticed.
+	if p.store != nil && lastUserMessage != "" {
+		memEntry := store.MemoryEntry{
+			ID:         generateRequestID(),
+			SessionID:  sessionID,
+			Content:    lastUserMessage,
+			MemoryType: store.DetectMemoryType(lastUserMessage),
+			Timestamp:  time.Now(),
+			Embedding:  queryEmbedding,
+		}
+		if writeErr := p.store.Write(ctx, memEntry); writeErr != nil {
+			slog.Error("Failed to write memory entry", "error", writeErr)
 		}
 	}
 
@@ -278,10 +409,14 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// Check for persist traces flag (this would be passed from main)
 	// For now, we'll assume it's handled at a higher level
 
-	// Store results in context for downstream use
+	// Store results in context for downstream use, including data
+	// ModifyResponse will need to write the assistant's reply to the same
+	// session once the upstream responds.
 	ctx = context.WithValue(ctx, ScoredMemoriesKey, compileResult.Messages)
 	ctx = context.WithValue(ctx, IntentKey, intent)
 	ctx = context.WithValue(ctx, ConfidenceKey, confidence)
+	ctx = context.WithValue(ctx, SessionIDKey, sessionID)
+	ctx = context.WithValue(ctx, UserMessageKey, lastUserMessage)
 
 	// Create new request with updated context
 	r = r.WithContext(ctx)

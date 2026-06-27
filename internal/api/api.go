@@ -210,6 +210,23 @@ func (a *APIServer) handleCompile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// 3b. Write this message to the store so memory actually accumulates
+	// from real traffic. Best-effort: a write failure shouldn't block the
+	// response, but it is logged so silent data loss doesn't go unnoticed.
+	if a.store != nil && lastUserMessage != "" {
+		memEntry := store.MemoryEntry{
+			ID:         generateRequestID(),
+			SessionID:  sessionID,
+			Content:    lastUserMessage,
+			MemoryType: store.DetectMemoryType(lastUserMessage),
+			Timestamp:  time.Now(),
+			Embedding:  queryEmbedding,
+		}
+		if writeErr := a.store.Write(ctx, memEntry); writeErr != nil {
+			slog.Error("Failed to write memory entry", "error", writeErr)
+		}
+	}
 	
 	// 4. Score candidates using 4-factor model
 	var scoredMemories []scorer.ScoredMemory

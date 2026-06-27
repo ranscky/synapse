@@ -2,18 +2,23 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"synapse/internal/config"
 	"synapse/internal/store"
 	"synapse/internal/trace"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIntegration(t *testing.T) {
@@ -403,4 +408,31 @@ func TestPerformance(t *testing.T) {
 		t.Errorf("Performance below threshold: %.0f req/sec, expected at least 50", requestsPerSecond)
 	}
 }
+func TestAPICompileWritesMemory(t *testing.T) {
+	realStore, err := store.NewStore(":memory:")
+	require.NoError(t, err)
+	defer realStore.Close()
 
+	mockEmbedder := &mockEmbedder{}
+	cfg := config.DefaultConfig()
+	apiServer := NewAPIServer(realStore, mockEmbedder, cfg, false)
+
+	reqBody := `{"messages":[{"role":"user","content":"there was an error in the order handler causing a crash"}],"session_id":"write-test-session"}`
+	req := httptest.NewRequest("POST", "/v1/compile", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	apiServer.Router().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// Verify the message actually landed in the real store, with a real
+	// embedding attached.
+	ctx := context.Background()
+	entries, err := realStore.GetRecent(ctx, "write-test-session", 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "exactly one memory entry should have been written")
+
+	assert.Equal(t, "there was an error in the order handler causing a crash", entries[0].Content)
+	assert.Equal(t, "error", entries[0].MemoryType)
+	assert.NotEmpty(t, entries[0].Embedding, "written memory should have a real embedding attached")
+}

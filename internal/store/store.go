@@ -3,10 +3,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,6 +26,30 @@ type MemoryEntry struct {
 	Timestamp  time.Time `json:"timestamp"`             // Creation timestamp
 	Importance float64   `json:"importance,omitempty"`  // Importance score
 	Embedding  []float32 `json:"embedding,omitempty"`   // 384-dim embedding vector
+}
+
+// embeddingToBytes serializes a []float32 embedding into a byte slice for
+// storage in a BLOB column. Each float32 is encoded as 4 bytes, little-endian.
+func embeddingToBytes(embedding []float32) []byte {
+	buf := make([]byte, len(embedding)*4)
+	for i, v := range embedding {
+		bits := math.Float32bits(v)
+		binary.LittleEndian.PutUint32(buf[i*4:], bits)
+	}
+	return buf
+}
+
+// bytesToEmbedding deserializes a byte slice back into a []float32 embedding.
+func bytesToEmbedding(data []byte) []float32 {
+	if len(data) == 0 {
+		return nil
+	}
+	embedding := make([]float32, len(data)/4)
+	for i := range embedding {
+		bits := binary.LittleEndian.Uint32(data[i*4:])
+		embedding[i] = math.Float32frombits(bits)
+	}
+	return embedding
 }
 
 // Store represents the memory store using SQLite-vec
@@ -81,7 +108,8 @@ func (s *Store) initSchema() error {
 		content TEXT NOT NULL,
 		memory_type TEXT NOT NULL,
 		timestamp DATETIME NOT NULL,
-		importance REAL DEFAULT 0.0
+		importance REAL DEFAULT 0.0,
+		embedding BLOB
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_memories_session_id ON memories(session_id);
@@ -123,11 +151,16 @@ func (s *Store) Write(ctx context.Context, entry MemoryEntry) error {
 
 	// Insert memory entry
 	insertQuery := `
-	INSERT OR REPLACE INTO memories (id, session_id, content, memory_type, timestamp, importance)
-	VALUES (?, ?, ?, ?, ?, ?)
+	INSERT OR REPLACE INTO memories (id, session_id, content, memory_type, timestamp, importance, embedding)
+	VALUES (?, ?, ?, ?, ?, ?, ?)
 	`
 
-	_, err := s.db.ExecContext(ctx, insertQuery, entry.ID, entry.SessionID, entry.Content, entry.MemoryType, entry.Timestamp, entry.Importance)
+	var embeddingBytes []byte
+	if len(entry.Embedding) > 0 {
+		embeddingBytes = embeddingToBytes(entry.Embedding)
+	}
+
+	_, err := s.db.ExecContext(ctx, insertQuery, entry.ID, entry.SessionID, entry.Content, entry.MemoryType, entry.Timestamp, entry.Importance, embeddingBytes)
 	if err != nil {
 		return fmt.Errorf("failed to insert memory: %w", err)
 	}
@@ -135,22 +168,33 @@ func (s *Store) Write(ctx context.Context, entry MemoryEntry) error {
 	return nil
 }
 
-// Search performs search using content matching (simplified implementation)
+// Search performs real semantic search using cosine similarity against
+// queryEmbedding. Candidates are pulled from SQLite (filtered by session,
+// not yet ranked), similarity is computed in Go against each candidate's
+// stored embedding, then results are sorted by similarity descending and
+// truncated to topK.
+//
+// This is an application-level implementation, not a native sqlite-vec
+// vector index - fine for per-session memory stores (realistically tens to
+// a few hundred entries), but doesn't scale the way a real vector index
+// would for very large stores. Noted as a future upgrade, not pretended
+// away.
 func (s *Store) Search(ctx context.Context, queryEmbedding []float32, sessionID string, topK int) ([]MemoryEntry, error) {
 	if topK <= 0 {
 		topK = 20 // Default to 20 if not specified
 	}
 
-	// Simplified search by content similarity (would use embeddings in full implementation)
+	// Pull all candidates for the session - we need the full set to rank by
+	// similarity, not just the most recent topK (recency and relevance are
+	// different things; limiting here before ranking would silently throw
+	// away the most semantically relevant older entries).
 	searchQuery := `
-	SELECT id, session_id, content, memory_type, timestamp, importance
+	SELECT id, session_id, content, memory_type, timestamp, importance, embedding
 	FROM memories
 	WHERE session_id = ?
-	ORDER BY timestamp DESC
-	LIMIT ?
 	`
 
-	rows, err := s.db.QueryContext(ctx, searchQuery, sessionID, topK)
+	rows, err := s.db.QueryContext(ctx, searchQuery, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search memories: %w", err)
 	}
@@ -159,10 +203,12 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, sessionID 
 	var entries []MemoryEntry
 	for rows.Next() {
 		var entry MemoryEntry
-		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance)
+		var embeddingBytes []byte
+		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance, &embeddingBytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan memory entry: %w", err)
 		}
+		entry.Embedding = bytesToEmbedding(embeddingBytes)
 		entries = append(entries, entry)
 	}
 
@@ -170,7 +216,70 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, sessionID 
 		return nil, fmt.Errorf("error iterating results: %w", err)
 	}
 
-	return entries, nil
+	// If there's no query embedding to compare against, fall back to
+	// recency ordering (the old behavior) rather than returning an
+	// arbitrary or undefined order.
+	if len(queryEmbedding) == 0 {
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Timestamp.After(entries[j].Timestamp)
+		})
+		if len(entries) > topK {
+			entries = entries[:topK]
+		}
+		return entries, nil
+	}
+
+	// Rank by cosine similarity against the query embedding.
+	type scoredEntry struct {
+		entry      MemoryEntry
+		similarity float64
+	}
+	scored := make([]scoredEntry, 0, len(entries))
+	for _, e := range entries {
+		sim := cosineSimilarity(queryEmbedding, e.Embedding)
+		scored = append(scored, scoredEntry{entry: e, similarity: sim})
+	}
+
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].similarity > scored[j].similarity
+	})
+
+	if len(scored) > topK {
+		scored = scored[:topK]
+	}
+
+	results := make([]MemoryEntry, len(scored))
+	for i, s := range scored {
+		results[i] = s.entry
+	}
+
+	return results, nil
+}
+
+// cosineSimilarity computes the cosine similarity between two vectors.
+// Duplicated from internal/scorer rather than imported, since internal/
+// scorer imports internal/store - importing scorer here would create a
+// circular import. Keep this in sync with scorer's version if either
+// changes; both must use math.Sqrt(normA)*math.Sqrt(normB), not
+// normA*normB (a real bug found and fixed in internal/dedup earlier in
+// this project for exactly this reason).
+func cosineSimilarity(a, b []float32) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0.0
+	}
+
+	var dotProduct, normA, normB float64
+	for i := range a {
+		dotProduct += float64(a[i] * b[i])
+		normA += float64(a[i] * a[i])
+		normB += float64(b[i] * b[i])
+	}
+
+	if normA == 0 || normB == 0 {
+		return 0.0
+	}
+
+	return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
 // GetRecent retrieves recent memory entries for a session
@@ -179,8 +288,9 @@ func (s *Store) GetRecent(ctx context.Context, sessionID string, limit int) ([]M
 		limit = 100 // Default limit
 	}
 
-	query := `
-	SELECT id, session_id, content, memory_type, timestamp, importance
+	
+query := `
+	SELECT id, session_id, content, memory_type, timestamp, importance, embedding
 	FROM memories
 	WHERE session_id = ?
 	ORDER BY timestamp DESC
@@ -196,13 +306,15 @@ func (s *Store) GetRecent(ctx context.Context, sessionID string, limit int) ([]M
 	var entries []MemoryEntry
 	for rows.Next() {
 		var entry MemoryEntry
-		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance)
+		var embeddingBytes []byte
+		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance, &embeddingBytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan memory entry: %w", err)
 		}
+		entry.Embedding = bytesToEmbedding(embeddingBytes)
 		entries = append(entries, entry)
 	}
-
+	
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating results: %w", err)
 	}

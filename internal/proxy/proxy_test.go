@@ -258,3 +258,100 @@ func TestProxyContextValues(t *testing.T) {
 	assert.Equal(t, "debug", traceData.DetectedIntent,
 		"message containing 'fix this error in the code' should classify as debug intent")
 }
+
+func TestProxyWritesMemoryFromRealTraffic(t *testing.T) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("response"))
+	}))
+	defer testServer.Close()
+
+	realStore, err := store.NewStore(":memory:")
+	require.NoError(t, err)
+	defer realStore.Close()
+
+	proxy, err := NewProxy(testServer.URL, realStore, &mockEmbedder{}, config.DefaultConfig())
+	require.NoError(t, err)
+	defer proxy.Close()
+
+	r := chi.NewRouter()
+	proxy.RegisterRoutes(r)
+
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/messages", "application/json",
+		bytes.NewBufferString(`{"messages":[{"role":"user","content":"there was an error in the order handler causing a crash"}]}`))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Verify the message actually landed in the real store, with a real
+	// embedding attached — this is the core write-path behavior that was
+	// previously completely missing.
+	ctx := context.Background()
+	entries, err := realStore.GetRecent(ctx, "default-session", 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "exactly one memory entry should have been written")
+
+	assert.Equal(t, "there was an error in the order handler causing a crash", entries[0].Content)
+	assert.Equal(t, "error", entries[0].MemoryType, "content mentioning an error should be detected as error type")
+	assert.NotEmpty(t, entries[0].Embedding, "written memory should have a real embedding attached")
+	assert.Equal(t, []float32{0.1, 0.2, 0.3}, entries[0].Embedding, "embedding should match what mockEmbedder produced")
+}
+
+func TestProxyCapturesAssistantReply(t *testing.T) {
+	// Mock upstream returns a real OpenAI-shaped chat completion response,
+	// so extractAssistantReply has something real to parse.
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"The fix is to add a nil check before dereferencing the pointer."}}]}`))
+	}))
+	defer testServer.Close()
+
+	realStore, err := store.NewStore(":memory:")
+	require.NoError(t, err)
+	defer realStore.Close()
+
+	proxy, err := NewProxy(testServer.URL, realStore, &mockEmbedder{}, config.DefaultConfig())
+	require.NoError(t, err)
+	defer proxy.Close()
+
+	r := chi.NewRouter()
+	proxy.RegisterRoutes(r)
+
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/messages", "application/json",
+		bytes.NewBufferString(`{"messages":[{"role":"user","content":"I have a nil pointer error in my code"}]}`))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// The client should still receive the real response body unchanged.
+	respBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Contains(t, string(respBody), "nil check before dereferencing")
+
+	// Both the user's message AND the assistant's reply should now be in
+	// the store - this is the actual proof response-side capture works.
+	ctx := context.Background()
+	entries, err := realStore.GetRecent(ctx, "default-session", 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "both the user message and assistant reply should have been written")
+
+	var foundUserMsg, foundAssistantMsg bool
+	for _, e := range entries {
+		if e.Content == "I have a nil pointer error in my code" {
+			foundUserMsg = true
+		}
+		if e.Content == "The fix is to add a nil check before dereferencing the pointer." {
+			foundAssistantMsg = true
+			assert.NotEmpty(t, e.Embedding, "assistant reply should have an embedding attached")
+		}
+	}
+	assert.True(t, foundUserMsg, "user message should be in the store")
+	assert.True(t, foundAssistantMsg, "assistant reply should be in the store")
+}

@@ -4,6 +4,9 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSanitize(t *testing.T) {
@@ -105,4 +108,76 @@ func TestWriteWithSanitization(t *testing.T) {
 	if memories[0].Content != "[SANITIZED]" {
 		t.Errorf("Expected sanitized content, got %v", memories[0].Content)
 	}
+}
+
+func TestEmbeddingRoundTrip(t *testing.T) {
+	store, err := NewStore(":memory:")
+	require.NoError(t, err)
+	defer store.Close()
+
+	ctx := context.Background()
+
+	originalEmbedding := []float32{0.1, -0.5, 0.999, -1.0, 0.0, 3.14159}
+
+	entry := MemoryEntry{
+		ID:         "embed-test-1",
+		SessionID:  "test-session",
+		Content:    "test content for embedding round trip",
+		MemoryType: "context",
+		Timestamp:  time.Now(),
+		Embedding:  originalEmbedding,
+	}
+
+	err = store.Write(ctx, entry)
+	require.NoError(t, err)
+
+	results, err := store.GetRecent(ctx, "test-session", 10)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+
+	retrieved := results[0]
+	require.Len(t, retrieved.Embedding, len(originalEmbedding), "embedding length should match after round trip")
+
+	for i, v := range originalEmbedding {
+		assert.InDelta(t, v, retrieved.Embedding[i], 0.0001, "embedding value at index %d should match after round trip", i)
+	}
+}
+
+func TestSearchRanksBySimilarity(t *testing.T) {
+	store, err := NewStore(":memory:")
+	require.NoError(t, err)
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Three entries, written oldest-to-newest, with embeddings deliberately
+	// arranged so that recency order and similarity order DISAGREE - this is
+	// the only way to actually prove Search ranks by similarity rather than
+	// silently still sorting by timestamp.
+	closeMatch := []float32{1.0, 0.0, 0.0}
+	farMatch := []float32{0.0, 1.0, 0.0}
+	mediumMatch := []float32{0.7, 0.7, 0.0}
+
+	entries := []MemoryEntry{
+		{ID: "oldest-but-closest", SessionID: "search-test", Content: "oldest but closest match", MemoryType: "context", Timestamp: time.Now().Add(-3 * time.Hour), Embedding: closeMatch},
+		{ID: "middle-medium-match", SessionID: "search-test", Content: "middle aged medium match", MemoryType: "context", Timestamp: time.Now().Add(-2 * time.Hour), Embedding: mediumMatch},
+		{ID: "newest-but-farthest", SessionID: "search-test", Content: "newest but farthest match", MemoryType: "context", Timestamp: time.Now().Add(-1 * time.Hour), Embedding: farMatch},
+	}
+
+	for _, e := range entries {
+		require.NoError(t, store.Write(ctx, e))
+	}
+
+	// Query embedding identical to closeMatch - if Search ranks by
+	// similarity, "oldest-but-closest" should come first despite being the
+	// oldest entry (recency-only ordering would put it last).
+	queryEmbedding := []float32{1.0, 0.0, 0.0}
+
+	results, err := store.Search(ctx, queryEmbedding, "search-test", 10)
+	require.NoError(t, err)
+	require.Len(t, results, 3)
+
+	assert.Equal(t, "oldest-but-closest", results[0].ID, "most similar entry should rank first, despite being oldest")
+	assert.Equal(t, "middle-medium-match", results[1].ID, "medium similarity should rank second")
+	assert.Equal(t, "newest-but-farthest", results[2].ID, "least similar entry should rank last, despite being newest")
 }
