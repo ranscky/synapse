@@ -171,13 +171,21 @@ func runSynapsePipeline(messages []Message, budgetOverride int) (int, error) {
 		cfg.TokenBudget = budgetOverride
 	}
 
-	// Real embedder: hash-based, content-sensitive. Not semantically meaningful
-	// (no notion of paraphrase/synonymy) but unlike a constant mock vector, it
-	// actually varies with input text, so dedup and semantic scoring have real
-	// signal to act on instead of comparing identical vectors for every message.
-	// TODO: swap for ONNXEmbedder once internal/embedder's ONNX path has a real
-	// model.Embed implementation (currently a stub returning a fixed ramp vector).
-	embedderInstance := embedder.NewHashEmbedder(384)
+	// Real ONNX embedder - genuinely semantic, not hash-based. Falls back to
+	// the hash embedder (with a clear warning, not a silent swap) if the
+	// model file can't be found, matching the same graceful-degradation
+	// pattern internal/embedder.NewEmbedder itself uses.
+	onnxModelPath := "models/all-MiniLM-L6-v2/model.onnx"
+	embedderInstance, err := embedder.NewEmbedder("onnx", "", onnxModelPath, "")
+	if err != nil {
+		return 0, fmt.Errorf("failed to create embedder: %w", err)
+	}
+	if _, ok := embedderInstance.(*embedder.ONNXEmbedder); !ok {
+		log.Printf("WARNING: ONNX model not found at %s, benchmark is running against hash-based embeddings, NOT real semantic similarity", onnxModelPath)
+	}
+	if onnxEmb, ok := embedderInstance.(*embedder.ONNXEmbedder); ok {
+		defer onnxEmb.Close()
+	}
 
 	ctx := context.Background()
 
