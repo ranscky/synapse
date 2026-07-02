@@ -1,5 +1,7 @@
 # Synapse Context Compiler
 
+[![CI](https://github.com/ranscky/synapse/actions/workflows/ci.yml/badge.svg)](https://github.com/ranscky/synapse/actions/workflows/ci.yml)
+
 A Go binary that acts as a reverse proxy between AI clients (Cline, Ollama, any OpenAI-compatible tool) and upstream models. It intercepts API calls, scores and prunes conversation history using a 4-factor model, and returns a compiled, token-budgeted context to the model instead of the raw noisy history.
 
 ## Features
@@ -11,6 +13,8 @@ A Go binary that acts as a reverse proxy between AI clients (Cline, Ollama, any 
 - **Multiple Embedding Backends**: Supports ONNX (local) and OpenAI embeddings
 - **Structured Logging**: Built-in structured logging with slog
 - **Health Monitoring**: Built-in health check endpoint
+- **Memory Trace Inspector**: Web UI for inspecting context compilation decisions
+- **Cross-Platform**: Works on Linux, macOS, and Windows
 
 ## Architecture
 
@@ -27,12 +31,80 @@ A Go binary that acts as a reverse proxy between AI clients (Cline, Ollama, any 
                    └──────────────────┘
 ```
 
+## 4-Factor Sieve Scoring
+
+Synapse uses a 4-factor model to score and rank conversation memories:
+
+**S (Semantic Similarity)**: How semantically similar is this memory to the current query?
+- Uses embedding vectors and cosine similarity
+- Weight: 0.4 (default)
+
+**R (Recency)**: How recent is this memory?
+- Newer memories get higher scores
+- Normalized 1/(1+hours_since) decay function
+- Weight: 0.2 (default)
+
+**I (Importance)**: What type of memory is this?
+- Decision: 1.0 (highest priority)
+- Error: 0.9
+- Fact: 0.7
+- Context: 0.5
+- Preference: 0.3
+- Weight: 0.2 (default)
+
+**T (Task Alignment)**: How relevant is this memory type to the current task?
+- Determined by intent classification (debug, code, plan, write, generic)
+- Different weights per intent type
+- Weight: 0.2 (default)
+
+**Total Score Formula**:
+```
+Total = S × wS + R × wR + I × wI + T × wT
+```
+
+## Trace Inspector
+
+Synapse includes a web-based trace inspector for understanding context compilation decisions:
+
+- Visit `http://localhost:8080/ui` to access the inspector
+- View detailed scoring breakdown for each memory
+- See which memories were included/excluded and why
+- Monitor token usage and budget compliance
+
+## Weight Tuning Guide
+
+Adjust weights in `synapse.yaml` for different use cases:
+
+**For Debugging Sessions** (prioritize errors and decisions):
+```yaml
+weight-semantic-similarity: 0.3
+weight-recency: 0.2
+weight-importance: 0.3
+weight-task-alignment: 0.2
+```
+
+**For Code Generation** (prioritize decisions and facts):
+```yaml
+weight-semantic-similarity: 0.5
+weight-recency: 0.1
+weight-importance: 0.2
+weight-task-alignment: 0.2
+```
+
+**For Creative Writing** (prioritize context and preferences):
+```yaml
+weight-semantic-similarity: 0.3
+weight-recency: 0.3
+weight-importance: 0.1
+weight-task-alignment: 0.3
+```
+
 ## Quick Start
 
 ### Installation
 
 ```bash
-go install github.com/yourhandle/synapse/cmd/synapse@latest
+go install github.com/ranscky/synapse/cmd/synapse@latest
 ```
 
 ### Configuration
