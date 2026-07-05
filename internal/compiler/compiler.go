@@ -27,36 +27,34 @@ func Compile(
 	tokenBudget int,
 	compileDurationMs int64,
 	allScoredMemories []scorer.ScoredMemory,
+	dedupedMemories []scorer.ScoredMemory,
 ) *CompileResult {
 	compileStart := time.Now()
-	
+
 	// Result slice for compiled messages
 	result := make([]map[string]interface{}, 0)
-	
+
 	// Sort selected memories by timestamp (oldest first)
 	sort.Slice(selected, func(i, j int) bool {
 		return selected[i].Timestamp.Before(selected[j].Timestamp)
 	})
-	
+
 	// Add selected memories as assistant/user turns
 	for _, memory := range selected {
-		// Create header with memory metadata
 		header := fmt.Sprintf("[Memory | Type: %s | Score: %.2f]", memory.MemoryType, memory.Total)
 		content := header + " " + memory.Content
-		
-		// Determine role based on memory type
+
 		role := "assistant"
 		if memory.MemoryType == "decision" || memory.MemoryType == "error" {
 			role = "user"
 		}
-		
-		message := map[string]interface{}{
+
+		result = append(result, map[string]interface{}{
 			"role":    role,
 			"content": content,
-		}
-		result = append(result, message)
+		})
 	}
-	
+
 	// Add the last user message
 	if lastUserMessage != "" {
 		result = append(result, map[string]interface{}{
@@ -64,10 +62,10 @@ func Compile(
 			"content": lastUserMessage,
 		})
 	}
-	
+
 	// Calculate final compile duration
 	finalCompileDuration := compileDurationMs + time.Since(compileStart).Milliseconds()
-	
+
 	// Create trace manifest
 	traceManifest := trace.NewTraceManifest(
 		requestID,
@@ -80,9 +78,10 @@ func Compile(
 		tokenBudget,
 		finalCompileDuration,
 		allScoredMemories,
+		dedupedMemories,
 		selected,
 	)
-	
+
 	return &CompileResult{
 		Messages: result,
 		Trace:    traceManifest,
@@ -102,18 +101,17 @@ func CompileWithContext(
 	tokenBudget int,
 	compileDurationMs int64,
 	allScoredMemories []scorer.ScoredMemory,
+	dedupedMemories []scorer.ScoredMemory,
 ) *CompileResult {
 	result := make([]map[string]interface{}, 0)
-	
-	// Add system message if present
+
 	if systemMessage != "" {
 		result = append(result, map[string]interface{}{
 			"role":    "system",
 			"content": systemMessage,
 		})
 	}
-	
-	// Add compiled memories and last user message
+
 	compileResult := Compile(
 		selected,
 		lastUserMessage,
@@ -125,9 +123,10 @@ func CompileWithContext(
 		tokenBudget,
 		compileDurationMs,
 		allScoredMemories,
+		dedupedMemories,
 	)
 	result = append(result, compileResult.Messages...)
-	
+
 	compileResult.Messages = result
 	return compileResult
 }

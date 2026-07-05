@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -11,16 +13,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-chi/chi/v5"
+	"synapse/internal/budget"
 	"synapse/internal/classifier"
 	"synapse/internal/compiler"
 	"synapse/internal/config"
 	"synapse/internal/dedup"
-	"synapse/internal/budget"
 	"synapse/internal/embedder"
 	"synapse/internal/scorer"
 	"synapse/internal/store"
 	"synapse/internal/trace"
+
+	"github.com/go-chi/chi/v5"
 )
 
 // APIServer represents the REST API server
@@ -132,14 +135,14 @@ func (a *APIServer) extractSessionID(r *http.Request, req CompileRequest) string
 	if req.SessionID != "" {
 		return req.SessionID
 	}
-	
-	// Use hash of Authorization header as session key
+
+	// Hash the Authorization header value so different keys never collide
 	authHeader := r.Header.Get("Authorization")
 	if authHeader != "" {
-		// In practice, you'd hash this properly
-		return fmt.Sprintf("sess-%d", len(authHeader))
+		sum := sha256.Sum256([]byte(authHeader))
+		return fmt.Sprintf("sess-%s", hex.EncodeToString(sum[:8]))
 	}
-	
+
 	// Fallback to default
 	return "default-session"
 }
@@ -261,6 +264,7 @@ func (a *APIServer) handleCompile(w http.ResponseWriter, r *http.Request) {
 		tokenBudget,
 		time.Since(compileStart).Milliseconds(),
 		scoredMemories,
+		deduplicated,
 	)
 	
 	// Update tokens used in trace
@@ -469,11 +473,14 @@ func (a *APIServer) loggingMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		ww := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(ww, r)
+
+		safe := sanitizeHeaders(map[string][]string(r.Header))
 		slog.Info("API request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", ww.statusCode,
-			"duration_ms", time.Since(start).Milliseconds())
+			"duration_ms", time.Since(start).Milliseconds(),
+			"headers", safe)
 	})
 }
 

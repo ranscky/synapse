@@ -72,6 +72,7 @@ func TestCompile(t *testing.T) {
 				3000,
 				10,
 				tt.selected,
+				[]scorer.ScoredMemory{mem1},
 			)
 			
 			if len(result.Messages) != tt.expectedLength {
@@ -141,6 +142,7 @@ func TestCompileWithContext(t *testing.T) {
 				3000,
 				10,
 				tt.selected,
+				[]scorer.ScoredMemory{mem1},
 			)
 			
 			if len(result.Messages) != tt.expectedLength {
@@ -180,6 +182,7 @@ func TestMemoryHeaders(t *testing.T) {
 		1,
 		3000,
 		10,
+		[]scorer.ScoredMemory{mem1},
 		[]scorer.ScoredMemory{mem1},
 	)
 	

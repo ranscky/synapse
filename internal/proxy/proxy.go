@@ -3,7 +3,9 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -91,6 +93,18 @@ func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.
 	return proxy, nil
 }
 
+// deriveSessionID returns a stable session ID derived from the Authorization
+// header value. Two different keys of equal length no longer collide because
+// we hash the content, not the length. Falls back to "default-session" only
+// when no Authorization header is present at all.
+func deriveSessionID(r *http.Request) string {
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		sum := sha256.Sum256([]byte(authHeader))
+		return fmt.Sprintf("sess-%s", hex.EncodeToString(sum[:8]))
+	}
+	return "default-session"
+}
+
 // director modifies the outgoing request to forward to the target
 func (p *Proxy) director(req *http.Request) {
 	// Set the target URL
@@ -108,8 +122,8 @@ func (p *Proxy) director(req *http.Request) {
 	req.Header.Del("Proxy-Authenticate")
 
 	// IMPORTANT SECURITY: Never log Authorization headers
-	// The header is stripped above and re-added from config if needed
-	// But we never log its value anywhere
+	// The header is passed through to upstream unchanged (client's own API
+	// key reaches the provider; Synapse never holds provider credentials).
 }
 
 // captureResponse reads the upstream's response, extracts the assistant's
@@ -129,9 +143,13 @@ func (p *Proxy) captureResponse(resp *http.Response) {
 	}
 
 	ctx := req.Context()
+
+	// Prefer the session ID stored in context by HandleMessages; fall back
+	// to re-deriving it from the Authorization header so captureResponse
+	// always writes to the correct session bucket.
 	sessionID, _ := ctx.Value(SessionIDKey).(string)
 	if sessionID == "" {
-		sessionID = "default-session"
+		sessionID = deriveSessionID(req)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -145,7 +163,7 @@ func (p *Proxy) captureResponse(resp *http.Response) {
 
 	assistantReply := extractAssistantReply(body)
 	if assistantReply == "" {
-		// Couldn't find a reply in the expected shape - nothing to write,
+		// Couldn't find a reply in the expected shape — nothing to write,
 		// but the response to the client is unaffected either way.
 		return
 	}
@@ -174,7 +192,7 @@ func (p *Proxy) captureResponse(resp *http.Response) {
 
 // extractAssistantReply parses an OpenAI-shaped chat completion response
 // body and returns the assistant's message content. Returns an empty
-// string if the body doesn't match the expected shape, rather than erroring -
+// string if the body doesn't match the expected shape, rather than erroring —
 // this is a best-effort extraction, not a strict contract with the upstream.
 func extractAssistantReply(body []byte) string {
 	var parsed struct {
@@ -199,7 +217,7 @@ func extractAssistantReply(body []byte) string {
 // HandleMessages handles POST /v1/messages requests with full pipeline
 func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	
+
 	ctx := r.Context()
 
 	// Read the request body
@@ -248,11 +266,11 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			"intent", intent, "confidence", confidence)
 	}
 
-	// 2. Get candidates from store (only if store is available)
-	// sessionID is declared at function scope (not just inside this block)
-	// because it's needed again later when writing the assistant's reply
-	// via ModifyResponse.
-	sessionID := "default-session"
+	// 2. Derive session ID from the Authorization header so each API key
+	// gets its own memory bucket. Falls back to "default-session" only when
+	// no Authorization header is present at all.
+	sessionID := deriveSessionID(r)
+
 	var candidates []store.MemoryEntry
 	if p.store != nil {
 		candidates, err = p.store.GetRecent(ctx, sessionID, 20)
@@ -326,8 +344,8 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// 7. Compile final context with trace
 	compileStart := time.Now()
-	requestID := generateRequestID() // Generate unique request ID
-	
+	requestID := generateRequestID()
+
 	compileResult := compiler.Compile(
 		selectedMemories,
 		lastUserMessage,
@@ -339,11 +357,12 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		tokenBudget,
 		time.Since(compileStart).Milliseconds(),
 		scoredMemories,
+		deduplicated,
 	)
-	
+
 	// Update tokens used in trace
 	compileResult.Trace.TokensUsed = totalTokens
-	
+
 	compileDuration := time.Since(compileStart)
 
 	// 8. Log timing information
@@ -378,36 +397,25 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// Check for trace header
 	traceHeader := r.Header.Get("X-Synapse-Trace")
 	if traceHeader == "true" {
-		// Serialize trace manifest to JSON
 		traceJSON, err := json.Marshal(compileResult.Trace)
 		if err != nil {
 			slog.Error("Failed to marshal trace manifest", "error", err)
 		} else {
-			// Base64 encode the JSON
 			traceBase64 := base64.StdEncoding.EncodeToString(traceJSON)
-			
+
 			// Check if trace exceeds 8KB limit
 			if len(traceBase64) > 8192 {
-				// Truncate memories list and add trace_truncated flag
 				truncatedTrace := *compileResult.Trace
-				// Keep only first few memories to stay under limit
 				if len(truncatedTrace.Memories) > 10 {
 					truncatedTrace.Memories = truncatedTrace.Memories[:10]
 				}
-				// Add truncated flag
-				// Note: This would require modifying the TraceManifest struct to include this field
-				
 				truncatedJSON, _ := json.Marshal(truncatedTrace)
 				traceBase64 = base64.StdEncoding.EncodeToString(truncatedJSON)
 			}
-			
-			// Add trace to response headers
+
 			w.Header().Set("X-Synapse-Trace-Result", traceBase64)
 		}
 	}
-
-	// Check for persist traces flag (this would be passed from main)
-	// For now, we'll assume it's handled at a higher level
 
 	// Store results in context for downstream use, including data
 	// ModifyResponse will need to write the assistant's reply to the same

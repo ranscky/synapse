@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"synapse/internal/config"
+	"synapse/internal/scorer"
 	"synapse/internal/store"
 	"synapse/internal/trace"
 
@@ -194,6 +195,7 @@ func TestIntegration(t *testing.T) {
 			45,
 			nil,
 			nil,
+			[]scorer.ScoredMemory{},
 		)
 
 		// Test saving trace
