@@ -1,188 +1,272 @@
 # Synapse Context Compiler
 
-[![CI](https://github.com/ranscky/synapse/actions/workflows/ci.yml/badge.svg)](https://github.com/ranscky/synapse/actions/workflows/ci.yml)
+> **46.4% token reduction** on real multi-session conversations — verified with semantic embeddings (all-MiniLM-L6-v2), not mock data.
 
-A Go binary that acts as a reverse proxy between AI clients (Cline, Ollama, any OpenAI-compatible tool) and upstream models. It intercepts API calls, scores and prunes conversation history using a 4-factor model, and returns a compiled, token-budgeted context to the model instead of the raw noisy history.
-
-## Features
-
-- **Reverse Proxy**: Transparently sits between AI clients and upstream models
-- **Context Compilation**: Intelligently reduces conversation history to essential context
-- **4-Factor Scoring**: Uses Semantic Similarity, Recency, Importance, and Task Alignment metrics
-- **Token Budget Management**: Ensures responses fit within model token limits
-- **Multiple Embedding Backends**: Supports ONNX (local) and OpenAI embeddings
-- **Structured Logging**: Built-in structured logging with slog
-- **Health Monitoring**: Built-in health check endpoint
-- **Memory Trace Inspector**: Web UI for inspecting context compilation decisions
-- **Cross-Platform**: Works on Linux, macOS, and Windows
-
-## Architecture
+A Go reverse proxy that sits between your AI client and your model. It intercepts every API call, scores and prunes conversation history using a 4-factor model, and forwards a token-budgeted, task-aware context instead of the raw, noisy history. Your model sees less, but better.
 
 ```
 ┌─────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │ AI Clients  │───▶│ Synapse Proxy    │───▶│ Upstream Models │
-│ (Cline, etc)│    │ (this binary)    │    │ (Ollama, etc)   │
+│ Cline, etc. │    │ :8080            │    │ Ollama, etc.    │
 └─────────────┘    └──────────────────┘    └─────────────────┘
                             │
-                            ▼
-                   ┌──────────────────┐
-                   │ Memory Store     │
-                   │ (SQLite + Vec)   │
+                   ┌────────▼─────────┐
+                   │  Memory Store    │
+                   │  SQLite +        │
+                   │  in-Go cosine    │
+                   │  similarity      │
                    └──────────────────┘
 ```
 
-## 4-Factor Sieve Scoring
+**Status:** functional MVP, single-developer project, pre-v1. See [Known limitations](#known-limitations) before relying on this in production.
 
-Synapse uses a 4-factor model to score and rank conversation memories:
+---
 
-**S (Semantic Similarity)**: How semantically similar is this memory to the current query?
-- Uses embedding vectors and cosine similarity
-- Weight: 0.4 (default)
+## Table of contents
 
-**R (Recency)**: How recent is this memory?
-- Newer memories get higher scores
-- Normalized 1/(1+hours_since) decay function
-- Weight: 0.2 (default)
+- [How it works](#how-it-works)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [CLI flags](#cli-flags)
+- [Connecting your AI client](#connecting-your-ai-client)
+- [API reference](#api-reference)
+- [Utility tools](#utility-tools)
+- [Security](#security)
+- [Development](#development)
+- [Known limitations](#known-limitations)
+- [Roadmap](#roadmap)
+- [License](#license)
 
-**I (Importance)**: What type of memory is this?
-- Decision: 1.0 (highest priority)
-- Error: 0.9
-- Fact: 0.7
-- Context: 0.5
-- Preference: 0.3
-- Weight: 0.2 (default)
+---
 
-**T (Task Alignment)**: How relevant is this memory type to the current task?
-- Determined by intent classification (debug, code, plan, write, generic)
-- Different weights per intent type
-- Weight: 0.2 (default)
+## How it works
 
-**Total Score Formula**:
+Every message sent through the proxy goes through a four-step pipeline before reaching your model.
+
+**1. Classify intent.** Synapse detects one of five intents from the message content — `debug`, `plan`, `code`, `write`, or `generic` — and uses that to shift scoring weights toward what actually matters for that kind of work.
+
+**2. Score memories.** Each candidate memory is scored on four independent factors and combined into a single weighted score:
+
 ```
-Total = S × wS + R × wR + I × wI + T × wT
-```
-
-## Trace Inspector
-
-Synapse includes a web-based trace inspector for understanding context compilation decisions:
-
-- Visit `http://localhost:8080/ui` to access the inspector
-- View detailed scoring breakdown for each memory
-- See which memories were included/excluded and why
-- Monitor token usage and budget compliance
-
-## Weight Tuning Guide
-
-Adjust weights in `synapse.yaml` for different use cases:
-
-**For Debugging Sessions** (prioritize errors and decisions):
-```yaml
-weight-semantic-similarity: 0.3
-weight-recency: 0.2
-weight-importance: 0.3
-weight-task-alignment: 0.2
+Score = S·w_s + R·w_r + I·w_i + T·w_t
 ```
 
-**For Code Generation** (prioritize decisions and facts):
-```yaml
-weight-semantic-similarity: 0.5
-weight-recency: 0.1
-weight-importance: 0.2
-weight-task-alignment: 0.2
+| Factor | What it measures | Source |
+|---|---|---|
+| **S** — Semantic Similarity | Cosine similarity between the current query and stored memory embeddings | Real ONNX inference via all-MiniLM-L6-v2, WordPiece tokenization verified against `transformers.BertTokenizer` |
+| **R** — Recency | Time-decayed, normalized across the current candidate set | — |
+| **I** — Importance | Lookup table by memory type | `decision: 1.0`, `error: 0.9`, `fact: 0.7`, `context: 0.5`, `preference: 0.3` |
+| **T** — Task Alignment | Intent × memory-type weight matrix, confidence-blended so a low-confidence intent guess doesn't fully override the other factors | See table below |
+
+Task-alignment weight matrix (`internal/scorer/weights.go`):
+
+| Intent | decision | error | fact | preference | context |
+|---|---|---|---|---|---|
+| `debug` | 1.0 | 1.0 | 0.6 | 0.1 | 0.4 |
+| `plan` | 1.0 | 0.3 | 0.8 | 0.3 | 0.7 |
+| `code` | 0.8 | 0.6 | 0.7 | 0.2 | 0.6 |
+| `write` | 0.4 | 0.1 | 0.6 | 0.7 | 0.8 |
+| `generic` | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 |
+
+This is the core novelty of the project: providers generally compete on making context windows bigger, not on making what goes into them smarter. Task-aware weight shifting is a bet that signal quality matters more than raw window size.
+
+**3. Deduplicate.** Near-duplicate memories (cosine similarity > 0.92) are collapsed before scoring, so repeated content doesn't crowd out genuine signal.
+
+**4. Budget.** Top-ranked memories are packed into a token budget (default 3000 tokens, counted exactly via `tiktoken-go`, not estimated) and compiled into the final context forwarded upstream.
+
+---
+
+## Installation
+
+### Option 1 — Pre-built release (recommended if you don't have Go installed)
+
+Download the archive for your platform from the Releases page. Each archive bundles everything needed to run:
+
+```
+synapse                              # or synapse.exe on Windows
+libonnxruntime.so                    # or .dylib / onnxruntime.dll
+models/all-MiniLM-L6-v2/
+  model.onnx
+  vocab.txt
+ui/
 ```
 
-**For Creative Writing** (prioritize context and preferences):
-```yaml
-weight-semantic-similarity: 0.3
-weight-recency: 0.3
-weight-importance: 0.1
-weight-task-alignment: 0.3
-```
-
-## Quick Start
-
-### Installation
+Extract and run:
 
 ```bash
-go install github.com/ranscky/synapse/cmd/synapse@latest
+./synapse --upstream https://api.anthropic.com
 ```
 
-### Configuration
+No separate ONNX Runtime install needed — the release archive ships the native library alongside the binary and Synapse resolves it automatically at startup.
 
-Create a `synapse.yaml` file:
-
-```yaml
-# See synapse.yaml.example for all configuration options
-upstream-url: "http://localhost:11434"  # Ollama default
-listen-addr: "127.0.0.1:8080"
-token-budget: 3000
-embedder-type: "onnx"  # or "openai"
-```
-
-### Running
+### Option 2 — Setup script (build from source, recommended if you have Go)
 
 ```bash
-# Basic usage
-synapse --config synapse.yaml
-
-# Override upstream URL
-synapse --config synapse.yaml --upstream http://localhost:11434
-
-# Override port
-synapse --config synapse.yaml --port 9090
+git clone https://github.com/<yourhandle>/synapse
+cd synapse
+bash setup.sh
 ```
 
-## API Endpoints
+`setup.sh` detects your OS/architecture, downloads and installs the matching ONNX Runtime native library, downloads the all-MiniLM-L6-v2 model (~90MB, one-time), builds the binary, and scaffolds `synapse.yaml` from the example file. Supports Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), and Windows (Git Bash/WSL).
 
-- `POST /v1/messages` - Main proxy endpoint for chat completions
-- `GET /health` - Health check endpoint returning `{"status":"ok"}`
+Then:
 
-## Configuration
+```bash
+./synapse --config synapse.yaml
+```
 
-All configuration options can be set in `synapse.yaml`:
+### Option 3 — Manual build
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `upstream-url` | Required | Upstream model server URL |
-| `listen-addr` | `127.0.0.1:8080` | Bind address for the proxy |
-| `token-budget` | `3000` | Maximum tokens in compiled context |
-| `embedder-type` | `"onnx"` | Embedding backend (`"onnx"` or `"openai"`) |
-| `openai-api-key` | From `OPENAI_API_KEY` env | OpenAI API key for embeddings |
-| `weight-semantic-similarity` | `0.4` | Weight for semantic similarity scoring |
-| `weight-recency` | `0.2` | Weight for recency scoring |
-| `weight-importance` | `0.2` | Weight for importance scoring |
-| `weight-task-alignment` | `0.2` | Weight for task alignment scoring |
-| `log-level` | `"info"` | Logging level (`debug`, `info`, `warn`, `error`) |
-
-## Security
-
-- Binds to `127.0.0.1` by default (never `0.0.0.0`)
-- Never logs Authorization headers
-- All config files created with secure `0600` permissions
-- Memory traces are in-memory only by default
-
-## Development
-
-### Building
+Requires Go 1.22+, a C toolchain (the project uses cgo for both SQLite and ONNX Runtime bindings), and ONNX Runtime 1.27.0 available on your system library path (or set via `SYNAPSE_ORT_LIB_PATH`, see below).
 
 ```bash
 go build -o synapse ./cmd/synapse
 ```
 
-### Testing
+---
 
-```bash
-go test ./...
+## Configuration
+
+Create `synapse.yaml` (use `synapse.yaml.example` as a starting point):
+
+```yaml
+upstream-url: "http://localhost:11434"    # Your model server (Ollama default). Required.
+allowed-upstream-hosts: []                  # Optional allowlist; localhost/127.x is always permitted
+listen-addr: "127.0.0.1:8080"              # Must be 127.0.0.1 or localhost — enforced at validation time
+token-budget: 3000                          # Tokens allocated to compiled context (tiktoken-exact count)
+embedder-type: "onnx"                       # "onnx" (local, real semantic similarity) or "openai"
+model-path: "models/all-MiniLM-L6-v2/model.onnx"
+db-path: ""                                 # Leave blank to use the OS-standard data directory (see below)
+openai-api-key: ""                          # Also settable via OPENAI_API_KEY env var
+weight-semantic-similarity: 0.4
+weight-recency: 0.2
+weight-importance: 0.2
+weight-task-alignment: 0.2
+deduplication-threshold: 0.92               # Cosine similarity above which memories are collapsed
+log-level: "info"
 ```
 
-### Dependencies
+### Data location
 
-- Go 1.22+
-- Chi v5 (HTTP router)
-- go-yaml v3 (config parsing)
-- sqlite-vec (memory storage)
-- ONNX Runtime (local embeddings)
-- tiktoken-go (token counting)
+If `db-path` is left blank, Synapse resolves a stable per-OS data directory rather than writing next to the binary — important since a distributed release binary may be launched from anywhere:
+
+| OS | Default path |
+|---|---|
+| Linux | `~/.local/share/synapse/synapse.db` (or `$XDG_DATA_HOME/synapse/synapse.db`) |
+| macOS | `~/Library/Application Support/synapse/synapse.db` |
+| Windows | `%APPDATA%\synapse\synapse.db` |
+
+Set `db-path` explicitly to override — including `:memory:` for a fully ephemeral, non-persistent store.
+
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `SYNAPSE_ORT_LIB_PATH` | Override the ONNX Runtime shared library location. Only needed if you've moved `synapse` away from its bundled native lib, or are running a source build with ORT installed somewhere non-standard. |
+| `OPENAI_API_KEY` | Used only when `embedder-type: openai`. |
+
+---
+
+## CLI flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config` | `synapse.yaml` | Path to configuration file |
+| `--upstream` | — | Override `upstream-url` from config |
+| `--port` | — | Override the port in `listen-addr` |
+| `--persist-traces` | `false` | Persist memory traces to disk (they're in-memory-only by default) |
+
+---
+
+## Connecting your AI client
+
+Point any OpenAI-compatible client at `http://127.0.0.1:8080`:
+
+- **Cline** — set the API base URL in settings to `http://127.0.0.1:8080`
+- **Open WebUI** — set the Ollama/OpenAI base URL to `http://127.0.0.1:8080`
+- **curl** — `curl http://127.0.0.1:8080/v1/messages -d '{"messages": [...]}'`
+
+---
+
+## API reference
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/messages` | POST | Main proxy endpoint — intercepts, compiles, forwards upstream |
+| `/v1/compile` | POST | Compile a session without proxying (useful for testing/inspection) |
+| `/v1/memories` | GET | List stored memories for a session |
+| `/v1/memories` | DELETE | Clear memories for a session |
+| `/v1/stats` | GET | Memory count, average compile time |
+| `/openapi.yaml` | GET | Full OpenAPI specification |
+| `/health` | GET | Health check — `{"status":"ok","memories_stored":N,"avg_compile_ms":N}` |
+| `/ui` | GET | Web trace inspector |
+
+Add header `X-Synapse-Trace: true` to any proxied request to get a base64-encoded trace manifest back in the `X-Synapse-Trace-Result` response header — shows exactly which memories were selected, scored, and why (and why others were excluded).
+
+---
+
+## Utility tools
+
+Alongside the proxy itself, `cmd/` includes a few standalone tools:
+
+| Command | Purpose |
+|---|---|
+| `cmd/benchmark` | Run the scoring pipeline against a test-fixture session and report token reduction vs. raw history |
+| `cmd/counttokens` | Exact tiktoken-based token count for a session JSON file |
+| `cmd/mergesessions` | Merge multiple session JSON files into one, for constructing larger test fixtures |
+
+```bash
+go run ./cmd/benchmark testdata/session_code.json
+```
+
+---
+
+## Security
+
+- Binds to `127.0.0.1` by default — validation actively rejects any other host
+- `Authorization` headers are forwarded upstream but **never logged**
+- Config and database files are created with `0600` permissions
+- Memory content is sanitized before storage (prompt-injection pattern detection)
+- Upstream URLs can be restricted to an explicit allowlist (`allowed-upstream-hosts`); localhost/127.x is always implicitly permitted for local model servers like Ollama
+- Traces are in-memory only by default; `--persist-traces` is required to write them to disk
+
+---
+
+## Development
+
+```bash
+# Run tests (matches CI: ubuntu-latest, macos-latest, windows-latest)
+go test -v ./...
+
+# Run a benchmark against a test fixture
+go run ./cmd/benchmark testdata/session_merged.json
+
+# Build
+go build -o synapse ./cmd/synapse
+```
+
+CI runs on every push/PR to `main` across all three OSes, installs ONNX Runtime and downloads the real model so the ONNX inference path is actually exercised rather than silently falling back to hash-based embeddings. Tagged pushes (`v*`) trigger the release workflow, which builds and bundles a self-contained archive per platform.
+
+---
+
+## Known limitations
+
+Being upfront about what's not finished yet:
+
+- **OpenAI embedder is stubbed** — `embedder-type: openai` currently returns a placeholder, non-semantic embedding. Use `onnx` for real semantic similarity.
+- **Single-developer project, pre-v1** — no design partners or production deployments yet.
+- **`allowed-upstream-hosts` allowlist** is optional and off by default; if security matters for your deployment, set it explicitly.
+
+---
+
+## Roadmap
+
+- Show HN launch anchored to the token-reduction benchmark
+- Community distribution via Cline, Ollama, and LocalLLaMA channels
+- 2–3 design partners post-v1
+- v2: enterprise managed-memory plane with a signed, auditable Memory Trace ledger
+
+---
 
 ## License
 

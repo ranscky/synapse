@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	ort "github.com/yalue/onnxruntime_go"
@@ -41,12 +42,12 @@ type ONNXEmbedder struct {
 	modelPath string
 	tokenizer *WordPieceTokenizer
 
-	mu                   sync.Mutex
-	session              *ort.AdvancedSession
-	inputIDsTensor       *ort.Tensor[int64]
-	attentionMaskTensor  *ort.Tensor[int64]
-	tokenTypeIDsTensor   *ort.Tensor[int64]
-	outputTensor         *ort.Tensor[float32]
+	mu                  sync.Mutex
+	session             *ort.AdvancedSession
+	inputIDsTensor      *ort.Tensor[int64]
+	attentionMaskTensor *ort.Tensor[int64]
+	tokenTypeIDsTensor  *ort.Tensor[int64]
+	outputTensor        *ort.Tensor[float32]
 }
 
 // OpenAIEmbedder implements Embedder using OpenAI API
@@ -67,8 +68,8 @@ type HashEmbedder struct {
 // InitializeEnvironment more than once (e.g. if multiple ONNXEmbedders are
 // created) would be an error.
 var (
-	onnxEnvOnce  sync.Once
-	onnxEnvErr   error
+	onnxEnvOnce sync.Once
+	onnxEnvErr  error
 )
 
 // NewEmbedder creates an embedder based on configuration
@@ -90,7 +91,40 @@ func NewEmbedder(embedderType, openAIAPIKey, onnxModelPath, openAIModel string) 
 // inference session. The vocabulary file is expected at "vocab.txt" in the
 // same directory as the model file, matching how models/all-MiniLM-L6-v2/
 // is organized in this project (model.onnx + vocab.txt together).
-//
+
+// resolveOrtLibPath locates the ONNX Runtime shared library. Resolution
+// order: explicit override via SYNAPSE_ORT_LIB_PATH env var, then a
+// platform-appropriate filename sitting next to the running executable
+// (the bundled-release layout), falling back to just the bare filename so
+// onnxruntime_go's own default search (including system lib dirs like
+// /usr/local/lib on a dev machine) still applies if neither of the above
+// exist.
+func resolveOrtLibPath() string {
+	if p := os.Getenv("SYNAPSE_ORT_LIB_PATH"); p != "" {
+		return p
+	}
+
+	names := map[string]string{
+		"linux":   "libonnxruntime.so",
+		"darwin":  "libonnxruntime.dylib",
+		"windows": "onnxruntime.dll",
+	}
+	libName := names[runtime.GOOS]
+
+	if exe, err := os.Executable(); err == nil {
+		if candidate := filepath.Join(filepath.Dir(exe), libName); fileExists(candidate) {
+			return candidate
+		}
+	}
+
+	return libName
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // Falls back to the hash embedder (not an error) if the model file is
 // missing, preserving the existing graceful-degradation behavior - but
 // once the model file IS found, any subsequent failure (bad vocab, broken
@@ -108,7 +142,7 @@ func newONNXEmbedder(modelPath string) (Embedder, error) {
 		// configured - SetSharedLibraryPath must be called before
 		// InitializeEnvironment, and InitializeEnvironment is itself
 		// guarded to only run once per process via onnxEnvOnce.
-		ort.SetSharedLibraryPath("/usr/local/lib/libonnxruntime.so")
+		ort.SetSharedLibraryPath(resolveOrtLibPath())
 		onnxEnvErr = ort.InitializeEnvironment()
 	})
 	if onnxEnvErr != nil {

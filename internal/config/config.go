@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -14,6 +16,8 @@ type Config struct {
 	ListenAddr               string   `yaml:"listen-addr"`
 	TokenBudget              int      `yaml:"token-budget"`
 	EmbedderType             string   `yaml:"embedder-type"`
+	ModelPath                string   `yaml:"model-path"`
+	DBPath                   string   `yaml:"db-path"`
 	OpenAIAPIKey             string   `yaml:"openai-api-key"`
 	WeightSemanticSimilarity float64  `yaml:"weight-semantic-similarity"`
 	WeightRecency            float64  `yaml:"weight-recency"`
@@ -21,6 +25,36 @@ type Config struct {
 	WeightTaskAlignment      float64  `yaml:"weight-task-alignment"`
 	DeduplicationThreshold   float64  `yaml:"deduplication-threshold"`
 	LogLevel                 string   `yaml:"log-level"`
+}
+
+// defaultDBPath resolves a stable, per-OS data directory for the SQLite
+// database, so persistence doesn't depend on which folder the binary
+// happens to be launched from (a real risk for a distributed release
+// binary run from arbitrary locations). Falls back to a bare relative
+// filename if the OS data dir can't be resolved for any reason.
+func defaultDBPath() string {
+	const dbFile = "synapse.db"
+
+	var dataDir string
+	switch runtime.GOOS {
+	case "windows":
+		dataDir = os.Getenv("APPDATA")
+	case "darwin":
+		if home, err := os.UserHomeDir(); err == nil {
+			dataDir = filepath.Join(home, "Library", "Application Support")
+		}
+	default: // linux and other unix-likes
+		if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+			dataDir = xdg
+		} else if home, err := os.UserHomeDir(); err == nil {
+			dataDir = filepath.Join(home, ".local", "share")
+		}
+	}
+
+	if dataDir == "" {
+		return dbFile
+	}
+	return filepath.Join(dataDir, "synapse", dbFile)
 }
 
 // DefaultConfig returns the default configuration
@@ -33,6 +67,8 @@ func DefaultConfig() *Config {
 		ListenAddr:               "127.0.0.1:8080",
 		TokenBudget:              3000,
 		EmbedderType:             "onnx",
+		ModelPath:                "models/all-MiniLM-L6-v2/model.onnx",
+		DBPath:                   defaultDBPath(),
 		OpenAIAPIKey:             openAIAPIKey,
 		WeightSemanticSimilarity: 0.4,
 		WeightRecency:            0.2,

@@ -26,6 +26,36 @@ jobs:
     
     - name: Download dependencies
       run: go mod download
+
+    - name: Install ONNX Runtime (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        curl -L -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz
+        tar -xzf ort.tgz
+        sudo cp onnxruntime-linux-x64-1.27.0/lib/libonnxruntime.so* /usr/local/lib/
+        sudo ldconfig
+
+    - name: Install ONNX Runtime (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        curl -L -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz
+        tar -xzf ort.tgz
+        sudo cp onnxruntime-osx-arm64-1.27.0/lib/libonnxruntime*.dylib /usr/local/lib/
+
+    - name: Install ONNX Runtime (Windows)
+      if: matrix.os == 'windows-latest'
+      shell: pwsh
+      run: |
+        Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-win-x64-1.27.0.zip" -OutFile ort.zip
+        Expand-Archive -Path ort.zip -DestinationPath ort
+        Copy-Item "ort\onnxruntime-win-x64-1.27.0\lib\onnxruntime.dll" -Destination .
+        echo "SYNAPSE_ORT_LIB_PATH=$pwd\onnxruntime.dll" >> $env:GITHUB_ENV
+
+    - name: Download embedding model
+      shell: bash
+      run: |
+        mkdir -p models/all-MiniLM-L6-v2
+        curl -L -o models/all-MiniLM-L6-v2/model.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
     
     - name: Run tests
       run: go test -v ./...

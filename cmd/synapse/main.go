@@ -91,7 +91,7 @@ func main() {
 	}
 
 	// Initialize store
-	storeInstance, err := store.NewStore("synapse.db")
+	storeInstance, err := store.NewStore(cfg.DBPath)
 	if err != nil {
 		slog.Error("Failed to create store", "error", err)
 		os.Exit(1)

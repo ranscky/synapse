@@ -13,6 +13,15 @@ token-budget: 3000
 # Embedding backend: "onnx" or "openai"
 embedder-type: "onnx"
 
+# Path to the ONNX model file (only used when embedder-type is "onnx")
+model-path: "models/all-MiniLM-L6-v2/model.onnx"
+
+# SQLite database path. Leave blank to use the OS-standard data directory
+# (~/.local/share/synapse on Linux, ~/Library/Application Support/synapse on
+# macOS, %APPDATA%\synapse on Windows). Set to ":memory:" for a fully
+# ephemeral, non-persistent store.
+db-path: ""
+
 # OpenAI API key (can also be set via OPENAI_API_KEY environment variable)
 openai-api-key: ""
 

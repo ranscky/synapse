@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz
+            ort_dir: onnxruntime-linux-x64-1.27.0
+            ort_lib: libonnxruntime.so
+            ext: ""
+            archive_cmd: tar -czf synapse-linux-amd64.tar.gz -C bundle .
+            archive_name: synapse-linux-amd64.tar.gz
+          - os: macos-latest
+            goos: darwin
+            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz
+            ort_dir: onnxruntime-osx-arm64-1.27.0
+            ort_lib: libonnxruntime.dylib
+            ext: ""
+            archive_cmd: tar -czf synapse-darwin-arm64.tar.gz -C bundle .
+            archive_name: synapse-darwin-arm64.tar.gz
+          - os: windows-latest
+            goos: windows
+            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-win-x64-1.27.0.zip
+            ort_dir: onnxruntime-win-x64-1.27.0
+            ort_lib: onnxruntime.dll
+            ext: ".exe"
+            archive_cmd: Compress-Archive -Path bundle\* -DestinationPath synapse-windows-amd64.zip
+            archive_name: synapse-windows-amd64.zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.22
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Fetch ONNX Runtime (unix)
+      if: matrix.goos != 'windows'
+      shell: bash
+      run: |
+        curl -L -o ort.tgz "${{ matrix.ort_url }}"
+        tar -xzf ort.tgz
+        mkdir -p bundle
+        cp ${{ matrix.ort_dir }}/lib/${{ matrix.ort_lib }}* bundle/
+
+    - name: Fetch ONNX Runtime (windows)
+      if: matrix.goos == 'windows'
+      shell: pwsh
+      run: |
+        Invoke-WebRequest -Uri "${{ matrix.ort_url }}" -OutFile ort.zip
+        Expand-Archive -Path ort.zip -DestinationPath ort
+        New-Item -ItemType Directory -Force -Path bundle
+        Copy-Item "ort\${{ matrix.ort_dir }}\lib\${{ matrix.ort_lib }}" -Destination bundle\
+
+    - name: Download embedding model
+      shell: bash
+      run: |
+        mkdir -p bundle/models/all-MiniLM-L6-v2
+        curl -L -o bundle/models/all-MiniLM-L6-v2/model.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
+        cp models/all-MiniLM-L6-v2/vocab.txt bundle/models/all-MiniLM-L6-v2/vocab.txt
+
+    - name: Build
+      shell: bash
+      env:
+        CGO_ENABLED: 1
+      run: go build -ldflags="-s -w" -o bundle/synapse${{ matrix.ext }} ./cmd/synapse
+
+    - name: Copy ui and config
+      shell: bash
+      run: |
+        cp -r ui bundle/ui
+        cp README.md bundle/ 2>/dev/null || true
+
+    - name: Archive
+      shell: bash
+      run: ${{ matrix.archive_cmd }}
+      if: matrix.goos != 'windows'
+
+    - name: Archive (windows)
+      shell: pwsh
+      run: ${{ matrix.archive_cmd }}
+      if: matrix.goos == 'windows'
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.archive_name }}
+        path: ${{ matrix.archive_name }}
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    - name: Create GitHub Release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release create ${{ github.ref_name }} \
+          artifacts/**/*.tar.gz artifacts/**/*.zip \
+          --draft \
+          --title "${{ github.ref_name }}" \
+          --generate-notes

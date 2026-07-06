@@ -176,7 +176,8 @@ func runSynapsePipeline(messages []Message, budgetOverride int) (int, error) {
 	// model file can't be found, matching the same graceful-degradation
 	// pattern internal/embedder.NewEmbedder itself uses.
 	onnxModelPath := "models/all-MiniLM-L6-v2/model.onnx"
-	embedderInstance, err := embedder.NewEmbedder("onnx", "", onnxModelPath, "")
+	// Initialize embedder
+	embedderInstance, err := embedder.NewEmbedder(cfg.EmbedderType, cfg.OpenAIAPIKey, cfg.ModelPath, "")
 	if err != nil {
 		return 0, fmt.Errorf("failed to create embedder: %w", err)
 	}
