@@ -121,9 +121,52 @@ func (p *Proxy) director(req *http.Request) {
 	req.Header.Del("Proxy-Authorization")
 	req.Header.Del("Proxy-Authenticate")
 
+	// Splice the compiled, memory-augmented messages into the outgoing
+	// body, replacing the client's original full-history "messages" array
+	// while preserving every other top-level field (model, system, stream,
+	// max_tokens, etc.) untouched. Without this, the compiler's output is
+	// only ever visible in the trace header/UI — the upstream never
+	// actually receives the reduced context.
+	if compiledMessages, ok := req.Context().Value(ScoredMemoriesKey).([]map[string]interface{}); ok {
+		if rewritten, err := rewriteRequestBody(req, compiledMessages); err != nil {
+			slog.Error("Failed to rewrite request body with compiled context, forwarding original body", "error", err)
+		} else {
+			req.Body = io.NopCloser(bytes.NewReader(rewritten))
+			req.ContentLength = int64(len(rewritten))
+			req.Header.Set("Content-Length", fmt.Sprintf("%d", len(rewritten)))
+		}
+	}
+
 	// IMPORTANT SECURITY: Never log Authorization headers
 	// The header is passed through to upstream unchanged (client's own API
 	// key reaches the provider; Synapse never holds provider credentials).
+}
+
+// rewriteRequestBody reads the original request body, replaces its
+// top-level "messages" field with the compiled messages, and returns the
+// re-marshaled body. All other top-level fields (model, system, stream,
+// max_tokens, etc.) are preserved unchanged, since this function doesn't
+// know or care which provider's schema those fields belong to.
+func rewriteRequestBody(req *http.Request, compiledMessages []map[string]interface{}) ([]byte, error) {
+	original, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read original body: %w", err)
+	}
+	req.Body.Close()
+
+	var bodyMap map[string]interface{}
+	if err := json.Unmarshal(original, &bodyMap); err != nil {
+		return nil, fmt.Errorf("failed to parse original body as JSON: %w", err)
+	}
+
+	bodyMap["messages"] = compiledMessages
+
+	rewritten, err := json.Marshal(bodyMap)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal rewritten body: %w", err)
+	}
+
+	return rewritten, nil
 }
 
 // captureResponse reads the upstream's response, extracts the assistant's
@@ -231,11 +274,13 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// Restore body for upstream (since we consumed it)
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
-	// Parse the request body to extract the actual last user message,
-	// rather than using the raw JSON body (which previously fed the entire
-	// request structure into the classifier/embedder, diluting any real
-	// signal with JSON syntax, role labels, and unrelated message history).
+	// Parse the request body to extract the actual last user message and
+	// system prompt, rather than using the raw JSON body (which previously
+	// fed the entire request structure into the classifier/embedder,
+	// diluting any real signal with JSON syntax, role labels, and unrelated
+	// message history).
 	var parsedRequest struct {
+		System   string `json:"system"`
 		Messages []struct {
 			Role    string `json:"role"`
 			Content string `json:"content"`
@@ -243,10 +288,12 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lastUserMessage := ""
+	systemPrompt := ""
 	if err := json.Unmarshal(body, &parsedRequest); err != nil {
 		slog.Warn("Failed to parse request body as JSON, falling back to raw body for classification", "error", err)
 		lastUserMessage = string(body)
 	} else {
+		systemPrompt = parsedRequest.System
 		for i := len(parsedRequest.Messages) - 1; i >= 0; i-- {
 			if parsedRequest.Messages[i].Role == "user" {
 				lastUserMessage = parsedRequest.Messages[i].Content
@@ -259,6 +306,27 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	classifyResult := classifier.Classify(lastUserMessage)
 	intent := classifyResult.Intent
 	confidence := classifyResult.Confidence
+
+	// Fall back to classifying the system prompt when the user message alone
+	// gives weak signal (e.g. "what did I just tell you?" carries no debug/
+	// code/plan/write keywords on its own). Only applied when confidence is
+	// already low, and only for short system prompts (persona-line length,
+	// not full boilerplate specs) -- a long system prompt would dilute its
+	// own keyword density the same way long code-heavy messages did before
+	// stripCode() was added, so it's excluded rather than risking a worse
+	// signal than doing nothing.
+	const lowConfidenceThreshold = 0.3
+	const maxSystemPromptLenForClassification = 300
+	if confidence < lowConfidenceThreshold && systemPrompt != "" && len(systemPrompt) <= maxSystemPromptLenForClassification {
+		systemClassifyResult := classifier.Classify(systemPrompt)
+		if systemClassifyResult.Confidence > confidence {
+			slog.Info("Low confidence from user message, using system prompt classification instead",
+				"user_intent", intent, "user_confidence", confidence,
+				"system_intent", systemClassifyResult.Intent, "system_confidence", systemClassifyResult.Confidence)
+			intent = systemClassifyResult.Intent
+			confidence = systemClassifyResult.Confidence
+		}
+	}
 
 	// Log intent classification
 	if confidence < 0.1 {

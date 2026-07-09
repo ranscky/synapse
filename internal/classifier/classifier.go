@@ -27,14 +27,14 @@ var inlineCodePattern = regexp.MustCompile("`[^`]*`")
 // keywordSets maps each intent to its characteristic keywords
 var keywordSets = map[Intent][]string{
 	Debug: {
-		// phrases (checked first)
-		"nil pointer", "race condition", "memory leak", "goroutine leak",
-		"stack trace", "segmentation fault", "out of memory", "deadlock",
-		"null pointer", "index out of range", "panic:",
-		// single words
-		"error", "exception", "traceback", "crash", "bug", "fix", "broken",
-		"failing", "stderr", "panic", "segfault", "leak", "race", "nil",
-		"deadlocked", "freeze", "hang", "corrupt",
+    // phrases (checked first)
+    "nil pointer", "race condition", "memory leak", "goroutine leak",
+    "stack trace", "segmentation fault", "out of memory", "deadlock",
+    "null pointer", "index out of range", "panic:",
+    // single words
+    "error", "exception", "traceback", "crash", "bug", "fix", "broken",
+    "failing", "stderr", "panic", "segfault", "leak", "race", "nil",
+    "deadlocked", "freeze", "hang", "corrupt", "debug", "debugging",
 	},
 	Plan: {
 		"how should", "best practice", "best approach", "design pattern",

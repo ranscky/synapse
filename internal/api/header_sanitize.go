@@ -13,10 +13,12 @@ func sanitizeHeaders(headers map[string][]string) map[string][]string {
 		// Convert header name to lowercase for case-insensitive comparison
 		lowerKey := strings.ToLower(key)
 		
-		// Skip sensitive headers
-		if lowerKey == "authorization" || 
-		   lowerKey == "x-api-key" || 
+		// Skip sensitive headers. "api-key" (substring, not exact match)
+		// catches Azure OpenAI's bare "api-key" header, which has no "x-"
+		// prefix and wouldn't match the old exact "x-api-key" check.
+		if lowerKey == "authorization" ||
 		   lowerKey == "proxy-authorization" ||
+		   strings.Contains(lowerKey, "api-key") ||
 		   strings.Contains(lowerKey, "auth") ||
 		   strings.Contains(lowerKey, "token") ||
 		   strings.Contains(lowerKey, "secret") {

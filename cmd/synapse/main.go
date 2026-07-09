@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	charmlog "github.com/charmbracelet/log"
 	"gopkg.in/yaml.v3"
 	"synapse/internal/api"
 	"synapse/internal/config"
@@ -33,6 +34,18 @@ var (
 
 func main() {
 	flag.Parse()
+
+	// Replace the default slog text handler with charmbracelet/log's
+	// handler for colored, aligned console output. charmbracelet/log
+	// implements slog.Handler directly, so every existing slog.Info/
+	// Warn/Error call across the codebase gets the new formatting for
+	// free -- no changes needed anywhere else.
+	prettyLogger := charmlog.NewWithOptions(os.Stderr, charmlog.Options{
+		ReportTimestamp: true,
+		TimeFormat:      time.Kitchen,
+		Prefix:          "synapse",
+	})
+	slog.SetDefault(slog.New(prettyLogger))
 
 	// Load UI HTML file
 	var err error
@@ -99,7 +112,7 @@ func main() {
 	defer storeInstance.Close()
 
 	// Initialize embedder
-	embedderInstance, err := embedder.NewEmbedder(cfg.EmbedderType, cfg.OpenAIAPIKey, "", "")
+	embedderInstance, err := embedder.NewEmbedder(cfg.EmbedderType, cfg.OpenAIAPIKey, cfg.ModelPath, "")
 	if err != nil {
 		slog.Error("Failed to create embedder", "error", err)
 		os.Exit(1)

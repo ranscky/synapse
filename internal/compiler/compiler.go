@@ -3,6 +3,7 @@ package compiler
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"synapse/internal/scorer"
@@ -39,24 +40,32 @@ func Compile(
 		return selected[i].Timestamp.Before(selected[j].Timestamp)
 	})
 
-	// Add selected memories as assistant/user turns
+	// Build a single consolidated context block from all selected memories,
+	// rather than injecting one message per memory with role alternating by
+	// type. The old approach produced invalid multi-turn structure -- e.g.
+	// several "assistant" turns in a row with no "user" turn between them --
+	// which strict providers reject outright (Anthropic requires alternating
+	// user/assistant turns) and others silently mishandle. Folding all
+	// memories into one "user" message alongside the actual question
+	// guarantees the compiled output is always exactly one valid turn,
+	// regardless of how many memories are selected or what type they are.
+	var contextBlock strings.Builder
 	for _, memory := range selected {
-		header := fmt.Sprintf("[Memory | Type: %s | Score: %.2f]", memory.MemoryType, memory.Total)
-		content := header + " " + memory.Content
-
-		role := "assistant"
-		if memory.MemoryType == "decision" || memory.MemoryType == "error" {
-			role = "user"
-		}
-
-		result = append(result, map[string]interface{}{
-			"role":    role,
-			"content": content,
-		})
+		fmt.Fprintf(&contextBlock, "[Memory: %s] %s\n", memory.MemoryType, memory.Content)
 	}
 
-	// Add the last user message
-	if lastUserMessage != "" {
+	switch {
+	case contextBlock.Len() > 0 && lastUserMessage != "":
+		result = append(result, map[string]interface{}{
+			"role":    "user",
+			"content": contextBlock.String() + "\n" + lastUserMessage,
+		})
+	case contextBlock.Len() > 0:
+		result = append(result, map[string]interface{}{
+			"role":    "user",
+			"content": contextBlock.String(),
+		})
+	case lastUserMessage != "":
 		result = append(result, map[string]interface{}{
 			"role":    "user",
 			"content": lastUserMessage,

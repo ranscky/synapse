@@ -80,19 +80,23 @@ func NewStore(dbPath string) (*Store, error) {
 		db.SetMaxOpenConns(1)
 	}
 
-	// Set file permissions to 0600
-	if dbPath != ":memory:" {
-    if err := os.Chmod(dbPath, 0600); err != nil {
-        slog.Warn("Failed to set database file permissions", "error", err)
-    }
-}
-
 	store := &Store{db: db}
 	
 	// Initialize database schema
 	if err := store.initSchema(); err != nil {
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
+
+	// Set file permissions to 0600. Must happen after initSchema(), since
+	// database/sql connections are lazy -- sql.Open doesn't touch disk, and
+	// the SQLite file isn't actually created until the first real query
+	// (initSchema's CREATE TABLE). Chmod'ing before that point always
+	// failed with "no such file or directory" on a fresh install.
+	if dbPath != ":memory:" {
+    	if err := os.Chmod(dbPath, 0600); err != nil {
+        	slog.Warn("Failed to set database file permissions", "error", err)
+		}
+    }
 
 	slog.Info("Store initialized", "db_path", dbPath)
 	return store, nil
