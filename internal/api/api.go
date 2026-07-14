@@ -20,6 +20,7 @@ import (
 	"synapse/internal/dedup"
 	"synapse/internal/embedder"
 	"synapse/internal/scorer"
+	"synapse/internal/session"
 	"synapse/internal/store"
 	"synapse/internal/trace"
 
@@ -36,6 +37,7 @@ type APIServer struct {
 	persistTraces   bool
 	compileTimes    []int64
 	compileTimesMu  sync.RWMutex
+	sessionMgr      *session.Manager
 }
 
 // CompileRequest represents the request body for /v1/compile
@@ -63,8 +65,69 @@ type StatsResponse struct {
 	AvgCompileMs    int64  `json:"avg_compile_ms"`
 }
 
+// SessionSummary is a lighter view of session.Session for the sidebar list
+// -- no raw message history, since the list only needs enough to render.
+type SessionSummary struct {
+	ID           string    `json:"id"`
+	TaskIntent   string    `json:"task_intent"`
+	MessageCount int       `json:"message_count"`
+	CreatedAt    time.Time `json:"created_at"`
+	LastActive   time.Time `json:"last_active"`
+}
+
+// handleListSessions handles GET /api/sessions
+func (a *APIServer) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	if a.sessionMgr == nil {
+		http.Error(w, "session tracking not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	sessions := a.sessionMgr.List()
+	summaries := make([]SessionSummary, 0, len(sessions))
+	for _, s := range sessions {
+		summaries = append(summaries, SessionSummary{
+			ID:           s.ID,
+			TaskIntent:   s.TaskIntent,
+			MessageCount: len(s.Messages),
+			CreatedAt:    s.CreatedAt,
+			LastActive:   s.LastActive,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(summaries); err != nil {
+		slog.Error("Failed to encode sessions response", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
+// handleGetSessionTrace handles GET /api/sessions/{id}/trace
+func (a *APIServer) handleGetSessionTrace(w http.ResponseWriter, r *http.Request) {
+	if a.sessionMgr == nil {
+		http.Error(w, "session tracking not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	s, ok := a.sessionMgr.Get(id)
+	if !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	if s.LastTrace == nil {
+		http.Error(w, "no trace recorded yet for this session", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(s.LastTrace); err != nil {
+		slog.Error("Failed to encode trace response", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
 // NewAPIServer creates a new API server instance
-func NewAPIServer(store *store.Store, emb embedder.Embedder, cfg *config.Config, persistTraces bool) *APIServer {
+func NewAPIServer(store *store.Store, emb embedder.Embedder, cfg *config.Config, persistTraces bool, sessionMgr *session.Manager) *APIServer {
 	api := &APIServer{
 		router:        chi.NewRouter(),
 		store:         store,
@@ -73,6 +136,7 @@ func NewAPIServer(store *store.Store, emb embedder.Embedder, cfg *config.Config,
 		rateLimiter:   NewRateLimiter(100, time.Second), // 100 requests per second
 		persistTraces: persistTraces,
 		compileTimes:  make([]int64, 0, 1000), // Keep last 1000 compile times
+		sessionMgr:    sessionMgr, // Add session manager to API server
 	}
 	
 	api.setupRoutes()
@@ -89,6 +153,8 @@ func (a *APIServer) setupRoutes() {
 	a.router.Get("/v1/memories", a.handleGetMemories)
 	a.router.Delete("/v1/memories", a.handleDeleteMemories)
 	a.router.Get("/v1/stats", a.handleStats)
+	a.router.Get("/api/sessions", a.handleListSessions)
+	a.router.Get("/api/sessions/{id}/trace", a.handleGetSessionTrace)
 	a.router.Get("/openapi.yaml", a.serveOpenAPI)
 }
 

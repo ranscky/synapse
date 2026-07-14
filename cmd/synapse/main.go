@@ -21,9 +21,13 @@ import (
 	"synapse/internal/embedder"
 	"synapse/internal/proxy"
 	"synapse/internal/store"
+	"synapse/internal/session"
 )
 
-var uiHTML []byte
+var (
+	uiHTML []byte
+	uiSessionHTML []byte
+)
 
 var (
 	configPath     = flag.String("config", "synapse.yaml", "Path to configuration file")
@@ -59,6 +63,17 @@ func main() {
 			if err != nil {
 				slog.Warn("Failed to load UI file, UI will not be available", "error", err)
 				uiHTML = []byte("<html><body><h1>UI not available</h1></body></html>")
+			}
+		}
+	}
+	uiSessionHTML, err = os.ReadFile("ui/session.html")
+	if err != nil {
+		uiSessionHTML, err = os.ReadFile("../../ui/session.html")
+		if err != nil {
+			uiSessionHTML, err = os.ReadFile("../ui/session.html")
+			if err != nil {
+				slog.Warn("Failed to load session UI file, page will not be available", "error", err)
+				uiSessionHTML = []byte("<html><body><h1>Page not available</h1></body></html>")
 			}
 		}
 	}
@@ -118,15 +133,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize session manager for trace inspector session inference.
+	// 30 min TTL: idle conversations age out of the in-memory map.
+	sessionMgr := session.NewManager(30 * time.Minute)
+
+
 	// Create proxy with store and embedder
-	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, embedderInstance, cfg)
+	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, embedderInstance, cfg, sessionMgr)
 	if err != nil {
 		slog.Error("Failed to create proxy", "error", err)
 		os.Exit(1)
 	}
 
 	// Create API server
-	apiServer := api.NewAPIServer(storeInstance, embedderInstance, cfg, *persistTraces)
+	apiServer := api.NewAPIServer(storeInstance, embedderInstance, cfg, *persistTraces, sessionMgr)
 	
 	// Create router
 	r := chi.NewRouter()
@@ -158,6 +178,13 @@ func main() {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		w.Write(uiHTML)
+	})
+
+	// Serve session UI at GET /ui/session
+	r.Get("/ui/session", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write(uiSessionHTML)
 	})
 
 	// Add link to UI in startup log

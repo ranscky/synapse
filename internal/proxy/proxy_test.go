@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"synapse/internal/config"
+	"synapse/internal/session"
 	"synapse/internal/store"
 	"synapse/internal/trace"
 
@@ -55,7 +56,7 @@ func TestProxyIntegration(t *testing.T) {
 	}))
 	defer testServer.Close()
 
-	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig())
+	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -85,7 +86,7 @@ func TestProxyHealthCheck(t *testing.T) {
 	}))
 	defer testServer.Close()
 
-	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig())
+	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -132,7 +133,7 @@ func TestProxyInvalidJSON(t *testing.T) {
 	}))
 	defer testServer.Close()
 
-	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig())
+	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -158,7 +159,7 @@ func TestProxyNilDependencies(t *testing.T) {
 	defer testServer.Close()
 
 	// Pass nil for both store and embedder — proxy should still forward requests
-	proxy, err := NewProxy(testServer.URL, nil, nil, config.DefaultConfig())
+	proxy, err := NewProxy(testServer.URL, nil, nil, config.DefaultConfig(), session.NewManager(30*time.Minute))
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -178,7 +179,7 @@ func TestProxyNilDependencies(t *testing.T) {
 // TestProxyUpstreamUnavailable tests handling of upstream server being unavailable
 func TestProxyUpstreamUnavailable(t *testing.T) {
 	// Create the proxy pointing to a non-existent server
-	proxy, err := NewProxy("http://127.0.0.1:19999", nil, nil, config.DefaultConfig()) // Unlikely to be in use
+	proxy, err := NewProxy("http://127.0.0.1:19999", nil, nil, config.DefaultConfig(), session.NewManager(30*time.Minute)) // Unlikely to be in use
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -214,7 +215,7 @@ func TestProxyContextValues(t *testing.T) {
 	}))
 	defer testServer.Close()
 
-	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig())
+	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -270,7 +271,7 @@ func TestProxyWritesMemoryFromRealTraffic(t *testing.T) {
 	require.NoError(t, err)
 	defer realStore.Close()
 
-	proxy, err := NewProxy(testServer.URL, realStore, &mockEmbedder{}, config.DefaultConfig())
+	proxy, err := NewProxy(testServer.URL, realStore, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -314,7 +315,7 @@ func TestProxyCapturesAssistantReply(t *testing.T) {
 	require.NoError(t, err)
 	defer realStore.Close()
 
-	proxy, err := NewProxy(testServer.URL, realStore, &mockEmbedder{}, config.DefaultConfig())
+	proxy, err := NewProxy(testServer.URL, realStore, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
 	require.NoError(t, err)
 	defer proxy.Close()
 

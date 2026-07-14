@@ -10,9 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"synapse/internal/config"
+	"synapse/internal/session"
 	"synapse/internal/store"
+
+	"github.com/go-chi/chi/v5"
 )
 
 func TestAPIServer(t *testing.T) {
@@ -30,7 +32,7 @@ func TestAPIServer(t *testing.T) {
 	cfg := config.DefaultConfig()
 
 	// Create API server
-	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 
 	// Test health endpoint
 	t.Run("Health Endpoint", func(t *testing.T) {
@@ -295,7 +297,7 @@ func TestAPIServerWithPersistence(t *testing.T) {
 	cfg := config.DefaultConfig()
 
 	// Create API server with persistence enabled
-	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, true)
+	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, true, session.NewManager(30*time.Minute))
 
 	// Test that server was created with persistence enabled
 	if !apiServer.persistTraces {
@@ -318,7 +320,7 @@ func BenchmarkAPIServer(b *testing.B) {
 	cfg := config.DefaultConfig()
 
 	// Create API server
-	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 
 	b.Run("Stats Endpoint", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
@@ -372,7 +374,7 @@ func TestConcurrentAccess(t *testing.T) {
 	cfg := config.DefaultConfig()
 
 	// Create API server
-	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 
 	// Test concurrent access to compile times
 	done := make(chan bool)

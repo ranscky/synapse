@@ -15,6 +15,7 @@ import (
 
 	"synapse/internal/config"
 	"synapse/internal/scorer"
+	"synapse/internal/session"
 	"synapse/internal/store"
 	"synapse/internal/trace"
 
@@ -42,7 +43,7 @@ func TestIntegration(t *testing.T) {
 
 	// Test 1: API server without persistence
 	t.Run("API Server Without Persistence", func(t *testing.T) {
-		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 
 		// Test compile endpoint
 		compileReq := CompileRequest{
@@ -92,7 +93,7 @@ func TestIntegration(t *testing.T) {
 
 	// Test 2: API server with persistence
 	t.Run("API Server With Persistence", func(t *testing.T) {
-		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, true)
+		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, true, session.NewManager(30*time.Minute))
 
 		// Test compile endpoint
 		compileReq := CompileRequest{
@@ -126,7 +127,7 @@ func TestIntegration(t *testing.T) {
 
 	// Test 3: Memory management endpoints
 	t.Run("Memory Management", func(t *testing.T) {
-		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 
 		sessionID := "memory-test-session"
 
@@ -160,7 +161,7 @@ func TestIntegration(t *testing.T) {
 
 	// Test 4: Stats endpoint
 	t.Run("Stats Endpoint", func(t *testing.T) {
-		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 
 		req := httptest.NewRequest("GET", "/v1/stats", nil)
 		rr := httptest.NewRecorder()
@@ -244,7 +245,7 @@ func TestIntegration(t *testing.T) {
 		rr := httptest.NewRecorder()
 
 		// Create fresh API server for each test
-		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 		apiServer.Router().ServeHTTP(rr, req)
 
 		// Check if error status matches expectation
@@ -273,7 +274,7 @@ func TestIntegration(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		rr := httptest.NewRecorder()
 
-		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 		apiServer.Router().ServeHTTP(rr, req)
 
 		if rr.Code != http.StatusBadRequest {
@@ -283,7 +284,7 @@ func TestIntegration(t *testing.T) {
 
 	// Test 7: Rate limiting
 	t.Run("Rate Limiting", func(t *testing.T) {
-		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+		apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 
 		// Make more than 100 requests to trigger rate limiting
 		rateLimitHit := false
@@ -319,7 +320,7 @@ func TestConcurrentCompilation(t *testing.T) {
 	cfg := config.DefaultConfig()
 
 	// Create API server
-	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 
 	// Test concurrent compilations
 	concurrentRequests := 5
@@ -375,7 +376,7 @@ func TestPerformance(t *testing.T) {
 	cfg := config.DefaultConfig()
 
 	// Create API server
-	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+	apiServer := NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 
 	// Performance test for stats endpoint (account for rate limiting)
 	start := time.Now()
@@ -417,7 +418,7 @@ func TestAPICompileWritesMemory(t *testing.T) {
 
 	mockEmbedder := &mockEmbedder{}
 	cfg := config.DefaultConfig()
-	apiServer := NewAPIServer(realStore, mockEmbedder, cfg, false)
+	apiServer := NewAPIServer(realStore, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 
 	reqBody := `{"messages":[{"role":"user","content":"there was an error in the order handler causing a crash"}],"session_id":"write-test-session"}`
 	req := httptest.NewRequest("POST", "/v1/compile", strings.NewReader(reqBody))

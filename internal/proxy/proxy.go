@@ -16,14 +16,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
+	"synapse/internal/budget"
 	"synapse/internal/classifier"
 	"synapse/internal/compiler"
 	"synapse/internal/config"
 	"synapse/internal/dedup"
-	"synapse/internal/budget"
 	"synapse/internal/scorer"
+	"synapse/internal/session"
 	"synapse/internal/store"
+
+	"github.com/go-chi/chi/v5"
 )
 
 // ContextKey represents context keys used in the proxy
@@ -35,6 +37,7 @@ const (
 	ConfidenceKey     ContextKey = "confidence"
 	SessionIDKey      ContextKey = "session_id"
 	UserMessageKey    ContextKey = "user_message"
+	TraceSessionIDKey ContextKey = "trace_session_id"
 )
 
 // Embedder is the interface for generating text embeddings.
@@ -58,10 +61,11 @@ type Proxy struct {
 	store    MemoryStore
 	embedder Embedder
 	config   *config.Config
+	sessionMgr *session.Manager
 }
 
 // NewProxy creates a new proxy instance
-func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.Config) (*Proxy, error) {
+func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.Config, sessionMgr *session.Manager) (*Proxy, error) {
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target URL: %w", err)
@@ -77,6 +81,7 @@ func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.
 		store:    memStore,
 		embedder: emb,
 		config:   cfg,
+		sessionMgr: sessionMgr,
 	}
 
 	// Create reverse proxy with director and response capture
@@ -85,6 +90,14 @@ func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.
 			proxy.director(req)
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// Surface the inspector's per-conversation session ID on the
+			// response so it's visible in devtools/logs even without
+			// opening the UI. Read via resp.Request.Context(), not a
+			// pre-RoundTrip copy -- context.WithValue doesn't survive
+			// the actual HTTP round trip otherwise.
+			if sid, ok := resp.Request.Context().Value(TraceSessionIDKey).(string); ok && sid != "" {
+				resp.Header.Set("X-Synapse-Session-Id", sid)
+			}
 			proxy.captureResponse(resp)
 			return nil
 		},
@@ -97,10 +110,16 @@ func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.
 // header value. Two different keys of equal length no longer collide because
 // we hash the content, not the length. Falls back to "default-session" only
 // when no Authorization header is present at all.
-func deriveSessionID(r *http.Request) string {
+func deriveSessionID(r *http.Request, fallback string) string {
 	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
 		sum := sha256.Sum256([]byte(authHeader))
 		return fmt.Sprintf("sess-%s", hex.EncodeToString(sum[:8]))
+	}
+	if fallback != "" {
+		// No API key to bucket by -- fall back to the per-conversation
+		// fingerprint instead of one flat "default-session" bucket, so
+		// unrelated keyless conversations don't share memory recall.
+		return fallback
 	}
 	return "default-session"
 }
@@ -192,7 +211,8 @@ func (p *Proxy) captureResponse(resp *http.Response) {
 	// always writes to the correct session bucket.
 	sessionID, _ := ctx.Value(SessionIDKey).(string)
 	if sessionID == "" {
-		sessionID = deriveSessionID(req)
+		traceID, _ := ctx.Value(TraceSessionIDKey).(string)
+		sessionID = deriveSessionID(req, traceID)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -287,6 +307,22 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		} `json:"messages"`
 	}
 
+	// Fingerprint this conversation for the trace inspector. Parsed
+	// separately from `parsedRequest` above because session.Message keeps
+	// Content as raw JSON (string or content-block array), whereas
+	// parsedRequest simplifies Content to a string for classification.
+	var sessionParse struct {
+		Messages []session.Message `json:"messages"`
+	}
+	var traceSessionID string
+	if p.sessionMgr != nil {
+		if err := json.Unmarshal(body, &sessionParse); err != nil {
+			slog.Warn("Failed to parse messages for session fingerprinting", "error", err)
+		} else {
+			traceSessionID, _ = p.sessionMgr.Identify(sessionParse.Messages)
+		}
+	}
+
 	lastUserMessage := ""
 	systemPrompt := ""
 	if err := json.Unmarshal(body, &parsedRequest); err != nil {
@@ -337,7 +373,7 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// 2. Derive session ID from the Authorization header so each API key
 	// gets its own memory bucket. Falls back to "default-session" only when
 	// no Authorization header is present at all.
-	sessionID := deriveSessionID(r)
+	sessionID := deriveSessionID(r, traceSessionID)
 
 	var candidates []store.MemoryEntry
 	if p.store != nil {
@@ -431,6 +467,11 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// Update tokens used in trace
 	compileResult.Trace.TokensUsed = totalTokens
 
+	if p.sessionMgr != nil && traceSessionID != "" {
+		p.sessionMgr.SetTrace(traceSessionID, compileResult.Trace)
+		p.sessionMgr.SetIntent(traceSessionID, string(intent))
+	}
+
 	compileDuration := time.Since(compileStart)
 
 	// 8. Log timing information
@@ -493,6 +534,7 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ConfidenceKey, confidence)
 	ctx = context.WithValue(ctx, SessionIDKey, sessionID)
 	ctx = context.WithValue(ctx, UserMessageKey, lastUserMessage)
+	ctx = context.WithValue(ctx, TraceSessionIDKey, traceSessionID)
 
 	// Create new request with updated context
 	r = r.WithContext(ctx)

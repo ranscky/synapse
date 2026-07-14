@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Synapse — Trace</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --void:       #080808;
+            --surface:    #0f0f0f;
+            --raised:     #161616;
+            --elevated:   #1c1c1c;
+            --border:     #242424;
+            --border-hi:  #2e2e2e;
+            --signal:     #00e5a0;
+            --burn:       #ff6b2b;
+            --burn-dim:   rgba(255, 107, 43, 0.12);
+            --text-hi:    #e8e8e8;
+            --text-mid:   #888;
+            --text-lo:    #444;
+            --amber:      #f59e0b;
+            --cobalt:     #3b82f6;
+            --violet:     #8b5cf6;
+            --font-display: 'Space Grotesk', system-ui, sans-serif;
+            --font-mono:    'JetBrains Mono', 'Fira Code', monospace;
+            --glow-signal: 0 0 8px rgba(0, 229, 160, 0.6), 0 0 24px rgba(0, 229, 160, 0.2);
+            --glow-burn:   0 0 8px rgba(255, 107, 43, 0.5), 0 0 20px rgba(255, 107, 43, 0.15);
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html { height: 100%; }
+        body { font-family: var(--font-mono); background: var(--void); color: var(--text-hi); line-height: 1.5; min-height: 100vh; }
+
+        ::-webkit-scrollbar { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-track { background: var(--surface); }
+        ::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--signal); box-shadow: var(--glow-signal); }
+
+        .topbar {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 0 24px; height: 56px; background: var(--surface);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .topbar-left { display: flex; align-items: center; gap: 16px; }
+
+        .wordmark { font-family: var(--font-display); font-size: 15px; font-weight: 600; display: flex; align-items: center; }
+        .wordmark-accent { color: var(--signal); text-shadow: var(--glow-signal); }
+
+        .topbar-right { display: flex; align-items: center; gap: 16px; }
+        .topbar-meta { font-size: 10px; color: var(--text-lo); letter-spacing: 0.08em; }
+
+        .sys-indicator { display: flex; align-items: center; gap: 7px; font-size: 10px; color: var(--text-mid); letter-spacing: 0.12em; text-transform: uppercase; }
+        .pulse-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--signal); box-shadow: var(--glow-signal); animation: pulse-beat 2.4s ease-in-out infinite; }
+        @keyframes pulse-beat { 0%,100% { opacity:1; transform:scale(1); } 40% { opacity:.3; transform:scale(.7); } 60% { opacity:1; transform:scale(1.15); } }
+
+        .panel-head {
+            padding: 16px 20px 14px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            flex-shrink: 0;
+        }
+
+        .panel-label {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--signal);
+            text-shadow: var(--glow-signal);
+            margin-bottom: 4px;
+        }
+
+        .panel-title {
+            font-family: var(--font-display);
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-hi);
+            line-height: 1.2;
+        }
+
+        .panel-desc {
+            font-size: 11px;
+            color: var(--text-mid);
+            margin-top: 3px;
+        }
+
+        .btn { font-family: var(--font-mono); font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; border: none; cursor: pointer; padding: 9px 18px; transition: all .15s; text-decoration: none; display: inline-flex; align-items: center; }
+        .btn-ghost { background: transparent; color: var(--text-mid); border: 1px solid var(--border); }
+        .btn-ghost:hover { border-color: var(--signal); color: var(--signal); }
+        .btn-ghost.topbar-btn { font-size: 10px; padding: 7px 14px; }
+
+        /* ── HEADER STRIP ──────────────────────────── */
+        .session-header {
+            padding: 18px 28px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 28px;
+            flex-wrap: wrap;
+            background: var(--surface);
+        }
+
+        .session-header-id { font-size: 13px; color: var(--text-mid); }
+
+        .type-badge { font-size: 9px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; padding: 2px 7px; }
+        .type-debug     { background: var(--burn);     color: #fff; }
+        .type-plan      { background: var(--violet);   color: #fff; }
+        .type-code      { background: var(--cobalt);   color: #fff; }
+        .type-write     { background: var(--signal);   color: var(--void); }
+        .type-generic   { background: var(--elevated); color: var(--text-mid); border: 1px solid var(--border-hi); }
+        .type-decision  { background: var(--cobalt);  color: #fff; }
+        .type-error     { background: var(--burn);     color: #fff; }
+        .type-fact      { background: var(--signal);   color: var(--void); }
+        .type-preference{ background: var(--amber);    color: var(--void); }
+        .type-context   { background: var(--elevated); color: var(--text-mid); border: 1px solid var(--border-hi); }
+
+        /* ── TRACE BODY ────────────────────────────── */
+        .trace-panel-body {
+            display: grid;
+            grid-template-columns: 280px 1fr;
+            gap: 0;
+            height: calc(100vh - 56px - 61px);
+        }
+
+        .trace-stats-col {
+            border-right: 1px solid var(--border);
+            padding: 20px 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            overflow-y: auto;
+        }
+
+        .trace-main-col {
+            overflow-y: auto;
+            padding: 20px 28px;
+            max-width: 1100px;
+        }
+
+        .stat-block { background: var(--raised); border: 1px solid var(--border); padding: 14px 16px; }
+        .stat-number { font-family: var(--font-display); font-size: 28px; font-weight: 700; color: var(--signal); text-shadow: var(--glow-signal); line-height: 1; margin-bottom: 4px; }
+        .stat-name { font-size: 10px; font-weight: 500; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-mid); }
+        .stat-token-bar { margin-top: 10px; height: 3px; background: var(--border); overflow: hidden; }
+        .stat-token-fill { height: 100%; background: var(--signal); box-shadow: var(--glow-signal); width: 0%; transition: width .8s cubic-bezier(.16,1,.3,1); }
+
+        .intent-block { background: var(--raised); border: 1px solid var(--border); padding: 14px 16px; }
+        .intent-label { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-lo); margin-bottom: 8px; }
+        .intent-text { font-family: var(--font-display); font-size: 15px; font-weight: 600; margin-bottom: 10px; }
+        .confidence-bar { height: 3px; background: var(--border); overflow: hidden; margin-bottom: 6px; }
+        .confidence-fill { height: 100%; width: 0%; transition: width .8s cubic-bezier(.16,1,.3,1) .2s; }
+        .confidence-hi { background: var(--signal); box-shadow: var(--glow-signal); }
+        .confidence-med { background: var(--amber); }
+        .confidence-low { background: var(--burn); box-shadow: var(--glow-burn); }
+        .confidence-pct { font-size: 11px; font-weight: 700; color: var(--text-mid); }
+
+        .trace-memory-item { background: var(--raised); border: 1px solid var(--border); margin-bottom: 8px; transition: border-color .15s; cursor: pointer; }
+        .trace-memory-item:hover { border-color: var(--signal); }
+        .trace-memory-item.excluded { border-color: var(--border); opacity: .45; }
+
+        .trace-mem-head { padding: 11px 15px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--border); }
+        .trace-mem-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+        .trace-mem-preview { font-size: 12px; color: var(--text-mid); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+        .excl-badge { font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; padding: 2px 7px; background: var(--burn-dim); color: var(--burn); border: 1px solid rgba(255,107,43,0.3); flex-shrink: 0; }
+        .trace-mem-scores { padding: 11px 15px 13px; }
+
+        .score-bar { height: 20px; background: #111; border: 1px solid var(--border); display: flex; overflow: hidden; margin-bottom: 9px; }
+        .score-seg { height: 100%; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700; color: rgba(0,0,0,.7); width: 0%; overflow: hidden; white-space: nowrap; transition: width .6s cubic-bezier(.16,1,.3,1); letter-spacing: .04em; }
+        .seg-s { background: #3b82f6; color: rgba(255,255,255,.8); }
+        .seg-r { background: #00e5a0; color: rgba(0,0,0,.7); box-shadow: inset 0 0 10px rgba(0,229,160,.3); }
+        .seg-i { background: #f59e0b; color: rgba(0,0,0,.7); }
+        .seg-t { background: #8b5cf6; color: rgba(255,255,255,.8); }
+
+        .score-detail-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; max-width: 480px; }
+        .score-cell { text-align: center; }
+        .score-cell-label { font-size: 9px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-lo); margin-bottom: 2px; }
+        .score-cell-val { font-size: 11px; font-weight: 700; }
+        .score-cell-val.total { color: var(--text-hi); }
+        .score-cell-val.s { color: #3b82f6; }
+        .score-cell-val.r { color: var(--signal); text-shadow: 0 0 6px rgba(0,229,160,.5); }
+        .score-cell-val.i { color: var(--amber); }
+        .score-cell-val.t { color: #8b5cf6; }
+
+        .legend { display: flex; gap: 14px; flex-wrap: wrap; }
+        .legend-item { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--text-mid); }
+        .legend-dot { width: 8px; height: 8px; }
+
+        .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 24px; text-align: center; gap: 10px; height: 100%; }
+        .empty-glyph { font-size: 26px; color: var(--text-lo); }
+        .empty-text { font-size: 12px; color: var(--text-lo); letter-spacing: .06em; }
+
+        .modal { position: fixed; inset: 0; background: rgba(0,0,0,.75); display: none; align-items: center; justify-content: center; z-index: 500; backdrop-filter: blur(4px); }
+        .modal.open { display: flex; }
+        .modal-box { background: var(--surface); border: 1px solid var(--border-hi); width: 90%; max-width: 620px; max-height: 80vh; display: flex; flex-direction: column; box-shadow: 0 0 60px rgba(0,229,160,.06); }
+        .modal-head { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+        .modal-head-title { font-family: var(--font-display); font-size: 14px; font-weight: 600; }
+        .modal-close { background: none; border: none; color: var(--text-mid); cursor: pointer; font-size: 18px; padding: 4px; }
+        .modal-close:hover { color: var(--burn); }
+        .modal-content-body { padding: 20px; overflow-y: auto; font-size: 12px; line-height: 1.7; color: var(--text-mid); white-space: pre-wrap; word-break: break-all; }
+
+        @media (max-width: 900px) {
+            .trace-panel-body { grid-template-columns: 1fr; height: auto; }
+            .trace-stats-col { border-right: none; border-bottom: 1px solid var(--border); }
+        }
+    </style>
+</head>
+<body>
+
+    <header class="topbar">
+        <div class="topbar-left">
+            <a class="btn btn-ghost topbar-btn" href="/ui">← SESSIONS</a>
+            <div class="wordmark"><span class="wordmark-accent">SYN</span>APSE</div>
+        </div>
+        <div class="topbar-right">
+            <span class="topbar-meta" id="topbarClock"></span>
+            <div class="sys-indicator"><div class="pulse-dot"></div>SYS:ACTIVE</div>
+        </div>
+    </header>
+
+    <div class="panel-head">
+                <div>
+                    <div class="panel-label">03 — Trace</div>
+                    <div class="panel-title">Compilation Trace</div>
+                    <div class="panel-desc">Memory scoring, intent detection, context decisions</div>
+                </div>
+            </div>
+
+    <div class="session-header" id="sessionHeaderStrip">
+        <span class="session-header-id" id="sessionIdLabel">—</span>
+    </div>
+
+    <div class="trace-panel-body">
+        <div class="trace-stats-col" id="traceStats">
+            <div class="empty" style="padding:24px 0"><div class="empty-glyph">◫</div><div class="empty-text">Loading…</div></div>
+        </div>
+        <div class="trace-main-col" id="traceContent">
+            <div class="empty"><div class="empty-glyph">◫</div><div class="empty-text">Loading…</div></div>
+        </div>
+    </div>
+
+    <div class="modal" id="memoryModal">
+        <div class="modal-box">
+            <div class="modal-head">
+                <span class="modal-head-title">Memory Detail</span>
+                <button class="modal-close" id="closeModal">✕</button>
+            </div>
+            <div class="modal-content-body" id="memoryDetailContent"></div>
+        </div>
+    </div>
+
+<script>
+    const clockEl = document.getElementById('topbarClock');
+    function updateClock() {
+        const now = new Date();
+        const pad = n => String(n).padStart(2, '0');
+        clockEl.textContent = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())} UTC${now.getTimezoneOffset() <= 0 ? '+' : ''}${-(now.getTimezoneOffset()/60)}`;
+    }
+    updateClock();
+    setInterval(updateClock, 1000);
+
+    const memoryModal = document.getElementById('memoryModal');
+    const memoryDetailContent = document.getElementById('memoryDetailContent');
+    document.getElementById('closeModal').addEventListener('click', () => memoryModal.classList.remove('open'));
+    memoryModal.addEventListener('click', e => { if (e.target === memoryModal) memoryModal.classList.remove('open'); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') memoryModal.classList.remove('open'); });
+    function showMemoryDetail(memory) {
+        memoryDetailContent.textContent = JSON.stringify(memory, null, 2);
+        memoryModal.classList.add('open');
+    }
+
+    const POLL_INTERVAL_MS = 3000;
+    const sessionId = new URLSearchParams(location.search).get('id');
+    const traceStats = document.getElementById('traceStats');
+    const traceContent = document.getElementById('traceContent');
+    const sessionIdLabel = document.getElementById('sessionIdLabel');
+
+    function intentTypeClass(intent) {
+        const known = ['debug', 'plan', 'code', 'write', 'generic'];
+        return known.includes(intent) ? `type-${intent}` : 'type-generic';
+    }
+
+    if (!sessionId) {
+        sessionIdLabel.textContent = 'No session ID in URL';
+        traceStats.innerHTML = '';
+        traceContent.innerHTML = '<div class="empty"><div class="empty-glyph">◫</div><div class="empty-text">Go back and pick a session from the feed</div></div>';
+    } else {
+        sessionIdLabel.textContent = sessionId;
+        loadTrace();
+        setInterval(loadTrace, POLL_INTERVAL_MS);
+    }
+
+    async function loadTrace() {
+        try {
+            const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/trace`);
+            if (res.status === 404) {
+                traceContent.innerHTML = '<div class="empty"><div class="empty-glyph">◫</div><div class="empty-text">No trace compiled yet for this session</div></div>';
+                return;
+            }
+            if (!res.ok) return;
+            const trace = await res.json();
+            displayTrace(trace);
+        } catch (e) {
+            // silent -- next poll retries
+        }
+    }
+
+    function displayTrace(trace) {
+        const tokenPct = trace.token_budget > 0 ? (trace.tokens_used / trace.token_budget) * 100 : 0;
+        const confPct  = (trace.intent_confidence ?? 0) * 100;
+        const confClass= confPct >= 80 ? 'confidence-hi' : confPct >= 50 ? 'confidence-med' : 'confidence-low';
+
+        sessionHeaderStrip.innerHTML = `
+            <span class="session-header-id">${sessionId}</span>
+            <span class="type-badge ${intentTypeClass(trace.detected_intent)}">${trace.detected_intent || 'generic'}</span>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>Semantic</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#00e5a0"></div>Recency</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div>Importance</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#8b5cf6"></div>Task</div>
+            </div>
+        `;
+
+        traceStats.innerHTML = `
+            <div class="stat-block">
+                <div class="stat-number">${trace.candidates_retrieved}</div>
+                <div class="stat-name">Candidates retrieved</div>
+            </div>
+            <div class="stat-block">
+                <div class="stat-number">${trace.candidates_after_dedup}</div>
+                <div class="stat-name">After dedup</div>
+            </div>
+            <div class="stat-block">
+                <div class="stat-number">${trace.memories_compiled}</div>
+                <div class="stat-name">Compiled</div>
+            </div>
+            <div class="stat-block">
+                <div class="stat-number" style="font-size:20px">${trace.tokens_used}<span style="font-size:13px;font-weight:400;color:var(--text-lo)">/${trace.token_budget}</span></div>
+                <div class="stat-name">Tokens used</div>
+                <div class="stat-token-bar"><div class="stat-token-fill" id="tokenFill"></div></div>
+            </div>
+            <div class="intent-block">
+                <div class="intent-label">Detected Intent</div>
+                <div class="intent-text">${trace.detected_intent ?? '—'}</div>
+                <div class="confidence-bar"><div class="confidence-fill ${confClass}" id="confFill"></div></div>
+                <div class="confidence-pct">${confPct.toFixed(1)}% confidence</div>
+            </div>
+            <div class="stat-block">
+                <div class="stat-number" style="font-size:20px">${trace.compile_duration_ms}ms</div>
+                <div class="stat-name">Compile duration</div>
+            </div>
+        `;
+
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            const tf = document.getElementById('tokenFill');
+            const cf = document.getElementById('confFill');
+            if (tf) tf.style.width = tokenPct.toFixed(1) + '%';
+            if (cf) cf.style.width = confPct.toFixed(1) + '%';
+        }));
+
+        if (trace.memories && trace.memories.length > 0) {
+            traceContent.innerHTML = trace.memories.map(renderMemoryTrace).join('');
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+                document.querySelectorAll('.score-seg[data-w]').forEach(el => { el.style.width = el.dataset.w + '%'; });
+            }));
+            document.querySelectorAll('.trace-memory-item').forEach(item => {
+                item.addEventListener('click', () => showMemoryDetail(JSON.parse(item.getAttribute('data-memory'))));
+            });
+        } else {
+            traceContent.innerHTML = '<div class="empty"><div class="empty-glyph">◫</div><div class="empty-text">No memory traces</div></div>';
+        }
+    }
+
+    function renderMemoryTrace(memory) {
+        const total = memory.score_total || 0.001;
+        const sW = ((memory.score_semantic / total) * 100).toFixed(1);
+        const rW = ((memory.score_recency / total) * 100).toFixed(1);
+        const iW = ((memory.score_importance / total) * 100).toFixed(1);
+        const tW = ((memory.score_task_alignment / total) * 100).toFixed(1);
+
+        return `
+            <div class="trace-memory-item${memory.included ? '' : ' excluded'}" data-memory='${JSON.stringify(memory).replace(/'/g, "&#39;")}'>
+                <div class="trace-mem-head">
+                    <div class="trace-mem-left">
+                        <span class="type-badge type-${memory.memory_type}">${memory.memory_type}</span>
+                        <span class="trace-mem-preview">${memory.content_preview.substring(0, 90)}${memory.content_preview.length > 90 ? '…' : ''}</span>
+                    </div>
+                    ${!memory.included ? `<span class="excl-badge">${memory.exclusion_reason || 'excluded'}</span>` : ''}
+                </div>
+                <div class="trace-mem-scores">
+                    <div class="score-bar">
+                        <div class="score-seg seg-s" data-w="${sW}" style="width:0%">${memory.score_semantic.toFixed(2)}</div>
+                        <div class="score-seg seg-r" data-w="${rW}" style="width:0%">${memory.score_recency.toFixed(2)}</div>
+                        <div class="score-seg seg-i" data-w="${iW}" style="width:0%">${memory.score_importance.toFixed(2)}</div>
+                        <div class="score-seg seg-t" data-w="${tW}" style="width:0%">${memory.score_task_alignment.toFixed(2)}</div>
+                    </div>
+                    <div class="score-detail-row">
+                        <div class="score-cell"><div class="score-cell-label">Total</div><div class="score-cell-val total">${memory.score_total.toFixed(3)}</div></div>
+                        <div class="score-cell"><div class="score-cell-label">Semantic</div><div class="score-cell-val s">${memory.score_semantic.toFixed(3)}</div></div>
+                        <div class="score-cell"><div class="score-cell-label">Recency</div><div class="score-cell-val r">${memory.score_recency.toFixed(3)}</div></div>
+                        <div class="score-cell"><div class="score-cell-label">Importance</div><div class="score-cell-val i">${memory.score_importance.toFixed(3)}</div></div>
+                        <div class="score-cell"><div class="score-cell-label">Task</div><div class="score-cell-val t">${memory.score_task_alignment.toFixed(3)}</div></div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    const sessionHeaderStrip = document.getElementById('sessionHeaderStrip');
+</script>
+</body>
+</html>

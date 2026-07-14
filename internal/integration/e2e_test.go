@@ -17,6 +17,7 @@ import (
 	"synapse/internal/api"
 	"synapse/internal/config"
 	"synapse/internal/proxy"
+	"synapse/internal/session"
 	"synapse/internal/store"
 	"synapse/internal/trace"
 
@@ -182,11 +183,11 @@ func TestEndToEndIntegration(t *testing.T) {
 			rawTokenCount := countTokens(messages)
 			
 			// Create proxy
-			proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, mockEmbedder, cfg)
+			proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, mockEmbedder, cfg, session.NewManager(30*time.Minute))
 			require.NoError(t, err)
 			
 			// Create API server
-			apiServer := api.NewAPIServer(storeInstance, mockEmbedder, cfg, false)
+			apiServer := api.NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
 			
 			// Create router
 			r := chi.NewRouter()
@@ -301,12 +302,12 @@ func TestTokenBudgetCompliance(t *testing.T) {
 	cfg.TokenBudget = 500 // Strict budget for testing
 	
 	// Create proxy
-	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, mockEmbedder, cfg)
+	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, mockEmbedder, cfg, session.NewManager(30*time.Minute))
 	require.NoError(t, err)
 	
 	// Create API server
-	apiServer := api.NewAPIServer(storeInstance, mockEmbedder, cfg, false)
-	
+	apiServer := api.NewAPIServer(storeInstance, mockEmbedder, cfg, false, session.NewManager(30*time.Minute))
+
 	// Create router
 	r := chi.NewRouter()
 	r.Mount("/api", apiServer.Router())
