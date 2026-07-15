@@ -188,6 +188,16 @@ func Classify(text string) ClassifyResult {
 
 	confidence := float64(bestHits) / float64(totalHits)
 
+	// A single keyword hit can mathematically produce 100% confidence
+	// (it wins 100% of a 1-hit contest) despite being weak signal. Scale
+	// confidence down when there's little corroborating evidence, without
+	// changing which intent wins -- downstream scoring shouldn't treat a
+	// one-word signal as equivalent to a dense, unambiguous one.
+	const minCorroboratingHits = 3
+	if bestHits < minCorroboratingHits {
+	    confidence *= float64(bestHits) / float64(minCorroboratingHits)
+	}
+
 	return ClassifyResult{
 		Intent:     bestIntent,
 		Confidence: confidence,

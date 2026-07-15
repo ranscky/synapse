@@ -58,7 +58,8 @@
         .app {
             display: grid;
             grid-template-rows: 56px 1fr;
-            min-height: 100vh;
+            height: 100vh;
+            overflow: hidden;
         }
 
         /* ── TOPBAR ────────────────────────────────── */
@@ -160,13 +161,12 @@
         .workspace {
             display: grid;
             grid-template-columns: 420px 1fr;
-            /*grid-template-rows: 1fr 340px;*/
             grid-template-areas:
                 "sidebar  playground"
                 ;
             gap: 1px;
             background: var(--border);
-            height: fill-available;
+            height: 100vh;
             overflow: hidden;
         }
 
@@ -181,7 +181,6 @@
 
         .panel-sidebar    { grid-area: sidebar; }
         .panel-playground { grid-area: playground; }
-        .panel-trace      { grid-area: trace; border-top: 1px solid var(--border); }
 
         .panel-head {
             padding: 16px 20px 14px;
@@ -254,7 +253,7 @@
             gap: 8px;
         }
 
-        input[type="text"], textarea {
+        input[type="text"], input[type="number"], textarea {
             width: 100%;
             background: var(--raised);
             border: 1px solid var(--border);
@@ -268,17 +267,27 @@
             -webkit-appearance: none;
         }
 
-        input[type="text"]:focus, textarea:focus {
+        input[type="text"]:focus, input[type="number"]:focus, textarea:focus {
             border-color: var(--signal);
             box-shadow: 0 0 0 1px var(--signal), inset 0 0 12px var(--signal-dim);
         }
 
-        input[type="text"]::placeholder, textarea::placeholder {
+        input[type="text"]::placeholder, input[type="number"]::placeholder, textarea::placeholder {
             color: var(--text-lo);
         }
 
+        input[type="number"]::-webkit-inner-spin-button,
+        input[type="number"]::-webkit-outer-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+
+input[type="number"] {
+    -moz-appearance: textfield;
+}
+
         textarea {
-            height: 160px;
+            height: 420px;
             resize: vertical;
             line-height: 1.6;
         }
@@ -491,234 +500,93 @@
             display: none;
         }
 
-        /* ── TRACE PANEL ───────────────────────────── */
-        .trace-panel-body {
-            display: grid;
-            grid-template-columns: 260px 1fr;
-            gap: 0;
-            height: 100%;
-            overflow: hidden;
-        }
+        /* ── INLINE TRACE (playground) ─────────────── */
+.trace-output { margin-top: 4px; }
 
-        .trace-stats-col {
-            border-right: 1px solid var(--border);
-            padding: 16px 20px;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            overflow-y: auto;
-            flex-shrink: 0;
-        }
+.trace-summary {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    background: var(--border);
+    margin-bottom: 12px;
+}
+.trace-summary-item { background: var(--raised); padding: 10px 8px; text-align: center; }
+.trace-summary-num {
+    font-family: var(--font-display);
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--signal);
+    text-shadow: var(--glow-signal);
+    line-height: 1;
+    margin-bottom: 3px;
+}
+.trace-summary-label { font-size: 8px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-mid); }
 
-        .trace-main-col {
-            flex: 1;
-            overflow-y: auto;
-            padding: 16px 20px;
-        }
+.intent-block { background: var(--raised); border: 1px solid var(--border); padding: 12px 14px; margin-bottom: 12px; }
+.intent-label { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-lo); margin-bottom: 6px; }
+.intent-text { font-family: var(--font-display); font-size: 14px; font-weight: 600; color: var(--text-hi); margin-bottom: 8px; }
 
-        .stat-block {
-            background: var(--raised);
-            border: 1px solid var(--border);
-            padding: 14px 16px;
-        }
+.confidence-bar { height: 3px; background: var(--border); position: relative; overflow: hidden; margin-bottom: 6px; }
+.confidence-fill { height: 100%; width: 0%; transition: width 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.2s; }
+.confidence-hi   { background: var(--signal); box-shadow: var(--glow-signal); }
+.confidence-med  { background: var(--amber); }
+.confidence-low  { background: var(--burn); box-shadow: var(--glow-burn); }
+.confidence-pct  { font-size: 10px; font-weight: 700; color: var(--text-mid); }
 
-        .stat-number {
-            font-family: var(--font-display);
-            font-size: 28px;
-            font-weight: 700;
-            color: var(--signal);
-            text-shadow: var(--glow-signal);
-            line-height: 1;
-            margin-bottom: 4px;
-        }
+.trace-memory-item { background: var(--raised); border: 1px solid var(--border); margin-bottom: 6px; }
+.trace-memory-item.excluded { opacity: 0.45; }
+.trace-mem-head {
+    padding: 8px 11px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid var(--border);
+}
+.trace-mem-left { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.trace-mem-preview { font-size: 10px; color: var(--text-mid); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.excl-badge {
+    font-family: var(--font-mono);
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    background: var(--burn-dim);
+    color: var(--burn);
+    border: 1px solid rgba(255, 107, 43, 0.3);
+    flex-shrink: 0;
+}
 
-        .stat-name {
-            font-size: 10px;
-            font-weight: 500;
-            letter-spacing: 0.12em;
-            text-transform: uppercase;
-            color: var(--text-mid);
-        }
+.trace-mem-scores { padding: 8px 11px 10px; }
+.score-bar { height: 16px; background: #111; border: 1px solid var(--border); display: flex; overflow: hidden; margin-bottom: 6px; }
+.score-seg {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 8px;
+    font-weight: 700;
+    color: rgba(0,0,0,0.7);
+    width: 0%;
+    overflow: hidden;
+    white-space: nowrap;
+    transition: width 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.seg-s { background: #3b82f6; color: rgba(255,255,255,0.8); }
+.seg-r { background: #00e5a0; color: rgba(0,0,0,0.7); }
+.seg-i { background: #f59e0b; color: rgba(0,0,0,0.7); }
+.seg-t { background: #8b5cf6; color: rgba(255,255,255,0.8); }
 
-        .stat-token-bar {
-            margin-top: 10px;
-            height: 3px;
-            background: var(--border);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .stat-token-fill {
-            height: 100%;
-            background: var(--signal);
-            box-shadow: var(--glow-signal);
-            width: 0%;
-            transition: width 0.8s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-
-        .intent-block {
-            background: var(--raised);
-            border: 1px solid var(--border);
-            padding: 14px 16px;
-        }
-
-        .intent-label {
-            font-size: 10px;
-            letter-spacing: 0.12em;
-            text-transform: uppercase;
-            color: var(--text-lo);
-            margin-bottom: 8px;
-        }
-
-        .intent-text {
-            font-family: var(--font-display);
-            font-size: 15px;
-            font-weight: 600;
-            color: var(--text-hi);
-            margin-bottom: 10px;
-        }
-
-        .confidence-bar {
-            height: 3px;
-            background: var(--border);
-            position: relative;
-            overflow: hidden;
-            margin-bottom: 6px;
-        }
-
-        .confidence-fill {
-            height: 100%;
-            width: 0%;
-            transition: width 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.2s;
-        }
-
-        .confidence-hi   { background: var(--signal); box-shadow: var(--glow-signal); }
-        .confidence-med  { background: var(--amber); }
-        .confidence-low  { background: var(--burn); box-shadow: var(--glow-burn); }
-
-        .confidence-pct {
-            font-size: 11px;
-            font-weight: 700;
-            color: var(--text-mid);
-        }
-
-        /* ── TRACE MEMORY ITEMS ────────────────────── */
-        .trace-memory-item {
-            background: var(--raised);
-            border: 1px solid var(--border);
-            margin-bottom: 6px;
-            transition: border-color 0.15s;
-        }
-
-        .trace-memory-item:hover {
-            border-color: var(--border-hi);
-        }
-
-        .trace-memory-item.excluded {
-            border-color: var(--border);
-            opacity: 0.45;
-        }
-
-        .trace-mem-head {
-            padding: 10px 13px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 10px;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .trace-mem-left {
-            display: flex;
-            align-items: center;
-            gap: 9px;
-            min-width: 0;
-        }
-
-        .trace-mem-preview {
-            font-size: 11px;
-            color: var(--text-mid);
-            overflow: hidden;
-            white-space: nowrap;
-            text-overflow: ellipsis;
-        }
-
-        .excl-badge {
-            font-family: var(--font-mono);
-            font-size: 9px;
-            font-weight: 700;
-            letter-spacing: 0.1em;
-            text-transform: uppercase;
-            padding: 2px 7px;
-            background: var(--burn-dim);
-            color: var(--burn);
-            border: 1px solid rgba(255, 107, 43, 0.3);
-            flex-shrink: 0;
-        }
-
-        .trace-mem-scores {
-            padding: 10px 13px 12px;
-        }
-
-        /* ── SCORE BAR (the electron-gun sweep) ─────── */
-        .score-bar {
-            height: 18px;
-            background: #111;
-            border: 1px solid var(--border);
-            display: flex;
-            overflow: hidden;
-            margin-bottom: 8px;
-            position: relative;
-        }
-
-        .score-seg {
-            height: 100%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 9px;
-            font-weight: 700;
-            color: rgba(0,0,0,0.7);
-            width: 0%;
-            overflow: hidden;
-            white-space: nowrap;
-            transition: width 0.6s cubic-bezier(0.16, 1, 0.3, 1);
-            letter-spacing: 0.04em;
-        }
-
-        .seg-s { background: #3b82f6; color: rgba(255,255,255,0.8); }
-        .seg-r { background: #00e5a0; color: rgba(0,0,0,0.7); box-shadow: inset 0 0 10px rgba(0,229,160,0.3); }
-        .seg-i { background: #f59e0b; color: rgba(0,0,0,0.7); }
-        .seg-t { background: #8b5cf6; color: rgba(255,255,255,0.8); }
-
-        .score-detail-row {
-            display: grid;
-            grid-template-columns: repeat(5, 1fr);
-            gap: 4px;
-        }
-
-        .score-cell {
-            text-align: center;
-        }
-
-        .score-cell-label {
-            font-size: 9px;
-            letter-spacing: 0.1em;
-            text-transform: uppercase;
-            color: var(--text-lo);
-            margin-bottom: 2px;
-        }
-
-        .score-cell-val {
-            font-size: 11px;
-            font-weight: 700;
-        }
-
-        .score-cell-val.total { color: var(--text-hi); }
-        .score-cell-val.s     { color: #3b82f6; }
-        .score-cell-val.r     { color: var(--signal); text-shadow: 0 0 6px rgba(0,229,160,0.5); }
-        .score-cell-val.i     { color: var(--amber); }
-        .score-cell-val.t     { color: #8b5cf6; }
+.score-detail-row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px 8px; }
+.score-cell { text-align: left; }
+.score-cell-label { font-size: 8px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-lo); }
+.score-cell-val { font-size: 10px; font-weight: 700; }
+.score-cell-val.total { color: var(--text-hi); }
+.score-cell-val.s     { color: #3b82f6; }
+.score-cell-val.r     { color: var(--signal); }
+.score-cell-val.i     { color: var(--amber); }
+.score-cell-val.t     { color: #8b5cf6; }
 
         /* ── MODAL ─────────────────────────────────── */
         .modal {
@@ -866,17 +734,13 @@
                 grid-template-rows: auto auto 360px;
                 grid-template-areas:
                     "sidebar"
-                    "playground"
-                    "trace";
+                    "playground";
                 height: auto;
                 overflow: auto;
             }
             .panel { height: auto; min-height: 300px; }
-            .panel-trace { height: 360px; }
             .playground-body { grid-template-columns: 1fr; }
             .playground-right { border-left: none; border-top: 1px solid var(--border); padding-left: 0; padding-top: 14px; }
-            .trace-panel-body { grid-template-columns: 1fr; }
-            .trace-stats-col { border-right: none; border-bottom: 1px solid var(--border); }
         }
 
         @media (prefers-reduced-motion: reduce) {
@@ -962,6 +826,10 @@
                         <label class="field-label" for="compileSessionId">Session ID <span style="color:var(--text-lo)">(optional)</span></label>
                         <input type="text" id="compileSessionId" placeholder="sess_…" autocomplete="off" spellcheck="false" />
                     </div>
+                    <div class="field">
+                        <label class="field-label" for="tokenBudget">Token Budget <span style="color:var(--text-lo)">(optional)</span></label>
+                        <input type="number" id="tokenBudget" placeholder="2000" min="1" autocomplete="off" />
+                    </div>
                     <div class="compile-actions">
                         <button class="btn btn-primary" id="compileBtn">▶ COMPILE</button>
                         <div class="spinner" id="compileSpinner"></div>
@@ -977,35 +845,10 @@
                             <div class="empty-text">Awaiting compilation</div>
                         </div>
                     </div>
+                    <div class="trace-output" id="compileTraceOutput"></div>
                 </div>
             </div>
         </section>
-
-        <!-- PANEL 3: TRACE VIEWER
-        <section class="panel panel-trace">
-            <div class="panel-head">
-                <div>
-                    <div class="panel-label">03 — Trace</div>
-                    <div class="panel-title">Compilation Trace</div>
-                    <div class="panel-desc">Memory scoring, intent detection, context decisions</div>
-                </div>
-            </div>
-            <div class="trace-panel-body">
-                <div class="trace-stats-col" id="traceStats">
-                    <div class="empty" style="padding:24px 0">
-                        <div class="empty-glyph">◫</div>
-                        <div class="empty-text">No trace yet</div>
-                    </div>
-                </div>
-                <div class="trace-main-col" id="traceContent">
-                    <div class="empty">
-                        <div class="empty-glyph">◫</div>
-                        <div class="empty-text">Compile a session to view trace</div>
-                    </div>
-                </div>
-            </div>
-        </section> -->
-
     </main>
 </div>
 
@@ -1113,6 +956,7 @@
     // ── COMPILE PLAYGROUND ─────────────────────────
     const messagesJson  = document.getElementById('messagesJson');
     const compileSessionId = document.getElementById('compileSessionId');
+    const tokenBudgetInput = document.getElementById('tokenBudget');
     const compileBtn    = document.getElementById('compileBtn');
     const compileSpinner= document.getElementById('compileSpinner');
     const compileError  = document.getElementById('compileError');
@@ -1143,8 +987,13 @@
         compileError.style.display = 'none';
 
         try {
-            const requestBody = { messages, session_id: sessionId || undefined };
-            const response = await fetch('/v1/compile', {
+            const tokenBudgetRaw = tokenBudgetInput.value.trim();
+            const requestBody = {
+                messages,
+                session_id: sessionId || undefined,
+                token_budget: tokenBudgetRaw ? parseInt(tokenBudgetRaw, 10) : undefined
+            };
+            const response = await fetch('/api/playground/compile', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(requestBody)
@@ -1155,7 +1004,6 @@
             const result = await response.json();
             displayCompileResults(result);
             if (result.trace) displayTrace(result.trace);
-
         } catch (error) {
             compileError.textContent = `Error: ${error.message}`;
             compileError.style.display = 'block';
@@ -1198,126 +1046,87 @@
         `;
     }
 
-    // ── TRACE VIEWER ───────────────────────────────
-    const traceStats   = document.getElementById('traceStats');
-    const traceContent = document.getElementById('traceContent');
-
     function displayTrace(trace) {
-        if (!trace) {
-            traceContent.innerHTML = '<div class="empty"><div class="empty-glyph">◫</div><div class="empty-text">No trace data</div></div>';
-            return;
-        }
+    const traceOutput = document.getElementById('compileTraceOutput');
+    if (!trace) { traceOutput.innerHTML = ''; return; }
 
-        const tokenPct = trace.token_budget > 0 ? (trace.tokens_used / trace.token_budget) * 100 : 0;
-        const confPct  = (trace.intent_confidence ?? 0) * 100;
-        const confClass= confPct >= 80 ? 'confidence-hi' : confPct >= 50 ? 'confidence-med' : 'confidence-low';
+    const confPct  = (trace.intent_confidence ?? 0) * 100;
+    const confClass= confPct >= 80 ? 'confidence-hi' : confPct >= 50 ? 'confidence-med' : 'confidence-low';
 
-        // Stats column
-        traceStats.innerHTML = `
-            <div class="stat-block">
-                <div class="stat-number">${trace.candidates_retrieved}</div>
-                <div class="stat-name">Candidates retrieved</div>
+    let html = `
+        <div class="trace-summary">
+            <div class="trace-summary-item">
+                <div class="trace-summary-num">${trace.candidates_retrieved}</div>
+                <div class="trace-summary-label">Retrieved</div>
             </div>
-            <div class="stat-block">
-                <div class="stat-number">${trace.candidates_after_dedup}</div>
-                <div class="stat-name">After dedup</div>
+            <div class="trace-summary-item">
+                <div class="trace-summary-num">${trace.candidates_after_dedup}</div>
+                <div class="trace-summary-label">Deduped</div>
             </div>
-            <div class="stat-block">
-                <div class="stat-number">${trace.memories_compiled}</div>
-                <div class="stat-name">Compiled</div>
+            <div class="trace-summary-item">
+                <div class="trace-summary-num">${trace.memories_compiled}</div>
+                <div class="trace-summary-label">Compiled</div>
             </div>
-            <div class="stat-block">
-                <div class="stat-number" style="font-size:20px">${trace.tokens_used}<span style="font-size:13px;font-weight:400;color:var(--text-lo)">/${trace.token_budget}</span></div>
-                <div class="stat-name">Tokens used</div>
-                <div class="stat-token-bar">
-                    <div class="stat-token-fill" id="tokenFill"></div>
-                </div>
-            </div>
-            <div class="intent-block">
-                <div class="intent-label">Detected Intent</div>
-                <div class="intent-text">${trace.detected_intent ?? '—'}</div>
-                <div class="confidence-bar">
-                    <div class="confidence-fill ${confClass}" id="confFill"></div>
-                </div>
-                <div class="confidence-pct">${confPct.toFixed(1)}% confidence</div>
-            </div>
-        `;
+        </div>
+        <div class="intent-block">
+            <div class="intent-label">Detected Intent</div>
+            <div class="intent-text">${trace.detected_intent ?? '—'}</div>
+            <div class="confidence-bar"><div class="confidence-fill ${confClass}" id="confFill"></div></div>
+            <div class="confidence-pct">${confPct.toFixed(1)}% confidence</div>
+        </div>
+    `;
 
-        // Animate fills after paint
+    if (trace.memories && trace.memories.length > 0) {
+        html += trace.memories.map(m => renderMemoryTrace(m)).join('');
+    }
+
+    traceOutput.innerHTML = html;
+
+    requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-                const tf = document.getElementById('tokenFill');
-                const cf = document.getElementById('confFill');
-                if (tf) tf.style.width = tokenPct.toFixed(1) + '%';
-                if (cf) cf.style.width = confPct.toFixed(1) + '%';
+            const cf = document.getElementById('confFill');
+            if (cf) cf.style.width = confPct.toFixed(1) + '%';
+            document.querySelectorAll('.score-seg[data-w]').forEach(el => {
+                el.style.width = el.dataset.w + '%';
             });
         });
+    });
+}
 
-        // Trace memory list
-        if (trace.memories && trace.memories.length > 0) {
-            traceContent.innerHTML = trace.memories.map(m => renderMemoryTrace(m)).join('');
-            // Animate score bars
-            requestAnimationFrame(() => {
-                requestAnimationFrame(() => {
-                    document.querySelectorAll('.score-seg[data-w]').forEach(el => {
-                        el.style.width = el.dataset.w + '%';
-                    });
-                });
-            });
-        } else {
-            traceContent.innerHTML = '<div class="empty"><div class="empty-glyph">◫</div><div class="empty-text">No memory traces</div></div>';
-        }
-    }
+function renderMemoryTrace(memory) {
+    const total = memory.score_total || 0.001;
+    const sW = ((memory.score_semantic       / total) * 100).toFixed(1);
+    const rW = ((memory.score_recency        / total) * 100).toFixed(1);
+    const iW = ((memory.score_importance     / total) * 100).toFixed(1);
+    const tW = ((memory.score_task_alignment / total) * 100).toFixed(1);
 
-    function renderMemoryTrace(memory) {
-        const total   = memory.score_total || 0.001;
-        const sW = ((memory.score_semantic      / total) * 100).toFixed(1);
-        const rW = ((memory.score_recency       / total) * 100).toFixed(1);
-        const iW = ((memory.score_importance    / total) * 100).toFixed(1);
-        const tW = ((memory.score_task_alignment/ total) * 100).toFixed(1);
-
-        return `
-            <div class="trace-memory-item${memory.included ? '' : ' excluded'}">
-                <div class="trace-mem-head">
-                    <div class="trace-mem-left">
-                        <span class="type-badge type-${memory.memory_type}">${memory.memory_type}</span>
-                        <span class="trace-mem-preview">${memory.content_preview.substring(0, 70)}${memory.content_preview.length > 70 ? '…' : ''}</span>
-                    </div>
-                    ${!memory.included ? `<span class="excl-badge">${memory.exclusion_reason || 'excluded'}</span>` : ''}
+    return `
+        <div class="trace-memory-item${memory.included ? '' : ' excluded'}">
+            <div class="trace-mem-head">
+                <div class="trace-mem-left">
+                    <span class="type-badge type-${memory.memory_type}">${memory.memory_type}</span>
+                    <span class="trace-mem-preview">${memory.content_preview.substring(0, 40)}${memory.content_preview.length > 40 ? '…' : ''}</span>
                 </div>
-                <div class="trace-mem-scores">
-                    <div class="score-bar">
-                        <div class="score-seg seg-s" data-w="${sW}" style="width:0%">${memory.score_semantic.toFixed(2)}</div>
-                        <div class="score-seg seg-r" data-w="${rW}" style="width:0%">${memory.score_recency.toFixed(2)}</div>
-                        <div class="score-seg seg-i" data-w="${iW}" style="width:0%">${memory.score_importance.toFixed(2)}</div>
-                        <div class="score-seg seg-t" data-w="${tW}" style="width:0%">${memory.score_task_alignment.toFixed(2)}</div>
-                    </div>
-                    <div class="score-detail-row">
-                        <div class="score-cell">
-                            <div class="score-cell-label">Total</div>
-                            <div class="score-cell-val total">${memory.score_total.toFixed(3)}</div>
-                        </div>
-                        <div class="score-cell">
-                            <div class="score-cell-label">Semantic</div>
-                            <div class="score-cell-val s">${memory.score_semantic.toFixed(3)}</div>
-                        </div>
-                        <div class="score-cell">
-                            <div class="score-cell-label">Recency</div>
-                            <div class="score-cell-val r">${memory.score_recency.toFixed(3)}</div>
-                        </div>
-                        <div class="score-cell">
-                            <div class="score-cell-label">Importance</div>
-                            <div class="score-cell-val i">${memory.score_importance.toFixed(3)}</div>
-                        </div>
-                        <div class="score-cell">
-                            <div class="score-cell-label">Task</div>
-                            <div class="score-cell-val t">${memory.score_task_alignment.toFixed(3)}</div>
-                        </div>
-                    </div>
+                ${!memory.included ? `<span class="excl-badge">${memory.exclusion_reason || 'excluded'}</span>` : ''}
+            </div>
+            <div class="trace-mem-scores">
+                <div class="score-bar">
+                    <div class="score-seg seg-s" data-w="${sW}" style="width:0%"></div>
+                    <div class="score-seg seg-r" data-w="${rW}" style="width:0%"></div>
+                    <div class="score-seg seg-i" data-w="${iW}" style="width:0%"></div>
+                    <div class="score-seg seg-t" data-w="${tW}" style="width:0%"></div>
+                </div>
+                <div class="score-detail-row">
+                    <div class="score-cell"><span class="score-cell-label">Total </span><span class="score-cell-val total">${memory.score_total.toFixed(3)}</span></div>
+                    <div class="score-cell"><span class="score-cell-label">Sem </span><span class="score-cell-val s">${memory.score_semantic.toFixed(3)}</span></div>
+                    <div class="score-cell"><span class="score-cell-label">Rec </span><span class="score-cell-val r">${memory.score_recency.toFixed(3)}</span></div>
+                    <div class="score-cell"><span class="score-cell-label">Imp </span><span class="score-cell-val i">${memory.score_importance.toFixed(3)}</span></div>
+                    <div class="score-cell"><span class="score-cell-label">Task </span><span class="score-cell-val t">${memory.score_task_alignment.toFixed(3)}</span></div>
                 </div>
             </div>
-        `;
-    }
+        </div>
+    `;
+}
 
     // ── RETRY ──────────────────────────────────────
     async function fetchWithRetry(url, options = {}) {

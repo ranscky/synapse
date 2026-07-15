@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -156,6 +157,7 @@ func (a *APIServer) setupRoutes() {
 	a.router.Get("/api/sessions", a.handleListSessions)
 	a.router.Get("/api/sessions/{id}/trace", a.handleGetSessionTrace)
 	a.router.Get("/openapi.yaml", a.serveOpenAPI)
+	a.router.Post("/api/playground/compile", a.handlePlaygroundCompile)
 }
 
 // Router returns the chi router
@@ -213,6 +215,97 @@ func (a *APIServer) extractSessionID(r *http.Request, req CompileRequest) string
 	return "default-session"
 }
 
+// runCompilePipeline executes the classify -> score -> dedup -> budget -> compile
+// pipeline shared by /v1/compile and /api/playground/compile. persist=false
+// skips the store write (step 3b) so playground compiles never contaminate
+// real session memory. tokenBudgetOverride of 0 falls back to config default.
+func (a *APIServer) runCompilePipeline(ctx context.Context, sessionID string, messages []Message, tokenBudgetOverride int, persist bool) (*compiler.CompileResult, error) {
+	lastUserMessage := ""
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			lastUserMessage = messages[i].Content
+			break
+		}
+	}
+
+	// 1. Classify the intent
+	classifyResult := classifier.Classify(lastUserMessage)
+	intent := classifyResult.Intent
+	confidence := classifyResult.Confidence
+
+	// 2. Get candidates from store
+	candidates, err := a.store.GetRecent(ctx, sessionID, 20)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get candidates from store: %w", err)
+	}
+
+	// 3. Generate query embedding
+	var queryEmbedding []float32
+	if a.embedder != nil && lastUserMessage != "" {
+		queryEmbedding, err = a.embedder.Embed(ctx, lastUserMessage)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate query embedding: %w", err)
+		}
+	}
+
+	// 3b. Persist only for real traffic -- never for playground.
+	if persist && a.store != nil && lastUserMessage != "" {
+		memEntry := store.MemoryEntry{
+			ID:         generateRequestID(),
+			SessionID:  sessionID,
+			Content:    lastUserMessage,
+			MemoryType: store.DetectMemoryType(lastUserMessage),
+			Timestamp:  time.Now(),
+			Embedding:  queryEmbedding,
+		}
+		if writeErr := a.store.Write(ctx, memEntry); writeErr != nil {
+			slog.Error("Failed to write memory entry", "error", writeErr)
+		}
+	}
+
+	// 4. Score candidates using 4-factor model
+	var scoredMemories []scorer.ScoredMemory
+	if len(candidates) > 0 && len(queryEmbedding) > 0 {
+		weights := scorer.GetWeights(0.4, 0.2, 0.2, 0.2)
+		scorerInstance := scorer.NewScorer(weights, intent, float64(confidence), time.Now())
+		scoredMemories = scorerInstance.Score(ctx, queryEmbedding, candidates)
+	} else {
+		scoredMemories = []scorer.ScoredMemory{}
+	}
+
+	// 5. Deduplicate memories
+	dedupThreshold := a.config.DeduplicationThreshold
+	deduplicated := dedup.Deduplicate(scoredMemories, dedupThreshold)
+
+	// 6. Apply token budget -- override of 0 keeps the configured default
+	tokenBudget := a.config.TokenBudget
+	if tokenBudgetOverride > 0 {
+		tokenBudget = tokenBudgetOverride
+	}
+	selectedMemories, totalTokens := budget.Fill(deduplicated, tokenBudget)
+
+	// 7. Compile final context with trace
+	compileStart := time.Now()
+	requestID := generateRequestID()
+
+	compileResult := compiler.Compile(
+		selectedMemories,
+		lastUserMessage,
+		requestID,
+		string(intent),
+		confidence,
+		len(scoredMemories),
+		len(deduplicated),
+		tokenBudget,
+		time.Since(compileStart).Milliseconds(),
+		scoredMemories,
+		deduplicated,
+	)
+	compileResult.Trace.TokensUsed = totalTokens
+
+	return compileResult, nil
+}
+
 // handleCompile handles POST /v1/compile
 func (a *APIServer) handleCompile(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
@@ -245,112 +338,22 @@ func (a *APIServer) handleCompile(w http.ResponseWriter, r *http.Request) {
 	
 	// Extract session ID
 	sessionID := a.extractSessionID(r, req)
-	
-	// Get last user message for classification
-	lastUserMessage := ""
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if req.Messages[i].Role == "user" {
-			lastUserMessage = req.Messages[i].Content
-			break
-		}
-	}
-	
-	// 1. Classify the intent
-	classifyResult := classifier.Classify(lastUserMessage)
-	intent := classifyResult.Intent
-	confidence := classifyResult.Confidence
-	
-	// 2. Get candidates from store
-	ctx := r.Context()
-	candidates, err := a.store.GetRecent(ctx, sessionID, 20)
+
+	compileResult, err := a.runCompilePipeline(r.Context(), sessionID, req.Messages, 0, true)
 	if err != nil {
-		slog.Error("Failed to get candidates from store", "error", err)
+		slog.Error("Compile pipeline failed", "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	
-	// 3. Generate query embedding
-	var queryEmbedding []float32
-	if a.embedder != nil && lastUserMessage != "" {
-		queryEmbedding, err = a.embedder.Embed(ctx, lastUserMessage)
-		if err != nil {
-			slog.Error("Failed to generate query embedding", "error", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	// 3b. Write this message to the store so memory actually accumulates
-	// from real traffic. Best-effort: a write failure shouldn't block the
-	// response, but it is logged so silent data loss doesn't go unnoticed.
-	if a.store != nil && lastUserMessage != "" {
-		memEntry := store.MemoryEntry{
-			ID:         generateRequestID(),
-			SessionID:  sessionID,
-			Content:    lastUserMessage,
-			MemoryType: store.DetectMemoryType(lastUserMessage),
-			Timestamp:  time.Now(),
-			Embedding:  queryEmbedding,
-		}
-		if writeErr := a.store.Write(ctx, memEntry); writeErr != nil {
-			slog.Error("Failed to write memory entry", "error", writeErr)
-		}
-	}
-	
-	// 4. Score candidates using 4-factor model
-	var scoredMemories []scorer.ScoredMemory
-	if len(candidates) > 0 && len(queryEmbedding) > 0 {
-		weights := scorer.GetWeights(0.4, 0.2, 0.2, 0.2)
-		scorerInstance := scorer.NewScorer(weights, intent, float64(confidence), time.Now())
-		scoredMemories = scorerInstance.Score(ctx, queryEmbedding, candidates)
-	} else {
-		scoredMemories = []scorer.ScoredMemory{}
-	}
-	
-	// 5. Deduplicate memories
-	dedupThreshold := a.config.DeduplicationThreshold
-	deduplicated := dedup.Deduplicate(scoredMemories, dedupThreshold)
-	
-	// 6. Apply token budget
-	tokenBudget := a.config.TokenBudget
-	selectedMemories, totalTokens := budget.Fill(deduplicated, tokenBudget)
-	
-	// 7. Compile final context with trace
-	compileStart := time.Now()
-	requestID := generateRequestID()
-	
-	compileResult := compiler.Compile(
-		selectedMemories,
-		lastUserMessage,
-		requestID,
-		string(intent),
-		confidence,
-		len(scoredMemories),
-		len(deduplicated),
-		tokenBudget,
-		time.Since(compileStart).Milliseconds(),
-		scoredMemories,
-		deduplicated,
-	)
-	
-	// Update tokens used in trace
-	compileResult.Trace.TokensUsed = totalTokens
-	
-	compileDuration := time.Since(compileStart)
-	
 	// Log timing information
 	totalDuration := time.Since(startTime)
-	compileDurationMs := compileDuration.Milliseconds()
 	slog.Info("API compile completed",
 		"total_duration_ms", totalDuration.Milliseconds(),
-		"compile_duration_ms", compileDurationMs,
-		"original_candidates", len(scoredMemories),
-		"deduplicated_count", len(deduplicated),
-		"selected_count", len(selectedMemories),
-		"total_tokens", totalTokens)
-	
+		"total_tokens", compileResult.Trace.TokensUsed)
+
 	// Track compile time for stats
-	a.addCompileTime(compileDurationMs)
+	a.addCompileTime(totalDuration.Milliseconds())
 	
 	// Save trace if persistence is enabled
 	if a.persistTraces && compileResult.Trace != nil {
@@ -381,6 +384,63 @@ func (a *APIServer) handleCompile(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// PlaygroundCompileRequest is the request body for POST /api/playground/compile.
+type PlaygroundCompileRequest struct {
+	Messages    []Message `json:"messages"`
+	SessionID   string    `json:"session_id"`  // optional; pull real candidates from an existing session
+	TokenBudget int       `json:"token_budget"` // optional; 0 = use configured default
+}
+
+// handlePlaygroundCompile handles POST /api/playground/compile -- a manual
+// compile tester. Runs the identical pipeline as /v1/compile but with
+// persist=false, so test compiles never contaminate real session memory.
+func (a *APIServer) handlePlaygroundCompile(w http.ResponseWriter, r *http.Request) {
+	var req PlaygroundCompileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Messages) == 0 {
+		http.Error(w, "messages_required", http.StatusBadRequest)
+		return
+	}
+
+	sessionID := req.SessionID
+	if sessionID == "" {
+		sessionID = "default-session"
+	}
+	if err := validateSessionID(sessionID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	for _, msg := range req.Messages {
+		if err := validateMessageContent(msg.Content); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	compileResult, err := a.runCompilePipeline(r.Context(), sessionID, req.Messages, req.TokenBudget, false)
+	if err != nil {
+		slog.Error("Playground compile pipeline failed", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	response := CompileResponse{
+		CompiledMessages: compileResult.Messages,
+		Trace:            compileResult.Trace,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.Error("Failed to encode playground compile response", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
 // handleGetMemories handles GET /v1/memories
 func (a *APIServer) handleGetMemories(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session_id")
@@ -403,12 +463,20 @@ func (a *APIServer) handleGetMemories(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	// Get memories from store
+	// Get memories from store
 	ctx := r.Context()
 	memories, err := a.store.GetRecent(ctx, sessionID, limitInt)
 	if err != nil {
 		slog.Error("Failed to get memories", "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
+	}
+
+	// Coerce nil -> empty slice so the response is always a JSON array,
+	// never `null` -- callers doing memories.map()/.length shouldn't have
+	// to null-check an empty result.
+	if memories == nil {
+		memories = []store.MemoryEntry{}
 	}
 	
 	// Set response headers
