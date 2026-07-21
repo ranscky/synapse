@@ -10,18 +10,21 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	charmlog "github.com/charmbracelet/log"
-	"gopkg.in/yaml.v3"
 	"synapse/internal/api"
+	"synapse/internal/budget"
 	"synapse/internal/config"
 	"synapse/internal/embedder"
 	"synapse/internal/proxy"
-	"synapse/internal/store"
 	"synapse/internal/session"
+	"synapse/internal/store"
+
+	charmlog "github.com/charmbracelet/log"
+	"github.com/go-chi/chi/v5"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -85,6 +88,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Pre-warm the tiktoken encoder now, during startup, so the first real
+	// request doesn't pay the one-time BPE table load cost (~180ms observed
+	// locally) inside live request latency.
+	if _, err := budget.CountTokens("warmup", "cl100k_base"); err != nil {
+		slog.Warn("Failed to pre-warm tiktoken encoder", "error", err)
+	}
+
 	// Override with flags if provided
 	if *upstream != "" {
 		cfg.UpstreamURL = *upstream
@@ -105,6 +115,12 @@ func main() {
 		slog.Error("Invalid configuration", "error", err)
 		os.Exit(1)
 	}
+
+	// Apply the configured log level now that config is loaded. The logger
+	// itself was created earlier (before config load), so early startup
+	// logs have somewhere to go -- this just adjusts its verbosity
+	// threshold in place rather than reconstructing the logger.
+	prettyLogger.SetLevel(parseLogLevel(cfg.LogLevel))
 
 	// Ensure upstream URL is provided
 	if cfg.UpstreamURL == "" {
@@ -138,15 +154,16 @@ func main() {
 	sessionMgr := session.NewManager(30 * time.Minute)
 
 
+	// Create API server first, so its RecordCompileTime method can be
+	// wired into the proxy below.
+	apiServer := api.NewAPIServer(storeInstance, embedderInstance, cfg, *persistTraces, sessionMgr)
+
 	// Create proxy with store and embedder
-	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, embedderInstance, cfg, sessionMgr)
+	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, embedderInstance, cfg, sessionMgr, apiServer.RecordCompileTime)
 	if err != nil {
 		slog.Error("Failed to create proxy", "error", err)
 		os.Exit(1)
 	}
-
-	// Create API server
-	apiServer := api.NewAPIServer(storeInstance, embedderInstance, cfg, *persistTraces, sessionMgr)
 	
 	// Create router
 	r := chi.NewRouter()
@@ -231,6 +248,25 @@ func main() {
 	slog.Info("Server stopped")
 }
 
+// parseLogLevel converts a config log-level string into charmbracelet/log's
+// Level type. Defaults to InfoLevel for empty or unrecognized values, rather
+// than erroring, since the logger is already initialized and startup
+// shouldn't fail over a typo'd log-level string.
+func parseLogLevel(level string) charmlog.Level {
+	switch strings.ToLower(level) {
+	case "debug":
+		return charmlog.DebugLevel
+	case "info":
+		return charmlog.InfoLevel
+	case "warn", "warning":
+		return charmlog.WarnLevel
+	case "error":
+		return charmlog.ErrorLevel
+	default:
+		return charmlog.InfoLevel
+	}
+}
+
 // loadConfig loads configuration from YAML file
 func loadConfig(path string) (*config.Config, error) {
 	// If config file doesn't exist, use defaults
@@ -255,9 +291,16 @@ func loadConfig(path string) (*config.Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	var cfg config.Config
+	cfg := *config.DefaultConfig()
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// Blank db-path in the file means "use the OS-standard default" per the
+	// documented config comment -- apply the same fallback DefaultConfig()
+	// gets automatically, since yaml.Unmarshal alone won't do it.
+	if cfg.DBPath == "" {
+		cfg.DBPath = config.DefaultDBPath()
 	}
 
 	// If OpenAI API key not in config, try environment variable

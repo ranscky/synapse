@@ -183,7 +183,7 @@ func TestEndToEndIntegration(t *testing.T) {
 			rawTokenCount := countTokens(messages)
 			
 			// Create proxy
-			proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, mockEmbedder, cfg, session.NewManager(30*time.Minute))
+			proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, mockEmbedder, cfg, session.NewManager(30*time.Minute), nil)
 			require.NoError(t, err)
 			
 			// Create API server
@@ -302,7 +302,7 @@ func TestTokenBudgetCompliance(t *testing.T) {
 	cfg.TokenBudget = 500 // Strict budget for testing
 	
 	// Create proxy
-	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, mockEmbedder, cfg, session.NewManager(30*time.Minute))
+	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, mockEmbedder, cfg, session.NewManager(30*time.Minute), nil)
 	require.NoError(t, err)
 	
 	// Create API server

@@ -57,6 +57,13 @@ func defaultDBPath() string {
 	return filepath.Join(dataDir, "synapse", dbFile)
 }
 
+// DefaultDBPath resolves the OS-standard database path. Exported so callers
+// loading config from a file can apply the same fallback that DefaultConfig
+// applies automatically for a blank db-path.
+func DefaultDBPath() string {
+	return defaultDBPath()
+}
+
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	// Try to get OpenAI API key from environment variable

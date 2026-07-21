@@ -664,3 +664,15 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
+
+// RecordCompileTime adds a compile time to the tracking slice
+func (a *APIServer) RecordCompileTime(duration int64) {
+	a.compileTimesMu.Lock()
+	defer a.compileTimesMu.Unlock()
+	
+	a.compileTimes = append(a.compileTimes, duration)
+	
+	if len(a.compileTimes) > 1000 {
+		a.compileTimes = a.compileTimes[len(a.compileTimes)-1000:]
+	}
+}

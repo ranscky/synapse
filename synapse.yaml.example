@@ -33,3 +33,12 @@ weight-task-alignment: 0.2
 
 # Logging level: debug, info, warn, error
 log-level: "info"
+
+# Cosine similarity threshold above which two memories are treated as
+# duplicates and one is dropped (0.0-1.0)
+deduplication-threshold: 0.92
+
+# Optional: restrict which upstream hosts are allowed (leave unset to allow
+# any http(s) URL; localhost/127.x.x.x is always implicitly allowed for
+# Ollama). Example: allowed-upstream-hosts: ["api.anthropic.com"]
+# allowed-upstream-hosts: []
