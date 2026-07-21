@@ -56,7 +56,7 @@ func TestProxyIntegration(t *testing.T) {
 	}))
 	defer testServer.Close()
 
-	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
+	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute), nil)
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -75,7 +75,7 @@ func TestProxyIntegration(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	assert.Equal(t, payload, string(body))
+	assert.JSONEq(t, payload, string(body))
 }
 
 // TestProxyHealthCheck tests the health check endpoint
@@ -86,7 +86,7 @@ func TestProxyHealthCheck(t *testing.T) {
 	}))
 	defer testServer.Close()
 
-	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
+	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute), nil)
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -110,7 +110,7 @@ func TestProxyHealthCheck(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	assert.Equal(t, `{"status":"ok"}`, string(body))
+	assert.JSONEq(t, `{"status":"ok"}`, string(body))
 }
 
 // TestProxyInvalidJSON tests handling of invalid JSON requests
@@ -133,7 +133,7 @@ func TestProxyInvalidJSON(t *testing.T) {
 	}))
 	defer testServer.Close()
 
-	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
+	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute), nil)
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -159,7 +159,7 @@ func TestProxyNilDependencies(t *testing.T) {
 	defer testServer.Close()
 
 	// Pass nil for both store and embedder — proxy should still forward requests
-	proxy, err := NewProxy(testServer.URL, nil, nil, config.DefaultConfig(), session.NewManager(30*time.Minute))
+	proxy, err := NewProxy(testServer.URL, nil, nil, config.DefaultConfig(), session.NewManager(30*time.Minute), nil)
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -179,7 +179,7 @@ func TestProxyNilDependencies(t *testing.T) {
 // TestProxyUpstreamUnavailable tests handling of upstream server being unavailable
 func TestProxyUpstreamUnavailable(t *testing.T) {
 	// Create the proxy pointing to a non-existent server
-	proxy, err := NewProxy("http://127.0.0.1:19999", nil, nil, config.DefaultConfig(), session.NewManager(30*time.Minute)) // Unlikely to be in use
+	proxy, err := NewProxy("http://127.0.0.1:19999", nil, nil, config.DefaultConfig(), session.NewManager(30*time.Minute), nil) // Unlikely to be in use
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -215,7 +215,7 @@ func TestProxyContextValues(t *testing.T) {
 	}))
 	defer testServer.Close()
 
-	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
+	proxy, err := NewProxy(testServer.URL, &mockMemoryStore{}, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute), nil)
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -271,7 +271,7 @@ func TestProxyWritesMemoryFromRealTraffic(t *testing.T) {
 	require.NoError(t, err)
 	defer realStore.Close()
 
-	proxy, err := NewProxy(testServer.URL, realStore, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
+	proxy, err := NewProxy(testServer.URL, realStore, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute), nil)
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -287,11 +287,14 @@ func TestProxyWritesMemoryFromRealTraffic(t *testing.T) {
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 
+	sessionID := resp.Header.Get("X-Synapse-Session-Id")
+	require.NotEmpty(t, sessionID, "proxy should surface the derived session id on the response")
+
 	// Verify the message actually landed in the real store, with a real
 	// embedding attached — this is the core write-path behavior that was
 	// previously completely missing.
 	ctx := context.Background()
-	entries, err := realStore.GetRecent(ctx, "default-session", 10)
+	entries, err := realStore.GetRecent(ctx, sessionID, 10)
 	require.NoError(t, err)
 	require.Len(t, entries, 1, "exactly one memory entry should have been written")
 
@@ -302,12 +305,13 @@ func TestProxyWritesMemoryFromRealTraffic(t *testing.T) {
 }
 
 func TestProxyCapturesAssistantReply(t *testing.T) {
-	// Mock upstream returns a real OpenAI-shaped chat completion response,
-	// so extractAssistantReply has something real to parse.
+	// Mock upstream returns an Anthropic Messages API-shaped response,
+	// matching what extractAssistantReply actually parses (Ollama's native
+	// Anthropic-compatible endpoint), so it has something real to parse.
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"The fix is to add a nil check before dereferencing the pointer."}}]}`))
+		w.Write([]byte(`{"content":[{"type":"text","text":"The fix is to add a nil check before dereferencing the pointer."}]}`))
 	}))
 	defer testServer.Close()
 
@@ -315,7 +319,7 @@ func TestProxyCapturesAssistantReply(t *testing.T) {
 	require.NoError(t, err)
 	defer realStore.Close()
 
-	proxy, err := NewProxy(testServer.URL, realStore, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute))
+	proxy, err := NewProxy(testServer.URL, realStore, &mockEmbedder{}, config.DefaultConfig(), session.NewManager(30*time.Minute), nil)
 	require.NoError(t, err)
 	defer proxy.Close()
 
@@ -336,10 +340,13 @@ func TestProxyCapturesAssistantReply(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(respBody), "nil check before dereferencing")
 
+	sessionID := resp.Header.Get("X-Synapse-Session-Id")
+	require.NotEmpty(t, sessionID, "proxy should surface the derived session id on the response")
+
 	// Both the user's message AND the assistant's reply should now be in
 	// the store - this is the actual proof response-side capture works.
 	ctx := context.Background()
-	entries, err := realStore.GetRecent(ctx, "default-session", 10)
+	entries, err := realStore.GetRecent(ctx, sessionID, 10)
 	require.NoError(t, err)
 	require.Len(t, entries, 2, "both the user message and assistant reply should have been written")
 

@@ -43,7 +43,7 @@ func TestCompile(t *testing.T) {
 			name:            "Normal compilation",
 			selected:        []scorer.ScoredMemory{mem1, mem2},
 			lastUserMessage: "Last user message",
-			expectedLength:  3, // 2 memories + 1 user message
+			expectedLength:  1, // memories folded into a single consolidated user message
 		},
 		{
 			name:            "No memories",
@@ -117,14 +117,14 @@ func TestCompileWithContext(t *testing.T) {
 			systemMessage:  "System instruction",
 			selected:       []scorer.ScoredMemory{mem1},
 			lastUserMessage: "User message",
-			expectedLength: 3, // system + memory + user
+			expectedLength: 2, // system + consolidated memory/user message
 		},
 		{
 			name:           "Without system message",
 			systemMessage:  "",
 			selected:       []scorer.ScoredMemory{mem1},
 			lastUserMessage: "User message",
-			expectedLength: 2, // memory + user
+			expectedLength: 1, // consolidated memory/user message
 		},
 	}
 
@@ -193,7 +193,7 @@ func TestMemoryHeaders(t *testing.T) {
 	// Check that the memory message includes the header
 	memoryMsg := result.Messages[0]
 	if content, ok := memoryMsg["content"].(string); ok {
-		if !contains(content, "[Memory | Type: decision | Score: 0.87]") {
+		if !contains(content, "[Memory: decision]") {
 			t.Errorf("Expected memory message to contain header, got %s", content)
 		}
 	}

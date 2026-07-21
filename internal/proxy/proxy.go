@@ -62,10 +62,11 @@ type Proxy struct {
 	embedder Embedder
 	config   *config.Config
 	sessionMgr *session.Manager
+	recordCompileTime func(int64) // Optional callback for recording compile time in tests
 }
 
 // NewProxy creates a new proxy instance
-func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.Config, sessionMgr *session.Manager) (*Proxy, error) {
+func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.Config, sessionMgr *session.Manager, recordCompileTime func(int64)) (*Proxy, error) {
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target URL: %w", err)
@@ -82,6 +83,7 @@ func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.
 		embedder: emb,
 		config:   cfg,
 		sessionMgr: sessionMgr,
+		recordCompileTime: recordCompileTime, // Assign the callback if provided
 	}
 
 	// Create reverse proxy with director and response capture
@@ -253,28 +255,33 @@ func (p *Proxy) captureResponse(resp *http.Response) {
 	}
 }
 
-// extractAssistantReply parses an OpenAI-shaped chat completion response
-// body and returns the assistant's message content. Returns an empty
-// string if the body doesn't match the expected shape, rather than erroring —
-// this is a best-effort extraction, not a strict contract with the upstream.
+// extractAssistantReply parses an Anthropic Messages API-shaped response
+// body (content: [{"type":"text","text":"..."}]) and returns the assistant's
+// reply as a single concatenated string. This matches both this proxy's own
+// route (/v1/messages) and Ollama's native Anthropic-compatible endpoint,
+// which upstream now returns by default. Returns an empty string if the body
+// doesn't match the expected shape, rather than erroring -- this is a
+// best-effort extraction, not a strict contract with the upstream.
 func extractAssistantReply(body []byte) string {
 	var parsed struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
 	}
 
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return ""
 	}
 
-	if len(parsed.Choices) == 0 {
-		return ""
+	var sb strings.Builder
+	for _, block := range parsed.Content {
+		if block.Type == "text" {
+			sb.WriteString(block.Text)
+		}
 	}
 
-	return parsed.Choices[0].Message.Content
+	return sb.String()
 }
 
 // HandleMessages handles POST /v1/messages requests with full pipeline
@@ -323,18 +330,18 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	lastUserMessage := ""
-	systemPrompt := ""
 	if err := json.Unmarshal(body, &parsedRequest); err != nil {
-		slog.Warn("Failed to parse request body as JSON, falling back to raw body for classification", "error", err)
-		lastUserMessage = string(body)
-	} else {
-		systemPrompt = parsedRequest.System
-		for i := len(parsedRequest.Messages) - 1; i >= 0; i-- {
-			if parsedRequest.Messages[i].Role == "user" {
-				lastUserMessage = parsedRequest.Messages[i].Content
-				break
-			}
+		slog.Warn("Rejecting request: body is not valid JSON", "error", err)
+		http.Error(w, "Request body must be valid JSON", http.StatusBadRequest)
+		return
+	}
+
+	systemPrompt := parsedRequest.System
+	lastUserMessage := ""
+	for i := len(parsedRequest.Messages) - 1; i >= 0; i-- {
+		if parsedRequest.Messages[i].Role == "user" {
+			lastUserMessage = parsedRequest.Messages[i].Content
+			break
 		}
 	}
 
@@ -376,11 +383,13 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	sessionID := deriveSessionID(r, traceSessionID)
 
 	var candidates []store.MemoryEntry
+	var storeDuration time.Duration
 	if p.store != nil {
+		storeStart := time.Now()
 		candidates, err = p.store.GetRecent(ctx, sessionID, 20)
+		storeDuration = time.Since(storeStart)
 		if err != nil {
 			slog.Error("Failed to get candidates from store", "error", err)
-			// Continue with passthrough if store fails
 			p.upstream.ServeHTTP(w, r)
 			return
 		}
@@ -388,11 +397,13 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Generate query embedding (only if embedder is available)
 	var queryEmbedding []float32
+	var embedDuration time.Duration
 	if p.embedder != nil {
+		embedStart := time.Now()
 		queryEmbedding, err = p.embedder.Embed(ctx, lastUserMessage)
+		embedDuration = time.Since(embedStart)
 		if err != nil {
 			slog.Error("Failed to generate query embedding", "error", err)
-			// Continue with passthrough if embedding fails
 			p.upstream.ServeHTTP(w, r)
 			return
 		}
@@ -459,25 +470,36 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		len(scoredMemories),
 		len(deduplicated),
 		tokenBudget,
-		time.Since(compileStart).Milliseconds(),
+		0, // placeholder -- real duration set below, after Compile() actually runs
 		scoredMemories,
 		deduplicated,
 	)
+	compileDuration := time.Since(compileStart)
 
-	// Update tokens used in trace
+	// Report the real compile duration to the stats tracker, if wired.
+	if p.recordCompileTime != nil {
+		p.recordCompileTime(compileDuration.Milliseconds())
+	}
+
+	// Update tokens used and the REAL compile duration in the trace. Both
+	// must be set after the fact: Go evaluates function arguments before
+	// making the call, so passing time.Since(compileStart) directly as an
+	// argument to Compile() always measured ~0ms -- before any compiling
+	// work had actually happened.
 	compileResult.Trace.TokensUsed = totalTokens
+	compileResult.Trace.CompileDurationMs = compileDuration.Milliseconds()
 
 	if p.sessionMgr != nil && traceSessionID != "" {
 		p.sessionMgr.SetTrace(traceSessionID, compileResult.Trace)
 		p.sessionMgr.SetIntent(traceSessionID, string(intent))
 	}
 
-	compileDuration := time.Since(compileStart)
-
 	// 8. Log timing information
 	totalDuration := time.Since(startTime)
 	slog.Info("Pipeline completed",
 		"total_duration_ms", totalDuration.Milliseconds(),
+		"store_duration_ms", storeDuration.Milliseconds(),
+		"embed_duration_ms", embedDuration.Milliseconds(),
 		"dedup_duration_ms", dedupDuration.Milliseconds(),
 		"budget_duration_ms", budgetDuration.Milliseconds(),
 		"compile_duration_ms", compileDuration.Milliseconds(),
@@ -486,10 +508,11 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		"selected_count", len(selectedMemories),
 		"total_tokens", totalTokens)
 
-	// Log warnings for performance issues
 	if totalDuration > 100*time.Millisecond {
 		slog.Warn("Pipeline slow (>100ms)",
 			"total_duration_ms", totalDuration.Milliseconds(),
+			"store_duration_ms", storeDuration.Milliseconds(),
+			"embed_duration_ms", embedDuration.Milliseconds(),
 			"dedup_duration_ms", dedupDuration.Milliseconds(),
 			"budget_duration_ms", budgetDuration.Milliseconds(),
 			"compile_duration_ms", compileDuration.Milliseconds())
