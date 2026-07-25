@@ -75,7 +75,13 @@ jobs:
       run: go test -v ./...
     
     - name: Build binary
-      run: go build -o synapse ./cmd/synapse
+      shell: bash
+      run: |
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          go build -o synapse.exe ./cmd/synapse
+        else
+          go build -o synapse ./cmd/synapse
+        fi
     
     - name: Check binary size
       shell: bash
