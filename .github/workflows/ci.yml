@@ -96,7 +96,19 @@ jobs:
         curl -fL -o models/all-MiniLM-L6-v2/config.json https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json
     
     - name: Run tests
-      run: go test -v ./...
+      shell: bash
+      run: |
+        if [ "${{ matrix.os }}" = "macos-latest" ]; then
+          # Go's internal linker doesn't emit an LC_UUID load command in
+          # Mach-O binaries (golang/go#68678). Recent macOS versions (Tahoe
+          # and later) reject execution of binaries missing LC_UUID at the
+          # dyld level, which aborts every `go test` binary on this runner.
+          # Forcing the system linker (which does emit LC_UUID) via
+          # -linkmode=external works around it.
+          go test -v -ldflags="-linkmode=external" ./...
+        else
+          go test -v ./...
+        fi
     
     - name: Build binary
       shell: bash
