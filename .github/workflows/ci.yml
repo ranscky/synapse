@@ -56,7 +56,11 @@ jobs:
       shell: bash
       run: |
         mkdir -p models/all-MiniLM-L6-v2
-        curl -L -o models/all-MiniLM-L6-v2/model.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
+        curl -fL -o models/all-MiniLM-L6-v2/model.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
+        curl -fL -o models/all-MiniLM-L6-v2/vocab.txt https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt
+        curl -fL -o models/all-MiniLM-L6-v2/tokenizer.json https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json
+        curl -fL -o models/all-MiniLM-L6-v2/tokenizer_config.json https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer_config.json
+        curl -fL -o models/all-MiniLM-L6-v2/config.json https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json
     
     - name: Run tests
       run: go test -v ./...
