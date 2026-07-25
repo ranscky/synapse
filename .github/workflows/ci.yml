@@ -34,10 +34,19 @@ jobs:
         set -euo pipefail
         curl -fL -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz
         tar -xzf ort.tgz
-        sudo cp onnxruntime-linux-x64-1.27.0/lib/libonnxruntime.so* /usr/local/lib/
+        echo "--- contents of extracted lib/ dir ---"
+        ls -la onnxruntime-linux-x64-1.27.0/lib/
+        sudo cp -P onnxruntime-linux-x64-1.27.0/lib/libonnxruntime.so* /usr/local/lib/
+        # Force the exact unversioned filename our Go code dlopen()s by
+        # name to exist, regardless of how the tarball's own symlinks
+        # resolved after cp -- don't rely on assumptions about tarball
+        # internals matching what dlopen needs by exact name.
+        sudo ln -sf /usr/local/lib/libonnxruntime.so.1.27.0 /usr/local/lib/libonnxruntime.so
         sudo ldconfig
+        echo "--- contents of /usr/local/lib after install ---"
         ls -la /usr/local/lib/libonnxruntime*
-        ldconfig -p | grep onnxruntime
+        echo "--- verifying exact filename dlopen needs ---"
+        test -e /usr/local/lib/libonnxruntime.so && echo "libonnxruntime.so: FOUND" || (echo "libonnxruntime.so: MISSING" && exit 1)
 
     - name: Install ONNX Runtime (macOS)
       if: matrix.os == 'macos-latest'
@@ -45,9 +54,14 @@ jobs:
         set -euo pipefail
         curl -fL -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz
         tar -xzf ort.tgz
-        sudo cp onnxruntime-osx-arm64-1.27.0/lib/libonnxruntime*.dylib /usr/local/lib/
+        echo "--- contents of extracted lib/ dir ---"
+        ls -la onnxruntime-osx-arm64-1.27.0/lib/
+        sudo cp -P onnxruntime-osx-arm64-1.27.0/lib/libonnxruntime*.dylib /usr/local/lib/
+        sudo ln -sf /usr/local/lib/libonnxruntime.1.27.0.dylib /usr/local/lib/libonnxruntime.dylib
+        echo "--- contents of /usr/local/lib after install ---"
         ls -la /usr/local/lib/libonnxruntime*
-        
+        test -e /usr/local/lib/libonnxruntime.dylib && echo "libonnxruntime.dylib: FOUND" || (echo "libonnxruntime.dylib: MISSING" && exit 1)
+
     - name: Install ONNX Runtime (Windows)
       if: matrix.os == 'windows-latest'
       shell: pwsh
