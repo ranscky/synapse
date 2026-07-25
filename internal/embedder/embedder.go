@@ -155,6 +155,37 @@ func newONNXEmbedder(modelPath string) (Embedder, error) {
 		return nil, fmt.Errorf("failed to load tokenizer vocabulary from %s: %w", vocabPath, err)
 	}
 
+	// Different exports of the same model (e.g. across sentence-transformers
+	// repo revisions) don't always declare the same input/output names --
+	// some omit the optional token_type_ids input entirely. Inspect the
+	// actual model instead of assuming a fixed 3-input/1-output shape, so
+	// this code tolerates whichever export variant is on disk.
+	inputInfo, outputInfo, err := ort.GetInputOutputInfo(modelPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect ONNX model input/output info: %w", err)
+	}
+
+	hasTokenTypeIDs := false
+	for _, in := range inputInfo {
+		if in.Name == "token_type_ids" {
+			hasTokenTypeIDs = true
+			break
+		}
+	}
+
+	const requiredOutput = "sentence_embedding"
+	hasSentenceEmbedding := false
+	var outputNames []string
+	for _, out := range outputInfo {
+		outputNames = append(outputNames, out.Name)
+		if out.Name == requiredOutput {
+			hasSentenceEmbedding = true
+		}
+	}
+	if !hasSentenceEmbedding {
+		return nil, fmt.Errorf("ONNX model at %s does not expose a %q output (found: %v) -- incompatible export variant", modelPath, requiredOutput, outputNames)
+	}
+
 	inputShape := ort.NewShape(1, onnxSeqLen)
 
 	// Tensors are created empty here and their contents are overwritten on
@@ -171,11 +202,14 @@ func newONNXEmbedder(modelPath string) (Embedder, error) {
 		return nil, fmt.Errorf("failed to create attention_mask tensor: %w", err)
 	}
 
-	tokenTypeIDsTensor, err := ort.NewEmptyTensor[int64](inputShape)
-	if err != nil {
-		inputIDsTensor.Destroy()
-		attentionMaskTensor.Destroy()
-		return nil, fmt.Errorf("failed to create token_type_ids tensor: %w", err)
+	var tokenTypeIDsTensor *ort.Tensor[int64]
+	if hasTokenTypeIDs {
+		tokenTypeIDsTensor, err = ort.NewEmptyTensor[int64](inputShape)
+		if err != nil {
+			inputIDsTensor.Destroy()
+			attentionMaskTensor.Destroy()
+			return nil, fmt.Errorf("failed to create token_type_ids tensor: %w", err)
+		}
 	}
 
 	outputShape := ort.NewShape(1, onnxEmbeddingDim)
@@ -187,18 +221,27 @@ func newONNXEmbedder(modelPath string) (Embedder, error) {
 		return nil, fmt.Errorf("failed to create output tensor: %w", err)
 	}
 
+	inputNames := []string{"input_ids", "attention_mask"}
+	inputValues := []ort.Value{inputIDsTensor, attentionMaskTensor}
+	if hasTokenTypeIDs {
+		inputNames = append(inputNames, "token_type_ids")
+		inputValues = append(inputValues, tokenTypeIDsTensor)
+	}
+
 	session, err := ort.NewAdvancedSession(
 		modelPath,
-		[]string{"input_ids", "attention_mask", "token_type_ids"},
-		[]string{"sentence_embedding"},
-		[]ort.Value{inputIDsTensor, attentionMaskTensor, tokenTypeIDsTensor},
+		inputNames,
+		[]string{requiredOutput},
+		inputValues,
 		[]ort.Value{outputTensor},
 		nil,
 	)
 	if err != nil {
 		inputIDsTensor.Destroy()
 		attentionMaskTensor.Destroy()
-		tokenTypeIDsTensor.Destroy()
+		if tokenTypeIDsTensor != nil {
+			tokenTypeIDsTensor.Destroy()
+		}
 		outputTensor.Destroy()
 		return nil, fmt.Errorf("failed to create ONNX session: %w", err)
 	}
@@ -227,7 +270,9 @@ func (e *ONNXEmbedder) Embed(ctx context.Context, text string) ([]float32, error
 
 	copy(e.inputIDsTensor.GetData(), inputIDs)
 	copy(e.attentionMaskTensor.GetData(), attentionMask)
-	copy(e.tokenTypeIDsTensor.GetData(), tokenTypeIDs)
+	if e.tokenTypeIDsTensor != nil {
+		copy(e.tokenTypeIDsTensor.GetData(), tokenTypeIDs)
+	}
 
 	if err := e.session.Run(); err != nil {
 		return nil, fmt.Errorf("ONNX inference failed: %w", err)
