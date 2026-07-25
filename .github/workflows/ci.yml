@@ -56,7 +56,16 @@ jobs:
       shell: bash
       run: |
         mkdir -p models/all-MiniLM-L6-v2
-        curl -fL -o models/all-MiniLM-L6-v2/model.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
+        # Pinned to commit ca2c6b8 (merged 2024-05-29), the last revision of
+        # onnx/model.onnx exported with library='sentence-transformers' via
+        # optimum, producing outputs named token_embeddings + sentence_embedding.
+        # main's onnx/model.onnx was replaced ~10 months later (commit bc57282,
+        # "Add new SentenceTransformer model with an onnx backend") with a
+        # differently-structured export that lacks the sentence_embedding
+        # output our Go code requires by name -- pinning avoids silently
+        # breaking again on the next upstream repo change.
+        MODEL_REVISION=ca2c6b84644f6c2f4b7c879851ad9d364ae375f6
+        curl -fL -o models/all-MiniLM-L6-v2/model.onnx "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/${MODEL_REVISION}/onnx/model.onnx"
         curl -fL -o models/all-MiniLM-L6-v2/vocab.txt https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt
         curl -fL -o models/all-MiniLM-L6-v2/tokenizer.json https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json
         curl -fL -o models/all-MiniLM-L6-v2/tokenizer_config.json https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer_config.json
