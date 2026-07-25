@@ -14,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"synapse/internal/budget"
@@ -576,7 +577,17 @@ func (p *Proxy) Close() error {
 	return nil
 }
 
-// Helper function to generate request ID (simplified)
+// requestIDCounter guarantees uniqueness even when two IDs are requested
+// within the same clock tick. time.Now().UnixNano() alone isn't a safe
+// uniqueness source -- OS clock resolution varies (Windows' default system
+// timer is far coarser than Linux's), so two fast successive calls can
+// return identical nanosecond values, producing colliding request/memory
+// IDs. Since memories.id is the primary key with INSERT OR REPLACE, a
+// collision silently overwrites one entry with the other.
+var requestIDCounter uint64
+
+// Helper function to generate request ID
 func generateRequestID() string {
-	return fmt.Sprintf("req-%d", time.Now().UnixNano())
+	seq := atomic.AddUint64(&requestIDCounter, 1)
+	return fmt.Sprintf("req-%d-%d", time.Now().UnixNano(), seq)
 }
