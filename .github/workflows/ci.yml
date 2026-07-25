@@ -31,18 +31,23 @@ jobs:
     - name: Install ONNX Runtime (Linux)
       if: matrix.os == 'ubuntu-latest'
       run: |
-        curl -L -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz
+        set -euo pipefail
+        curl -fL -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz
         tar -xzf ort.tgz
         sudo cp onnxruntime-linux-x64-1.27.0/lib/libonnxruntime.so* /usr/local/lib/
         sudo ldconfig
+        ls -la /usr/local/lib/libonnxruntime*
+        ldconfig -p | grep onnxruntime
 
     - name: Install ONNX Runtime (macOS)
       if: matrix.os == 'macos-latest'
       run: |
-        curl -L -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz
+        set -euo pipefail
+        curl -fL -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz
         tar -xzf ort.tgz
         sudo cp onnxruntime-osx-arm64-1.27.0/lib/libonnxruntime*.dylib /usr/local/lib/
-
+        ls -la /usr/local/lib/libonnxruntime*
+        
     - name: Install ONNX Runtime (Windows)
       if: matrix.os == 'windows-latest'
       shell: pwsh
