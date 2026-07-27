@@ -89,6 +89,9 @@ models/all-MiniLM-L6-v2/
   model.onnx
   vocab.txt
 ui/
+LICENSE
+synapse.yaml.example
+README.md
 ```
 
 Extract and run:
@@ -102,7 +105,7 @@ No separate ONNX Runtime install needed — the release archive ships the native
 ### Option 2 — Setup script (build from source, recommended if you have Go)
 
 ```bash
-git clone https://github.com/<yourhandle>/synapse
+git clone https://github.com/ranscky/synapse
 cd synapse
 bash setup.sh
 ```
