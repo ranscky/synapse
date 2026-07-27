@@ -16,8 +16,12 @@ set -euo pipefail
 
 ONNX_VERSION="1.27.0"
 MODEL_DIR="models/all-MiniLM-L6-v2"
-MODEL_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
-VOCAB_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt"
+# Pinned to commit ca2c6b8 -- see ci.yml/release.yml for why: main's
+# current onnx/model.onnx is a different export backend that lacks the
+# sentence_embedding output this project's embedder requires by name.
+MODEL_REVISION="ca2c6b84644f6c2f4b7c879851ad9d364ae375f6"
+MODEL_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/${MODEL_REVISION}/onnx/model.onnx"
+VOCAB_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/${MODEL_REVISION}/vocab.txt"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -215,8 +219,8 @@ main() {
     echo "  2. Run: ./synapse --config synapse.yaml"
     echo "  3. Point your AI client (Cline, Open WebUI, etc.) at http://127.0.0.1:8080"
     echo ""
-    echo "  Docs: docs/README.md"
-    echo "  API:  docs/api.md"
+    echo "  Docs: README.md"
+    echo "  API:  ./synapse --config synapse.yaml, then GET /openapi.yaml"
     echo ""
 }
 

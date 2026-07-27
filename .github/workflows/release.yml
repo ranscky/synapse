@@ -42,7 +42,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
         go-version: 1.22
 
@@ -70,9 +70,17 @@ jobs:
     - name: Download embedding model
       shell: bash
       run: |
+        set -euo pipefail
         mkdir -p bundle/models/all-MiniLM-L6-v2
-        curl -L -o bundle/models/all-MiniLM-L6-v2/model.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
-        cp models/all-MiniLM-L6-v2/vocab.txt bundle/models/all-MiniLM-L6-v2/vocab.txt
+        # Pinned to commit ca2c6b8 -- main's current onnx/model.onnx was
+        # replaced by a different export backend that lacks the
+        # sentence_embedding output our embedder requires. Same pin as
+        # ci.yml. vocab.txt is fetched fresh too, from the same commit,
+        # rather than assumed present in the checkout -- keeps this
+        # workflow self-contained and independent of .gitignore state.
+        MODEL_REVISION=ca2c6b84644f6c2f4b7c879851ad9d364ae375f6
+        curl -fL -o bundle/models/all-MiniLM-L6-v2/model.onnx "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/${MODEL_REVISION}/onnx/model.onnx"
+        curl -fL -o bundle/models/all-MiniLM-L6-v2/vocab.txt "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/${MODEL_REVISION}/vocab.txt"
 
     - name: Build
       shell: bash
@@ -85,6 +93,8 @@ jobs:
       run: |
         cp -r ui bundle/ui
         cp README.md bundle/ 2>/dev/null || true
+        cp LICENSE bundle/ 2>/dev/null || true
+        cp synapse.yaml.example bundle/ 2>/dev/null || true
 
     - name: Archive
       shell: bash

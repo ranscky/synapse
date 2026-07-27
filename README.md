@@ -270,4 +270,7 @@ Being upfront about what's not finished yet:
 
 ## License
 
-MIT
+[Business Source License 1.1](LICENSE). Free for internal and production
+use — the only restriction is offering Synapse (or a modified version) as
+a competing hosted/managed service. Converts automatically to Apache 2.0
+on 2030-07-06.
