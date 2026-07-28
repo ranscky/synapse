@@ -27,6 +27,28 @@ type Config struct {
 	LogLevel                 string   `yaml:"log-level"`
 }
 
+// defaultDataDir resolves the stable, per-OS data directory used as the
+// parent for both the SQLite database and the OS-standard model fallback
+// location. Extracted from the original defaultDBPath so both can share
+// the same resolution logic rather than duplicating it.
+func defaultDataDir() string {
+	switch runtime.GOOS {
+	case "windows":
+		return os.Getenv("APPDATA")
+	case "darwin":
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, "Library", "Application Support")
+		}
+	default: // linux and other unix-likes
+		if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+			return xdg
+		} else if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, ".local", "share")
+		}
+	}
+	return ""
+}
+
 // defaultDBPath resolves a stable, per-OS data directory for the SQLite
 // database, so persistence doesn't depend on which folder the binary
 // happens to be launched from (a real risk for a distributed release
@@ -34,23 +56,7 @@ type Config struct {
 // filename if the OS data dir can't be resolved for any reason.
 func defaultDBPath() string {
 	const dbFile = "synapse.db"
-
-	var dataDir string
-	switch runtime.GOOS {
-	case "windows":
-		dataDir = os.Getenv("APPDATA")
-	case "darwin":
-		if home, err := os.UserHomeDir(); err == nil {
-			dataDir = filepath.Join(home, "Library", "Application Support")
-		}
-	default: // linux and other unix-likes
-		if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
-			dataDir = xdg
-		} else if home, err := os.UserHomeDir(); err == nil {
-			dataDir = filepath.Join(home, ".local", "share")
-		}
-	}
-
+	dataDir := defaultDataDir()
 	if dataDir == "" {
 		return dbFile
 	}
@@ -62,6 +68,46 @@ func defaultDBPath() string {
 // applies automatically for a blank db-path.
 func DefaultDBPath() string {
 	return defaultDBPath()
+}
+
+// defaultModelPath resolves the OS-standard fallback location for the ONNX
+// model. NOT used as DefaultConfig()'s primary ModelPath value -- that
+// stays a cwd-relative path so the existing standalone release archive
+// (extract, cd in, run ./synapse) keeps working with zero behavior change.
+// This is consulted only as a fallback at startup, for package-manager
+// installs (Homebrew, etc.) where there's no "models/ next to the binary"
+// the way there is in the archive.
+func defaultModelPath() string {
+	dataDir := defaultDataDir()
+	if dataDir == "" {
+		return ""
+	}
+	return filepath.Join(dataDir, "synapse", "models", "all-MiniLM-L6-v2", "model.onnx")
+}
+
+// DefaultModelPath exports the OS-standard fallback model location.
+func DefaultModelPath() string {
+	return defaultModelPath()
+}
+
+// defaultConfigPath resolves the OS-standard location for synapse.yaml,
+// using Go's own os.UserConfigDir() (XDG_CONFIG_HOME/~/.config on Linux,
+// ~/Library/Application Support on macOS, %APPDATA% on Windows) instead of
+// hand-rolling per-OS logic a second time.
+func defaultConfigPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "synapse.yaml"
+	}
+	return filepath.Join(dir, "synapse", "synapse.yaml")
+}
+
+// DefaultConfigPath exports the OS-standard config file location. Used by
+// both `synapse init` (to know where to scaffold) and main's config
+// resolution (to know where to look when no explicit --config is given
+// and nothing's found in the current directory).
+func DefaultConfigPath() string {
+	return defaultConfigPath()
 }
 
 // DefaultConfig returns the default configuration

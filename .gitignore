@@ -10,3 +10,5 @@ synapse
 coverage.txt
 .DS_Store
 *.swp
+synapse-*.tar.gz
+synapse-*.zip
