@@ -58,7 +58,10 @@ func resolveConfigPath(explicit string) string {
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "init" {
-		runInitCommand()
+		initFlags := flag.NewFlagSet("init", flag.ExitOnError)
+		initPath := initFlags.String("config", "", "Path to write the scaffolded config (default: OS-standard config location)")
+		initFlags.Parse(os.Args[2:])
+		runInitCommand(*initPath)
 		return
 	}
 
@@ -352,8 +355,11 @@ func loadConfig(path string) (*config.Config, error) {
 // location (see config.DefaultConfigPath), for package-manager installs
 // where there's no natural "next to the binary" place for it the way
 // there is when running from an extracted release archive.
-func runInitCommand() {
-	path := config.DefaultConfigPath()
+func runInitCommand(explicitPath string) {
+	path := explicitPath
+	if path == "" {
+		path = config.DefaultConfigPath()
+	}
 
 	if _, err := os.Stat(path); err == nil {
 		fmt.Printf("Config already exists at %s -- not overwriting.\n", path)
