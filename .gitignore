@@ -1,7 +1,7 @@
 models/
 synapse.yaml
 payload.json
-synapse
+/synapse
 *.db
 *.db-shm
 *.db-wal
