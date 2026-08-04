@@ -79,32 +79,14 @@ func main() {
 	})
 	slog.SetDefault(slog.New(prettyLogger))
 
-	// Load UI HTML file
-	var err error
-	uiHTML, err = os.ReadFile("ui/index.html")
-	if err != nil {
-		// Try alternative path for when running from cmd/synapse directory
-		uiHTML, err = os.ReadFile("../../ui/index.html")
-		if err != nil {
-			// Try path when binary is in project root
-			uiHTML, err = os.ReadFile("../ui/index.html")
-			if err != nil {
-				slog.Warn("Failed to load UI file, UI will not be available", "error", err)
-				uiHTML = []byte("<html><body><h1>UI not available</h1></body></html>")
-			}
-		}
-	}
-	uiSessionHTML, err = os.ReadFile("ui/session.html")
-	if err != nil {
-		uiSessionHTML, err = os.ReadFile("../../ui/session.html")
-		if err != nil {
-			uiSessionHTML, err = os.ReadFile("../ui/session.html")
-			if err != nil {
-				slog.Warn("Failed to load session UI file, page will not be available", "error", err)
-				uiSessionHTML = []byte("<html><body><h1>Page not available</h1></body></html>")
-			}
-		}
-	}
+	// Load UI HTML files. Tries the standalone-archive relative layout
+	// first (ui/, ../ui/, ../../ui/ -- covers different working
+	// directories the binary might be launched from), then a
+	// package-manager install layout resolved relative to the actual
+	// binary location (e.g. Homebrew's bin/../share/synapse/ui) -- see
+	// resolveUIPath.
+	uiHTML = loadUIFile("index.html", "Failed to load UI file, UI will not be available")
+	uiSessionHTML = loadUIFile("session.html", "Failed to load session UI file, page will not be available")
 
 	// Load configuration
 	resolvedConfigPath := resolveConfigPath(*configPath)
@@ -305,6 +287,48 @@ func parseLogLevel(level string) charmlog.Level {
 	default:
 		return charmlog.InfoLevel
 	}
+}
+
+// resolveUIPath finds a UI asset by trying, in order: the standalone-
+// archive relative layout, then a location relative to the executable
+// itself matching a package-manager install layout (e.g. Homebrew's
+// bin/../share/synapse/ui). Returns "" if the file isn't found under any
+// of them.
+func resolveUIPath(name string) string {
+	candidates := []string{
+		filepath.Join("ui", name),
+		filepath.Join("..", "ui", name),
+		filepath.Join("..", "..", "ui", name),
+	}
+
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		execDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(execDir, "..", "share", "synapse", "ui", name),
+		)
+	}
+
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// loadUIFile loads a UI asset via resolveUIPath, logging a warning and
+// returning a placeholder page if it can't be found under any layout.
+func loadUIFile(name, warnMsg string) []byte {
+	if path := resolveUIPath(name); path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			return data
+		}
+	}
+	slog.Warn(warnMsg, "file", name)
+	return []byte("<html><body><h1>UI not available</h1></body></html>")
 }
 
 // loadConfig loads configuration from YAML file
