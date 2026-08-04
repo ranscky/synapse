@@ -124,8 +124,8 @@ func DefaultConfig() *Config {
 		DBPath:                   defaultDBPath(),
 		OpenAIAPIKey:             openAIAPIKey,
 		WeightSemanticSimilarity: 0.4,
-		WeightRecency:            0.2,
-		WeightImportance:         0.2,
+		WeightRecency:            0.1,
+		WeightImportance:         0.3,
 		WeightTaskAlignment:      0.2,
 		DeduplicationThreshold:   0.92, // Default deduplication threshold
 		LogLevel:                 "info",

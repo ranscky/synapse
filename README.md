@@ -142,8 +142,8 @@ model-path: "models/all-MiniLM-L6-v2/model.onnx"
 db-path: ""                                 # Leave blank to use the OS-standard data directory (see below)
 openai-api-key: ""                          # Also settable via OPENAI_API_KEY env var
 weight-semantic-similarity: 0.4
-weight-recency: 0.2
-weight-importance: 0.2
+weight-recency: 0.1
+weight-importance: 0.3
 weight-task-alignment: 0.2
 deduplication-threshold: 0.92               # Cosine similarity above which memories are collapsed
 log-level: "info"

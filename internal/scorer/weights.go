@@ -18,10 +18,19 @@ const (
 // Default weights for each factor
 const (
 	DefaultWeightSemanticSimilarity = 0.4
-	DefaultWeightRecency            = 0.2
-	DefaultWeightImportance         = 0.2
+	DefaultWeightRecency            = 0.1
+	DefaultWeightImportance         = 0.3
 	DefaultWeightTaskAlignment      = 0.2
 )
+
+// DefaultRecencyHalfLifeHours is the fixed time scale recency decay is
+// anchored to when Weights.RecencyHalfLifeHours isn't explicitly set (the
+// zero value, which every existing GetWeights(...) call site produces
+// today). 24 hours: a memory from exactly one day ago scores R=0.5, two
+// days ago R=0.25, a week ago R≈0.02 -- chosen to match the timescale of a
+// typical multi-session coding conversation (hours to a few days), not
+// weeks or months.
+const DefaultRecencyHalfLifeHours = 24.0
 
 // TaskWeights defines the weight mapping for intent × memory type combinations
 var TaskWeights = map[classifier.Intent]map[MemoryType]float64{
@@ -83,10 +92,11 @@ func GetWeights(semantic, recency, importance, taskAlignment float64) Weights {
 
 // Weights holds the scoring weights for each factor
 type Weights struct {
-	SemanticSimilarity float64
-	Recency            float64
-	Importance         float64
-	TaskAlignment      float64
+	SemanticSimilarity   float64
+	Recency              float64
+	Importance           float64
+	TaskAlignment        float64
+	RecencyHalfLifeHours float64 // 0 (zero value) means "use DefaultRecencyHalfLifeHours"
 }
 
 // GetTaskAlignmentWeight returns the task alignment weight for a given intent and memory type

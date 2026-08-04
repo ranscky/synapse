@@ -129,12 +129,25 @@ func (s *Scorer) scoreMemory(query []float32, memory store.MemoryEntry, minHours
 	// S (Semantic Similarity): cosine similarity
 	scoreS := cosineSimilarity(query, memory.Embedding)
 
-	// R (Recency): 1.0 / (1.0 + hours_since_creation), normalized
+	// R (Recency): fixed half-life exponential decay, anchored to an
+	// absolute time scale rather than normalized against the current
+	// candidate batch's own min/max age. The old batch-relative
+	// normalization always stretched recency to span the full 0.0-1.0
+	// range regardless of the *actual* size of the age gap -- a 30-day-old
+	// memory and a 1-hour-old memory in the same batch would be stretched
+	// to exactly 0.0 and 1.0, artificially guaranteeing recency's full
+	// weight budget every time, while importance (a fixed 0-1 lookup
+	// table) never got that same boost. This anchors "recent" to the same
+	// meaning in every batch, independent of what else is in it.
 	hoursSince := time.Since(memory.Timestamp).Hours()
 	if hoursSince < 0 {
 		hoursSince = 0
 	}
-	scoreR := 1.0 / (1.0 + hoursSince)
+	halfLife := s.weights.RecencyHalfLifeHours
+	if halfLife <= 0 {
+		halfLife = DefaultRecencyHalfLifeHours
+	}
+	scoreR := math.Exp2(-hoursSince / halfLife)
 	
 	// T (Task Alignment): blend the intent-specific weight with the generic
 	// fallback weight, proportional to classifier confidence. Low confidence
@@ -144,13 +157,6 @@ func (s *Scorer) scoreMemory(query []float32, memory store.MemoryEntry, minHours
 	intentWeight := GetTaskAlignmentWeight(s.intent, MemoryType(memory.MemoryType))
 	genericWeight := GetTaskAlignmentWeight(classifier.Generic, MemoryType(memory.MemoryType))
 	scoreT := s.confidence*intentWeight + (1-s.confidence)*genericWeight
-
-	// Normalize recency score to 0.0-1.0 range
-	if maxHours > minHours {
-		scoreR = (scoreR - (1.0/(1.0+maxHours))) / ((1.0/(1.0+minHours)) - (1.0/(1.0+maxHours)))
-	} else {
-		scoreR = 1.0 // All have same recency
-	}
 
 	// I (Importance): lookup table
 	scoreI := getImportanceScore(MemoryType(memory.MemoryType))

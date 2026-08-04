@@ -429,8 +429,8 @@ openai-api-key: ""
 
 # Weights for the 4-factor scoring model
 weight-semantic-similarity: 0.4
-weight-recency: 0.2
-weight-importance: 0.2
+weight-recency: 0.1
+weight-importance: 0.3
 weight-task-alignment: 0.2
 
 # Logging level: debug, info, warn, error
