@@ -1,5 +1,9 @@
 # Synapse Context Compiler
 
+[![CI](https://github.com/ranscky/synapse/actions/workflows/ci.yml/badge.svg)](https://github.com/ranscky/synapse/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ranscky/synapse)](https://github.com/ranscky/synapse/releases/latest)
+[![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue)](LICENSE)
+
 > **46.4% token reduction** on real multi-session conversations — verified with semantic embeddings (all-MiniLM-L6-v2), not mock data.
 
 A Go reverse proxy that sits between your AI client and your model. It intercepts every API call, scores and prunes conversation history using a 4-factor model, and forwards a token-budgeted, task-aware context instead of the raw, noisy history. Your model sees less, but better.
@@ -19,6 +23,24 @@ A Go reverse proxy that sits between your AI client and your model. It intercept
 ```
 
 **Status:** functional MVP, single-developer project, pre-v1. See [Known limitations](#known-limitations) before relying on this in production.
+
+**What this looks like in practice:**
+Raw history sent to the model: 2,847 tokens
+Synapse-compiled context sent instead: 980 tokens
+Same conversation, same task, roughly a third of the tokens — because the other two-thirds were duplicate context, stale small talk, or content irrelevant to what you're currently working on.
+
+---
+
+## Quickstart
+
+```bash
+brew install ranscky/synapse/synapse
+synapse init
+# edit the generated config, then:
+synapse --config ~/.config/synapse/synapse.yaml
+```
+
+No Homebrew? See [Installation](#installation) for the pre-built archive and manual-build options. Full walkthrough: [QUICKSTART.md](QUICKSTART.md).
 
 ---
 
