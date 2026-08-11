@@ -110,6 +110,8 @@ This is the core novelty of the project: providers generally compete on making c
 
 Download the archive for your platform from the Releases page. Each archive bundles everything needed to run:
 
+> **Note:** the macOS build currently targets Apple Silicon (arm64) only. Intel Mac support is on the roadmap, but GitHub's Intel-runner build queue has been unreliable, so it's not in the release matrix yet — Intel Mac users should use [Option 3 — Manual build](#option-3--manual-build) in the meantime.
+
 ```
 synapse                              # or synapse.exe on Windows
 libonnxruntime.so                    # or .dylib / onnxruntime.dll
