@@ -28,15 +28,7 @@ jobs:
             ort_lib: libonnxruntime.dylib
             ext: ""
             archive_cmd: tar -czf synapse-darwin-arm64.tar.gz -C bundle .
-            archive_name: synapse-darwin-arm64.tar.gz
-          - os: macos-13
-            goos: darwin
-            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-x86_64-1.27.0.tgz
-            ort_dir: onnxruntime-osx-x86_64-1.27.0
-            ort_lib: libonnxruntime.dylib
-            ext: ""
-            archive_cmd: tar -czf synapse-darwin-amd64.tar.gz -C bundle .
-            archive_name: synapse-darwin-amd64.tar.gz  
+            archive_name: synapse-darwin-arm64.tar.gz 
           - os: windows-latest
             goos: windows
             ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-win-x64-1.27.0.zip
