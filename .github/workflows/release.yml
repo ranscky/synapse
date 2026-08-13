@@ -131,6 +131,49 @@ jobs:
       run: |
         gh release create ${{ github.ref_name }} \
           artifacts/**/*.tar.gz artifacts/**/*.zip \
-          --draft \
           --title "${{ github.ref_name }}" \
           --generate-notes
+    - name: Update Homebrew tap
+      env:
+        HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        VERSION: ${{ github.ref_name }}
+      run: |
+        set -euo pipefail
+        DARWIN_SHA=$(sha256sum artifacts/synapse-darwin-arm64.tar.gz/synapse-darwin-arm64.tar.gz | cut -d ' ' -f1)
+        LINUX_SHA=$(sha256sum artifacts/synapse-linux-amd64.tar.gz/synapse-linux-amd64.tar.gz | cut -d ' ' -f1)
+
+        git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/ranscky/homebrew-synapse.git" tap
+
+        # Per-platform block substitution rather than sequential sed calls --
+        # matches each url/sha256 pair by which on_macos/on_linux block it
+        # sits in, so there's no reliance on line ordering staying stable.
+        python3 - "$VERSION" "$DARWIN_SHA" "$LINUX_SHA" <<'PYEOF'
+        import re, sys
+        version, darwin_sha, linux_sha = sys.argv[1], sys.argv[2], sys.argv[3]
+        version_num = version.lstrip("v")
+        path = "tap/Formula/synapse.rb"
+        content = open(path).read()
+
+        content = re.sub(r'version ".*?"', f'version "{version_num}"', content, count=1)
+
+        content = re.sub(
+            r'(url "https://github\.com/ranscky/synapse/releases/download/)v[^/]+(/synapse-darwin-arm64\.tar\.gz"\n\s*sha256 ")[^"]*(")',
+            rf'\g<1>{version}\g<2>{darwin_sha}\g<3>',
+            content, count=1,
+        )
+        content = re.sub(
+            r'(url "https://github\.com/ranscky/synapse/releases/download/)v[^/]+(/synapse-linux-amd64\.tar\.gz"\n\s*sha256 ")[^"]*(")',
+            rf'\g<1>{version}\g<2>{linux_sha}\g<3>',
+            content, count=1,
+        )
+
+        open(path, "w").write(content)
+        PYEOF
+
+        cd tap
+        git diff --exit-code -- Formula/synapse.rb && { echo "No changes -- substitution failed to match, aborting"; exit 1; } || true
+        git config user.name "synapse-release-bot"
+        git config user.email "actions@github.com"
+        git add Formula/synapse.rb
+        git commit -m "chore: bump synapse to ${VERSION#v}"
+        git push origin main
