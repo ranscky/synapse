@@ -176,4 +176,4 @@ jobs:
         git config user.email "actions@github.com"
         git add Formula/synapse.rb
         git commit -m "chore: bump synapse to ${VERSION#v}"
-        git push origin main
+        git push origin HEAD
