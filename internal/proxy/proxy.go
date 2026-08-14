@@ -109,12 +109,22 @@ func NewProxy(targetURL string, memStore MemoryStore, emb Embedder, cfg *config.
 	return proxy, nil
 }
 
-// deriveSessionID returns a stable session ID derived from the Authorization
-// header value. Two different keys of equal length no longer collide because
-// we hash the content, not the length. Falls back to "default-session" only
-// when no Authorization header is present at all.
+// deriveSessionID returns a stable session ID derived from whichever auth
+// header is present. Checks Authorization first (OpenAI/Bearer-style
+// clients, and Ollama's Bearer-token convention), then x-api-key (the
+// actual Anthropic Messages API convention, which Synapse is otherwise
+// built around) -- without this second check, real Anthropic-shaped
+// clients that only send x-api-key would silently get a fresh session ID
+// on every request, with no error, just zero memory recall. Two different
+// keys of equal length no longer collide because we hash the content, not
+// the length. Falls back to "default-session" only when neither header is
+// present at all.
 func deriveSessionID(r *http.Request, fallback string) string {
-	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		authHeader = r.Header.Get("x-api-key")
+	}
+	if authHeader != "" {
 		sum := sha256.Sum256([]byte(authHeader))
 		return fmt.Sprintf("sess-%s", hex.EncodeToString(sum[:8]))
 	}
