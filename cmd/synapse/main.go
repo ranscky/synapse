@@ -154,19 +154,38 @@ func main() {
 	defer storeInstance.Close()
 
 	// If the configured model path isn't found relative to the current
-	// directory (the standalone-archive layout), try the OS-standard
-	// fallback location before giving up -- this is what lets a
-	// package-manager install (no models/ folder next to the binary) still
-	// find its model, without changing the archive workflow's behavior.
+	// directory (the standalone-archive layout), try package-manager and
+	// OS-standard fallback locations before giving up.
 	if _, err := os.Stat(cfg.ModelPath); os.IsNotExist(err) {
-		if fallback := config.DefaultModelPath(); fallback != "" {
-			if _, ferr := os.Stat(fallback); ferr == nil {
-				slog.Info("Configured model-path not found, using OS-standard fallback location", "configured", cfg.ModelPath, "fallback", fallback)
-				cfg.ModelPath = fallback
+		resolved := false
+
+		// Package-manager layout: bin/ and share/ as siblings under the
+		// same prefix (Homebrew, Linuxbrew, and most FHS-style installs).
+		// Needed because post_install's inreplace only rewrites model-path
+		// the first time it creates a config -- if that config is later
+		// deleted and `synapse init` is run manually, the binary has no
+		// other way to know it's a package-manager install.
+		if exe, eerr := os.Executable(); eerr == nil {
+			if resolvedExe, eerr := filepath.EvalSymlinks(exe); eerr == nil {
+				candidate := filepath.Join(filepath.Dir(resolvedExe), "..", "share", "synapse", "models", "all-MiniLM-L6-v2", "model.onnx")
+				if _, ferr := os.Stat(candidate); ferr == nil {
+					slog.Info("Configured model-path not found, using package install location", "configured", cfg.ModelPath, "fallback", candidate)
+					cfg.ModelPath = candidate
+					resolved = true
+				}
+			}
+		}
+
+		if !resolved {
+			if fallback := config.DefaultModelPath(); fallback != "" {
+				if _, ferr := os.Stat(fallback); ferr == nil {
+					slog.Info("Configured model-path not found, using OS-standard fallback location", "configured", cfg.ModelPath, "fallback", fallback)
+					cfg.ModelPath = fallback
+				}
 			}
 		}
 	}
-
+	
 	// Initialize embedder
 	embedderInstance, err := embedder.NewEmbedder(cfg.EmbedderType, cfg.OpenAIAPIKey, cfg.ModelPath, "")
 	if err != nil {
