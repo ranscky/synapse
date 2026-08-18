@@ -505,6 +505,22 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		p.sessionMgr.SetIntent(traceSessionID, string(intent))
 	}
 
+	// Sum tokens across the full pre-dedup, pre-budget candidate pool using
+	// the same CountTokens/encoding budget.Fill already uses, so this is an
+	// apples-to-apples comparison against totalTokens (the compiled output)
+	// rather than a separately-estimated baseline. Scoped to the retrieved
+	// candidate pool, not literal zero-context -- that's the number that
+	// actually reflects what the 4-factor sieve saved.
+	candidatePoolTokens := 0
+	for _, m := range scoredMemories {
+		t, _ := budget.CountTokens(m.Content, "cl100k_base")
+		candidatePoolTokens += t
+	}
+	reductionPct := 0.0
+	if candidatePoolTokens > 0 {
+		reductionPct = float64(candidatePoolTokens-totalTokens) / float64(candidatePoolTokens) * 100
+	}
+
 	// 8. Log timing information
 	totalDuration := time.Since(startTime)
 	slog.Info("Pipeline completed",
@@ -517,7 +533,9 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		"original_candidates", len(scoredMemories),
 		"deduplicated_count", len(deduplicated),
 		"selected_count", len(selectedMemories),
-		"total_tokens", totalTokens)
+		"candidate_pool_tokens", candidatePoolTokens,
+		"total_tokens", totalTokens,
+		"reduction_pct", fmt.Sprintf("%.1f", reductionPct))
 
 	if totalDuration > 100*time.Millisecond {
 		slog.Warn("Pipeline slow (>100ms)",
