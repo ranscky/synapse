@@ -266,13 +266,16 @@ func (p *Proxy) captureResponse(resp *http.Response) {
 	}
 }
 
-// extractAssistantReply parses an Anthropic Messages API-shaped response
-// body (content: [{"type":"text","text":"..."}]) and returns the assistant's
-// reply as a single concatenated string. This matches both this proxy's own
-// route (/v1/messages) and Ollama's native Anthropic-compatible endpoint,
-// which upstream now returns by default. Returns an empty string if the body
-// doesn't match the expected shape, rather than erroring -- this is a
-// best-effort extraction, not a strict contract with the upstream.
+// extractAssistantReply tries the Anthropic Messages API shape first
+// (content: [{"type":"text","text":"..."}]), then falls back to Ollama's
+// native /api/chat shape ({"message":{"content":"..."}}) if that doesn't
+// match. Both this proxy's own /v1/messages route and Ollama's native
+// Anthropic-compatible endpoint return the first shape; the native
+// /api/chat route (used by the ollama CLI and any tool built directly
+// against Ollama's own API, not the Anthropic-compat layer) returns the
+// second. Returns an empty string if neither shape matches, rather than
+// erroring -- this is a best-effort extraction, not a strict contract
+// with the upstream.
 func extractAssistantReply(body []byte) string {
 	var parsed struct {
 		Content []struct {
@@ -281,18 +284,28 @@ func extractAssistantReply(body []byte) string {
 		} `json:"content"`
 	}
 
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return ""
-	}
-
-	var sb strings.Builder
-	for _, block := range parsed.Content {
-		if block.Type == "text" {
-			sb.WriteString(block.Text)
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		var sb strings.Builder
+		for _, block := range parsed.Content {
+			if block.Type == "text" {
+				sb.WriteString(block.Text)
+			}
+		}
+		if sb.Len() > 0 {
+			return sb.String()
 		}
 	}
 
-	return sb.String()
+	var ollamaShape struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(body, &ollamaShape); err == nil && ollamaShape.Message.Content != "" {
+		return ollamaShape.Message.Content
+	}
+
+	return ""
 }
 
 // HandleMessages handles POST /v1/messages requests with full pipeline
@@ -595,9 +608,72 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	p.upstream.ServeHTTP(w, r)
 }
 
+// HandleOllamaChat accepts Ollama's native POST /api/chat request shape
+// (which already matches HandleMessages' generic {model, messages:
+// [{role, content}], ...} parsing) and forces stream:false before
+// delegating to the same pipeline. Forcing non-streaming is a deliberate
+// scope decision, not an oversight: captureResponse fully buffers the
+// upstream response (io.ReadAll) before it's returned to the client, so
+// this pipeline was never going to deliver true token-by-token streaming
+// regardless of route -- and a streaming response's NDJSON chunks
+// wouldn't match extractAssistantReply's shape anyway, silently losing
+// memory capture. Forcing non-streaming trades live typing in the
+// terminal for a reliably complete, correctly-captured reply. The client
+// (e.g. `ollama run`) will see a pause and then the full response appear
+// at once, rather than word-by-word. True incremental streaming support
+// would need a rework of captureResponse itself and applies to every
+// route, not just this one -- worth a deliberate separate pass later,
+// not bundled into this fix.
+func (p *Proxy) HandleOllamaChat(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		slog.Error("Failed to read request body", "error", err)
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	r.Body.Close()
+
+	var bodyMap map[string]interface{}
+	if err := json.Unmarshal(body, &bodyMap); err != nil {
+		slog.Warn("Rejecting request: body is not valid JSON", "error", err)
+		http.Error(w, "Request body must be valid JSON", http.StatusBadRequest)
+		return
+	}
+	bodyMap["stream"] = false
+
+	rewritten, err := json.Marshal(bodyMap)
+	if err != nil {
+		slog.Error("Failed to re-marshal request body", "error", err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
+	r.Body = io.NopCloser(bytes.NewReader(rewritten))
+	r.ContentLength = int64(len(rewritten))
+
+	p.HandleMessages(w, r)
+}
+
+// HandlePassthrough forwards a request straight through to upstream
+// unmodified, with no pipeline processing. Used for Ollama's health check
+// (GET/HEAD /) and, via NotFound, for every other control-plane endpoint
+// (model listing, status, pulls, embeddings, version, etc.) that doesn't
+// carry conversation content. Only endpoints that actually carry chat
+// content (/v1/messages, /api/chat) get the memory-augmented pipeline --
+// whitelisting every other Ollama/provider endpoint one at a time as
+// clients discover them by trial and error doesn't scale, and doesn't
+// match Synapse's own design goal of requiring no client-side changes.
+func (p *Proxy) HandlePassthrough(w http.ResponseWriter, r *http.Request) {
+	p.upstream.ServeHTTP(w, r)
+}
+
 // RegisterRoutes registers the proxy routes with the chi router
 func (p *Proxy) RegisterRoutes(r chi.Router) {
+	r.Get("/", p.HandlePassthrough)
+	r.Head("/", p.HandlePassthrough)
 	r.Post("/v1/messages", p.HandleMessages)
+	r.Post("/api/chat", p.HandleOllamaChat)
+	r.NotFound(p.HandlePassthrough)
 }
 
 // Close closes the proxy resources (no-op for simple proxy)
