@@ -113,7 +113,7 @@ This is the core novelty of the project: providers generally compete on making c
 
 Download the archive for your platform from the Releases page. Each archive bundles everything needed to run:
 
-> **Note:** the macOS build currently targets Apple Silicon (arm64) only. Intel Mac support is on the roadmap, but GitHub's Intel-runner build queue has been unreliable, so it's not in the release matrix yet — Intel Mac users should use [Option 3 — Manual build](#option-3--manual-build) in the meantime.
+> > **Note:** the macOS build currently targets Apple Silicon (arm64) only. Intel Mac support is on the roadmap, but GitHub's Intel-runner build queue has been unreliable, so it's not in the release matrix yet — Intel Mac users should use [Option 3 — Manual build](#option-3--manual-build) in the meantime. **The Apple Silicon build itself passes CI on GitHub's macos-latest (arm64) runners, but hasn't yet been run on real Apple Silicon hardware by the maintainer** (who doesn't have access to one) — if you try it, a report either way (works / doesn't) is genuinely useful. See [Known limitations](#known-limitations).
 
 ```
 synapse                              # or synapse.exe on Windows
@@ -311,6 +311,7 @@ Being upfront about what's not finished yet:
 
 - **OpenAI embedder is stubbed** — `embedder-type: openai` currently returns a placeholder, non-semantic embedding. Use `onnx` for real semantic similarity.
 - **No true token-by-token streaming** — Synapse fully buffers the upstream response before returning it, so the full reply can be reliably captured for memory. Responses arrive as one block rather than typed out live; most noticeable with the interactive `ollama` CLI, which will pause and then print the whole reply at once.
+- **Apple Silicon build is CI-tested only, not verified on real hardware** — it passes GitHub's macos-latest (arm64) runners, but the maintainer doesn't have access to a physical Apple Silicon Mac to confirm it on real hardware. Reports from real usage (either way) are welcome.
 - **Single-developer project, pre-v1** — no design partners or production deployments yet.
 - **`allowed-upstream-hosts` allowlist** is optional and off by default; if security matters for your deployment, set it explicitly.
 
