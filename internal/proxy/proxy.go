@@ -267,15 +267,16 @@ func (p *Proxy) captureResponse(resp *http.Response) {
 }
 
 // extractAssistantReply tries the Anthropic Messages API shape first
-// (content: [{"type":"text","text":"..."}]), then falls back to Ollama's
-// native /api/chat shape ({"message":{"content":"..."}}) if that doesn't
-// match. Both this proxy's own /v1/messages route and Ollama's native
-// Anthropic-compatible endpoint return the first shape; the native
-// /api/chat route (used by the ollama CLI and any tool built directly
-// against Ollama's own API, not the Anthropic-compat layer) returns the
-// second. Returns an empty string if neither shape matches, rather than
-// erroring -- this is a best-effort extraction, not a strict contract
-// with the upstream.
+// (content: [{"type":"text","text":"..."}]), then Ollama's native
+// /api/chat shape ({"message":{"content":"..."}}), then the OpenAI Chat
+// Completions shape ({"choices":[{"message":{"content":"..."}}]}) if
+// neither of those match. This proxy's own /v1/messages route and
+// Ollama's native Anthropic-compatible endpoint return the first shape;
+// the native /api/chat route returns the second; /v1/chat/completions
+// (used by Cline's "OpenAI Compatible" provider and most other coding
+// tools pointed at a self-hosted endpoint) returns the third. Returns an
+// empty string if none of the shapes match, rather than erroring -- this
+// is a best-effort extraction, not a strict contract with the upstream.
 func extractAssistantReply(body []byte) string {
 	var parsed struct {
 		Content []struct {
@@ -303,6 +304,17 @@ func extractAssistantReply(body []byte) string {
 	}
 	if err := json.Unmarshal(body, &ollamaShape); err == nil && ollamaShape.Message.Content != "" {
 		return ollamaShape.Message.Content
+	}
+
+	var openaiShape struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &openaiShape); err == nil && len(openaiShape.Choices) > 0 && openaiShape.Choices[0].Message.Content != "" {
+		return openaiShape.Choices[0].Message.Content
 	}
 
 	return ""
@@ -654,6 +666,46 @@ func (p *Proxy) HandleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	p.HandleMessages(w, r)
 }
 
+// HandleOpenAIChat accepts the OpenAI Chat Completions request shape
+// (POST /v1/chat/completions), which the "OpenAI Compatible" provider
+// setting in Cline and most other coding-agent tools sends by default
+// when pointed at a self-hosted/local endpoint. Without this route, that
+// traffic fell through to HandlePassthrough and silently bypassed the
+// entire memory pipeline -- no error, no captured history, just quiet
+// passthrough to upstream. Same delegation pattern as HandleOllamaChat:
+// OpenAI's request shape (messages: [{role, content}]) already matches
+// HandleMessages' generic parsing, so this just forces stream:false
+// (same streaming-capture reasoning as the Ollama route) and delegates.
+func (p *Proxy) HandleOpenAIChat(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		slog.Error("Failed to read request body", "error", err)
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	r.Body.Close()
+
+	var bodyMap map[string]interface{}
+	if err := json.Unmarshal(body, &bodyMap); err != nil {
+		slog.Warn("Rejecting request: body is not valid JSON", "error", err)
+		http.Error(w, "Request body must be valid JSON", http.StatusBadRequest)
+		return
+	}
+	bodyMap["stream"] = false
+
+	rewritten, err := json.Marshal(bodyMap)
+	if err != nil {
+		slog.Error("Failed to re-marshal request body", "error", err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
+	r.Body = io.NopCloser(bytes.NewReader(rewritten))
+	r.ContentLength = int64(len(rewritten))
+
+	p.HandleMessages(w, r)
+}
+
 // HandlePassthrough forwards a request straight through to upstream
 // unmodified, with no pipeline processing. Used for Ollama's health check
 // (GET/HEAD /) and, via NotFound, for every other control-plane endpoint
@@ -667,12 +719,12 @@ func (p *Proxy) HandlePassthrough(w http.ResponseWriter, r *http.Request) {
 	p.upstream.ServeHTTP(w, r)
 }
 
-// RegisterRoutes registers the proxy routes with the chi router
 func (p *Proxy) RegisterRoutes(r chi.Router) {
 	r.Get("/", p.HandlePassthrough)
 	r.Head("/", p.HandlePassthrough)
 	r.Post("/v1/messages", p.HandleMessages)
 	r.Post("/api/chat", p.HandleOllamaChat)
+	r.Post("/v1/chat/completions", p.HandleOpenAIChat)
 	r.NotFound(p.HandlePassthrough)
 }
 
