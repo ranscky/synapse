@@ -266,6 +266,44 @@ func (p *Proxy) captureResponse(resp *http.Response) {
 	}
 }
 
+// extractTextContent normalizes a message's content field, which per both
+// the Anthropic and OpenAI APIs can be either a plain string or an array
+// of typed content blocks (e.g. [{"type":"text","text":"..."}] alongside
+// image blocks, tool-use blocks, etc.). Modern clients -- Cline included
+// -- commonly send array-shaped content even for plain text messages.
+// Mirrors the same string-or-array handling session.Message already uses
+// (json.RawMessage), applied here to request parsing rather than session
+// fingerprinting. Returns the concatenated text from any "text"-typed
+// blocks, or the plain string directly if that's what was sent.
+// Best-effort: returns empty string on an unrecognized shape rather than
+// erroring the whole request.
+func extractTextContent(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err == nil {
+		return asString
+	}
+
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err == nil {
+		var sb strings.Builder
+		for _, block := range blocks {
+			if block.Type == "text" {
+				sb.WriteString(block.Text)
+			}
+		}
+		return sb.String()
+	}
+
+	return ""
+}
+
 // extractAssistantReply tries the Anthropic Messages API shape first
 // (content: [{"type":"text","text":"..."}]), then Ollama's native
 // /api/chat shape ({"message":{"content":"..."}}), then the OpenAI Chat
@@ -346,7 +384,7 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		System   string `json:"system"`
 		Messages []struct {
 			Role    string `json:"role"`
-			Content string `json:"content"`
+			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
 
@@ -376,7 +414,7 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	lastUserMessage := ""
 	for i := len(parsedRequest.Messages) - 1; i >= 0; i-- {
 		if parsedRequest.Messages[i].Role == "user" {
-			lastUserMessage = parsedRequest.Messages[i].Content
+			lastUserMessage = extractTextContent(parsedRequest.Messages[i].Content)
 			break
 		}
 	}
