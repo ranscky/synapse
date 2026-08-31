@@ -218,7 +218,7 @@ Set `db-path` explicitly to override — including `:memory:` for a fully epheme
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080`:
 
-- **Cline** — set the API base URL in settings to `http://127.0.0.1:8080`
+- **Cline** — API Provider: **OpenAI Compatible**. Base URL: `http://127.0.0.1:8080/v1` (include the `/v1` — Cline appends `/chat/completions` itself). Any placeholder API key works; Synapse doesn't validate it, but whatever value you use becomes the session-bucketing key, so keep it consistent.
 - **Open WebUI** — set the Ollama/OpenAI base URL to `http://127.0.0.1:8080`
 - **curl** — `curl http://127.0.0.1:8080/v1/messages -d '{"messages": [...]}'`
 
@@ -233,7 +233,7 @@ ollama
 
 To make this permanent rather than exporting it every session: add that `export` line to your shell rc file (`~/.bashrc` or `~/.zshrc`), and keep Synapse always running in the background with `brew services start synapse`. Once both are set, `ollama` transparently routes through Synapse with no per-session setup — though note that if Synapse isn't running, `ollama` will fail to connect rather than falling back to the real server directly, since it's now pointed explicitly at Synapse's port.
 
-Every other native Ollama endpoint (`/api/tags`, `/api/show`, model pulls, `/api/status`, etc.) is forwarded straight through to your real Ollama server unmodified — only `/v1/messages` and `/api/chat` run through the memory pipeline, so the rest of the CLI (model listing, launching, etc.) works exactly as it would without Synapse in the picture.
+Every other native Ollama endpoint (`/api/tags`, `/api/show`, model pulls, `/api/status`, etc.) is forwarded straight through to your real Ollama server unmodified — only `/v1/messages`, `/api/chat`, and `/v1/chat/completions` run through the memory pipeline, so the rest of the CLI (model listing, launching, etc.) works exactly as it would without Synapse in the picture.
 
 ### Session Continuity
 
@@ -247,6 +247,7 @@ Synapse buckets conversation history into sessions by hashing whichever auth hea
 |---|---|---|
 | `/v1/messages` | POST | Main proxy endpoint (Anthropic Messages API shape) — intercepts, compiles, forwards upstream |
 | `/api/chat` | POST | Ollama-native chat endpoint (used by the `ollama` CLI and Ollama-native tools) — same pipeline as `/v1/messages`; responses are forced non-streaming so the full reply can be reliably captured |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions shape (used by Cline's "OpenAI Compatible" provider and most other coding-agent tools pointed at a self-hosted endpoint) — same pipeline as `/v1/messages`, also forced non-streaming |
 | `/v1/compile` | POST | Compile a session without proxying (useful for testing/inspection) |
 | `/v1/memories` | GET | List stored memories for a session |
 | `/v1/memories` | DELETE | Clear memories for a session |
