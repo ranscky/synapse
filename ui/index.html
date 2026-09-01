@@ -505,7 +505,7 @@ input[type="number"] {
 
 .trace-summary {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     gap: 1px;
     background: var(--border);
     margin-bottom: 12px;
@@ -1050,8 +1050,9 @@ input[type="number"] {
     const traceOutput = document.getElementById('compileTraceOutput');
     if (!trace) { traceOutput.innerHTML = ''; return; }
 
-    const confPct  = (trace.intent_confidence ?? 0) * 100;
+        const confPct  = (trace.intent_confidence ?? 0) * 100;
     const confClass= confPct >= 80 ? 'confidence-hi' : confPct >= 50 ? 'confidence-med' : 'confidence-low';
+    const reductionPct = trace.reduction_pct ?? 0;
 
     let html = `
         <div class="trace-summary">
@@ -1067,12 +1068,10 @@ input[type="number"] {
                 <div class="trace-summary-num">${trace.memories_compiled}</div>
                 <div class="trace-summary-label">Compiled</div>
             </div>
-        </div>
-        <div class="intent-block">
-            <div class="intent-label">Detected Intent</div>
-            <div class="intent-text">${trace.detected_intent ?? '—'}</div>
-            <div class="confidence-bar"><div class="confidence-fill ${confClass}" id="confFill"></div></div>
-            <div class="confidence-pct">${confPct.toFixed(1)}% confidence</div>
+            <div class="trace-summary-item">
+                <div class="trace-summary-num">${reductionPct.toFixed(1)}%</div>
+                <div class="trace-summary-label">Reduction</div>
+            </div>
         </div>
     `;
 

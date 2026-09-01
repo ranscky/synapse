@@ -562,6 +562,10 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// work had actually happened.
 	compileResult.Trace.TokensUsed = totalTokens
 	compileResult.Trace.CompileDurationMs = compileDuration.Milliseconds()
+	
+	if compileResult.Trace.CandidatePoolTokens > 0 {
+		compileResult.Trace.ReductionPct = float64(compileResult.Trace.CandidatePoolTokens-totalTokens) / float64(compileResult.Trace.CandidatePoolTokens) * 100
+	}
 
 	if p.sessionMgr != nil && traceSessionID != "" {
 		p.sessionMgr.SetTrace(traceSessionID, compileResult.Trace)

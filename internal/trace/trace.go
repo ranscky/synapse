@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+	"synapse/internal/budget"
 	"synapse/internal/scorer"
 )
 
@@ -20,6 +21,8 @@ type TraceManifest struct {
 	MemoriesCompiled      int           `json:"memories_compiled"`
 	TokensUsed            int           `json:"tokens_used"`
 	TokenBudget           int           `json:"token_budget"`
+	CandidatePoolTokens   int           `json:"candidate_pool_tokens"`
+	ReductionPct          float64       `json:"reduction_pct"`
 	CompileDurationMs     int64         `json:"compile_duration_ms"`
 	Memories              []TraceMemory `json:"memories"`
 	TraceTruncated        bool          `json:"trace_truncated,omitempty"`
@@ -102,6 +105,24 @@ func NewTraceManifest(
 		}
 	}
 
+    // Same computation as the live "Pipeline completed" log field
+	// (candidate_pool_tokens) -- kept here too so the trace inspector's
+	// playground UI shows the identical number a user would otherwise
+	// only see by tailing terminal logs or running cmd/benchmark
+	// manually. ReductionPct is NOT computed here: tokensUsed is a
+	// placeholder (0) at this call site in both callers (api.go,
+	// proxy.go), overwritten by the caller after this function returns.
+	// Computing (pool-0)/pool*100 here always produces a false 100%
+	// regardless of the real compiled size -- confirmed via manual
+	// testing against a real session (showed 100.0% when the true
+	// reduction was much lower). ReductionPct is set by the caller
+	// alongside TokensUsed instead, once the real value is known.
+	candidatePoolTokens := 0
+	for _, m := range scoredMemories {
+		t, _ := budget.CountTokens(m.Content, "cl100k_base")
+		candidatePoolTokens += t
+	}
+
 	return &TraceManifest{
 		RequestID:            requestID,
 		Timestamp:            time.Now(),
@@ -112,6 +133,7 @@ func NewTraceManifest(
 		MemoriesCompiled:     memoriesCompiled,
 		TokensUsed:           tokensUsed,
 		TokenBudget:          tokenBudget,
+		CandidatePoolTokens:  candidatePoolTokens,
 		CompileDurationMs:    compileDurationMs,
 		Memories:             traceMemories,
 	}

@@ -302,6 +302,10 @@ func (a *APIServer) runCompilePipeline(ctx context.Context, sessionID string, me
 		deduplicated,
 	)
 	compileResult.Trace.TokensUsed = totalTokens
+	
+	if compileResult.Trace.CandidatePoolTokens > 0 {
+		compileResult.Trace.ReductionPct = float64(compileResult.Trace.CandidatePoolTokens-totalTokens) / float64(compileResult.Trace.CandidatePoolTokens) * 100
+	}
 
 	return compileResult, nil
 }
