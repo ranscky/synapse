@@ -2,6 +2,7 @@ package scorer
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -98,5 +99,48 @@ func TestVeryOldMemoryStillDecays(t *testing.T) {
 
 	if factScore >= contextScore {
 		t.Errorf("a 30-day-old memory should still lose to a 1-hour-old one -- decay should still function at extreme gaps: fact=%.4f, context=%.4f", factScore, contextScore)
+	}
+}
+
+
+// TestScorerUsesInjectedNowNotWallClock is a regression test for the dead
+// `now` parameter bug: NewScorer accepted a `now time.Time` constructor
+// argument, but scoreMemory and computeRecencyRange both called
+// time.Since(memory.Timestamp) directly instead of s.now.Sub(...), so the
+// injected clock was decorative -- recency was always computed against
+// real wall-clock time regardless of what `now` a caller passed in.
+//
+// This is proven by picking a fixed reference point years in the past
+// (2020-01-01) and a memory timestamped exactly 1 hour before it. If the
+// scorer is correctly using s.now, the recency score matches the expected
+// half-life decay for a 1-hour-old memory exactly. If it's silently using
+// real wall-clock time instead, the memory would appear to be several
+// years old and score close to zero.
+func TestScorerUsesInjectedNowNotWallClock(t *testing.T) {
+	fixedNow := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	embedding := []float32{0.5, 0.5, 0.5}
+
+	memory := store.MemoryEntry{
+		ID:         "fixed-point-1h-old",
+		MemoryType: "context",
+		Timestamp:  fixedNow.Add(-1 * time.Hour),
+		Embedding:  embedding,
+	}
+
+	weights := GetWeights(DefaultWeightSemanticSimilarity, DefaultWeightRecency, DefaultWeightImportance, DefaultWeightTaskAlignment)
+	scorer := NewScorer(weights, classifier.Generic, 0.0, fixedNow)
+
+	ctx := context.Background()
+	scored := scorer.Score(ctx, embedding, []store.MemoryEntry{memory})
+	if len(scored) != 1 {
+		t.Fatalf("expected exactly one scored memory, got %d", len(scored))
+	}
+
+	expectedScoreR := math.Exp2(-1.0 / DefaultRecencyHalfLifeHours)
+
+	if math.Abs(scored[0].ScoreR-expectedScoreR) > 1e-9 {
+		t.Errorf("recency score should be computed against the injected `now` (%.6f expected for a 1-hour-old memory relative to fixedNow), got %.6f -- "+
+			"this large a gap indicates time.Since()/wall-clock time is still being used instead of s.now",
+			expectedScoreR, scored[0].ScoreR)
 	}
 }

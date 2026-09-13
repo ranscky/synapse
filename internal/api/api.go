@@ -20,9 +20,11 @@ import (
 	"synapse/internal/config"
 	"synapse/internal/dedup"
 	"synapse/internal/embedder"
+	"synapse/internal/retrieval"
 	"synapse/internal/scorer"
 	"synapse/internal/session"
 	"synapse/internal/store"
+	"synapse/internal/supersession"
 	"synapse/internal/trace"
 
 	"github.com/go-chi/chi/v5"
@@ -233,20 +235,17 @@ func (a *APIServer) runCompilePipeline(ctx context.Context, sessionID string, me
 	intent := classifyResult.Intent
 	confidence := classifyResult.Confidence
 
-	// 2. Get candidates from store
-	candidates, err := a.store.GetRecent(ctx, sessionID, 20)
+	// 2-3. Retrieve candidates via the shared retrieval pipeline (same one
+	// the live proxy path uses) so the playground can't silently drift from
+	// production again -- embeds the query, then semantically searches the
+	// full session memory store instead of pulling the most recent 20 by
+	// recency.
+	retrievalResult, err := retrieval.Candidates(ctx, a.store, a.embedder, sessionID, lastUserMessage, a.config.RetrievalCandidateK)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get candidates from store: %w", err)
+		return nil, err
 	}
-
-	// 3. Generate query embedding
-	var queryEmbedding []float32
-	if a.embedder != nil && lastUserMessage != "" {
-		queryEmbedding, err = a.embedder.Embed(ctx, lastUserMessage)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate query embedding: %w", err)
-		}
-	}
+	candidates := retrievalResult.Candidates
+	queryEmbedding := retrievalResult.QueryEmbedding
 
 	// 3b. Persist only for real traffic -- never for playground.
 	if persist && a.store != nil && lastUserMessage != "" {
@@ -260,13 +259,26 @@ func (a *APIServer) runCompilePipeline(ctx context.Context, sessionID string, me
 		}
 		if writeErr := a.store.Write(ctx, memEntry); writeErr != nil {
 			slog.Error("Failed to write memory entry", "error", writeErr)
+		} else if supersededID := supersession.FindSupersededCandidate(memEntry, candidates, a.config.SupersessionSimilarityMin, a.config.SupersessionSimilarityMax); supersededID != "" {
+			if markErr := a.store.MarkSuperseded(ctx, supersededID, memEntry.ID); markErr != nil {
+				slog.Error("Failed to mark memory as superseded", "error", markErr, "superseded_id", supersededID, "superseding_id", memEntry.ID)
+			} else {
+				slog.Info("Memory superseded", "superseded_id", supersededID, "superseding_id", memEntry.ID)
+			}
 		}
 	}
 
 	// 4. Score candidates using 4-factor model
 	var scoredMemories []scorer.ScoredMemory
 	if len(candidates) > 0 && len(queryEmbedding) > 0 {
-		weights := scorer.GetWeights(0.4, 0.2, 0.2, 0.2)
+		// Previously hardcoded as scorer.GetWeights(0.4, 0.2, 0.2, 0.2) --
+		// see the matching comment in proxy.go's HandleMessages for why.
+		weights := scorer.GetWeights(
+			a.config.WeightSemanticSimilarity,
+			a.config.WeightRecency,
+			a.config.WeightImportance,
+			a.config.WeightTaskAlignment,
+		)
 		scorerInstance := scorer.NewScorer(weights, intent, float64(confidence), time.Now())
 		scoredMemories = scorerInstance.Score(ctx, queryEmbedding, candidates)
 	} else {
@@ -277,12 +289,25 @@ func (a *APIServer) runCompilePipeline(ctx context.Context, sessionID string, me
 	dedupThreshold := a.config.DeduplicationThreshold
 	deduplicated := dedup.Deduplicate(scoredMemories, dedupThreshold)
 
+	// 5b. Exclude anything already marked superseded from ever being
+	// compiled into context -- see the matching comment in proxy.go's
+	// HandleMessages for why this has to happen here, right before
+	// budget.Fill, rather than anywhere upstream, and for the known
+	// same-request staleness limitation (exclusion takes effect starting
+	// the next request, not the one that performs the marking).
+	eligibleForBudget := make([]scorer.ScoredMemory, 0, len(deduplicated))
+	for _, m := range deduplicated {
+		if m.SupersededBy == "" {
+			eligibleForBudget = append(eligibleForBudget, m)
+		}
+	}
+
 	// 6. Apply token budget -- override of 0 keeps the configured default
 	tokenBudget := a.config.TokenBudget
 	if tokenBudgetOverride > 0 {
 		tokenBudget = tokenBudgetOverride
 	}
-	selectedMemories, totalTokens := budget.Fill(deduplicated, tokenBudget)
+	selectedMemories, totalTokens := budget.Fill(eligibleForBudget, tokenBudget)
 
 	// 7. Compile final context with trace
 	compileStart := time.Now()

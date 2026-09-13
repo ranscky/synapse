@@ -163,6 +163,15 @@
         .trace-memory-item { background: var(--raised); border: 1px solid var(--border); margin-bottom: 8px; transition: border-color .15s; cursor: pointer; }
         .trace-memory-item:hover { border-color: var(--signal); }
         .trace-memory-item.excluded { border-color: var(--border); opacity: .45; }
+        .trace-group-header {
+            font-size: 10px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--text-lo);
+            margin: 12px 0 6px;
+            padding-top: 8px;
+            border-top: 1px solid var(--border);
+        }
 
         .trace-mem-head { padding: 11px 15px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--border); }
         .trace-mem-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -363,8 +372,26 @@
             if (cf) cf.style.width = confPct.toFixed(1) + '%';
         }));
 
-        if (trace.memories && trace.memories.length > 0) {
-            traceContent.innerHTML = trace.memories.map(renderMemoryTrace).join('');
+                if (trace.memories && trace.memories.length > 0) {
+            // scoredMemories (and therefore trace.memories) arrives
+            // pre-sorted by total score descending, so filtering into two
+            // groups here preserves that ordering within each group -- the
+            // Rejected list still shows its highest-scoring (closest)
+            // near-misses first, not an arbitrary order.
+            const selected = trace.memories.filter(m => m.included);
+            const rejected = trace.memories.filter(m => !m.included);
+
+            let traceHtml = '';
+            if (selected.length > 0) {
+                traceHtml += `<div class="trace-group-header">Selected (${selected.length})</div>`;
+                traceHtml += selected.map(renderMemoryTrace).join('');
+            }
+            if (rejected.length > 0) {
+                traceHtml += `<div class="trace-group-header">Rejected (${rejected.length})</div>`;
+                traceHtml += rejected.map(renderMemoryTrace).join('');
+            }
+            traceContent.innerHTML = traceHtml;
+
             requestAnimationFrame(() => requestAnimationFrame(() => {
                 document.querySelectorAll('.score-seg[data-w]').forEach(el => { el.style.width = el.dataset.w + '%'; });
             }));
@@ -390,7 +417,7 @@
                         <span class="type-badge type-${memory.memory_type}">${memory.memory_type}</span>
                         <span class="trace-mem-preview">${memory.content_preview.substring(0, 90)}${memory.content_preview.length > 90 ? '…' : ''}</span>
                     </div>
-                    ${!memory.included ? `<span class="excl-badge">${memory.exclusion_reason || 'excluded'}</span>` : ''}
+                    ${!memory.included ? `<span class="excl-badge"${memory.superseded_by ? ` title="Superseded by ${memory.superseded_by}"` : ''}>${memory.exclusion_reason === 'superseded' && memory.superseded_by ? `superseded &rarr; ${memory.superseded_by.slice(0, 8)}` : (memory.exclusion_reason || 'excluded')}</span>` : ''}
                 </div>
                 <div class="trace-mem-scores">
                     <div class="score-bar">

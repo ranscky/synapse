@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -180,4 +182,172 @@ func TestSearchRanksBySimilarity(t *testing.T) {
 	assert.Equal(t, "oldest-but-closest", results[0].ID, "most similar entry should rank first, despite being oldest")
 	assert.Equal(t, "middle-medium-match", results[1].ID, "medium similarity should rank second")
 	assert.Equal(t, "newest-but-farthest", results[2].ID, "least similar entry should rank last, despite being newest")
+}
+
+
+// TestSchemaMigrationAddsSupersededByColumn proves the ALTER TABLE
+// migration in initSchema actually works against a database created before
+// the superseded_by column existed -- exactly the shape of any real
+// synapse.db on disk before this change, including an existing dev
+// database. CREATE TABLE IF NOT EXISTS alone is a no-op against such a
+// database, so this is the part that actually needs to work.
+func TestSchemaMigrationAddsSupersededByColumn(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+
+	// Hand-build the pre-migration schema directly with database/sql,
+	// bypassing Store entirely, since Store.initSchema is the thing under
+	// test here.
+	legacyDB, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = legacyDB.Exec(`
+		CREATE TABLE memories (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			content TEXT NOT NULL,
+			memory_type TEXT NOT NULL,
+			timestamp DATETIME NOT NULL,
+			importance REAL DEFAULT 0.0,
+			embedding BLOB
+		);
+	`)
+	require.NoError(t, err)
+	_, err = legacyDB.Exec(
+		`INSERT INTO memories (id, session_id, content, memory_type, timestamp, importance) VALUES (?, ?, ?, ?, ?, ?)`,
+		"pre-migration-memory", "sess-legacy", "a memory written before this column existed", "fact", time.Now(), 0.7,
+	)
+	require.NoError(t, err)
+	require.NoError(t, legacyDB.Close())
+
+	// Opening this same file with the current Store should run the
+	// migration cleanly -- no error, no data loss, no panic scanning the
+	// pre-existing row's now-present (backfilled) column.
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer s.Close()
+
+	entries, err := s.GetRecent(context.Background(), "sess-legacy", 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "pre-migration-memory", entries[0].ID)
+	assert.Equal(t, "", entries[0].SupersededBy,
+		"pre-existing rows should backfill to empty string via the column's DEFAULT, not panic or scan as NULL")
+
+	// A fresh write against the now-migrated database should also
+	// round-trip the new column correctly.
+	require.NoError(t, s.Write(context.Background(), MemoryEntry{
+		ID:         "post-migration-memory",
+		SessionID:  "sess-legacy",
+		Content:    "a memory written after migration",
+		MemoryType: "decision",
+		Timestamp:  time.Now(),
+	}))
+
+	entries, err = s.GetRecent(context.Background(), "sess-legacy", 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	// Reopening the same file a second time (simulating a process
+	// restart) must not fail just because the migration already ran once.
+	s2, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer s2.Close()
+}
+
+// TestSupersededByRoundTrip confirms the field persists through Write and
+// comes back correctly via GetRecent -- both when set and when left at its
+// zero value (a memory that's never been superseded).
+func TestSupersededByRoundTrip(t *testing.T) {
+	s, err := NewStore(":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	require.NoError(t, s.Write(ctx, MemoryEntry{
+		ID:           "old-decision",
+		SessionID:    "sess-1",
+		Content:      "we use PostgreSQL",
+		MemoryType:   "decision",
+		Timestamp:    time.Now(),
+		SupersededBy: "new-decision-id",
+	}))
+	require.NoError(t, s.Write(ctx, MemoryEntry{
+		ID:         "current-decision",
+		SessionID:  "sess-1",
+		Content:    "we use MongoDB",
+		MemoryType: "decision",
+		Timestamp:  time.Now(),
+	}))
+
+	entries, err := s.GetRecent(ctx, "sess-1", 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	for _, e := range entries {
+		switch e.ID {
+		case "old-decision":
+			assert.Equal(t, "new-decision-id", e.SupersededBy)
+		case "current-decision":
+			assert.Equal(t, "", e.SupersededBy,
+				"a memory that's never been superseded should round-trip as an empty string")
+		default:
+			t.Fatalf("unexpected memory ID: %s", e.ID)
+		}
+	}
+}
+
+
+func TestMarkSuperseded(t *testing.T) {
+	s, err := NewStore(":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	require.NoError(t, s.Write(ctx, MemoryEntry{
+		ID:         "old-decision",
+		SessionID:  "sess-1",
+		Content:    "we use PostgreSQL",
+		MemoryType: "decision",
+		Timestamp:  time.Now(),
+	}))
+	require.NoError(t, s.Write(ctx, MemoryEntry{
+		ID:         "new-decision",
+		SessionID:  "sess-1",
+		Content:    "we switched to MongoDB",
+		MemoryType: "decision",
+		Timestamp:  time.Now(),
+	}))
+
+	require.NoError(t, s.MarkSuperseded(ctx, "old-decision", "new-decision"))
+
+	entries, err := s.GetRecent(ctx, "sess-1", 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	for _, e := range entries {
+		if e.ID == "old-decision" {
+			assert.Equal(t, "new-decision", e.SupersededBy)
+		} else {
+			assert.Equal(t, "", e.SupersededBy)
+		}
+	}
+}
+
+func TestMarkSupersededNonexistentID(t *testing.T) {
+	s, err := NewStore(":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	err = s.MarkSuperseded(context.Background(), "does-not-exist", "new-id")
+	assert.Error(t, err, "marking a nonexistent memory as superseded should return an error, not silently no-op")
+}
+
+func TestMarkSupersededEmptyArgs(t *testing.T) {
+	s, err := NewStore(":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	assert.Error(t, s.MarkSuperseded(context.Background(), "", "new-id"))
+	assert.Error(t, s.MarkSuperseded(context.Background(), "old-id", ""))
 }

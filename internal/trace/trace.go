@@ -40,6 +40,7 @@ type TraceMemory struct {
 	ScoreTotal         float64 `json:"score_total"`
 	Included           bool    `json:"included"`
 	ExclusionReason    string  `json:"exclusion_reason,omitempty"`
+	SupersededBy       string  `json:"superseded_by,omitempty"`
 }
 
 // NewTraceManifest creates a new trace manifest from pipeline data.
@@ -77,11 +78,20 @@ func NewTraceManifest(
 	for i, memory := range scoredMemories {
 		included := selectedMap[memory.ID]
 
+		// Supersession is checked first, ahead of the dedup/budget
+		// branching below. A superseded memory still survives dedup (it's
+		// not a near-duplicate of anything) and was filtered out of the
+		// budget.Fill() input entirely by the caller -- so without this
+		// check first, it would fall through to the dedupedMap branch and
+		// get mislabeled "budget_exceeded" instead of the real reason.
 		var exclusionReason string
 		if !included {
-			if !dedupedMap[memory.ID] {
+			switch {
+			case memory.SupersededBy != "":
+				exclusionReason = "superseded"
+			case !dedupedMap[memory.ID]:
 				exclusionReason = "duplicate"
-			} else {
+			default:
 				exclusionReason = "budget_exceeded"
 			}
 		}
@@ -102,6 +112,7 @@ func NewTraceManifest(
 			ScoreTotal:         memory.Total,
 			Included:           included,
 			ExclusionReason:    exclusionReason,
+			SupersededBy:       memory.SupersededBy,
 		}
 	}
 

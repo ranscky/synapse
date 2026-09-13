@@ -16,31 +16,31 @@ func TestCosineSimilarity(t *testing.T) {
 	// Test identical vectors
 	vec1 := []float32{1.0, 0.0, 0.0}
 	vec2 := []float32{1.0, 0.0, 0.0}
-	similarity := cosineSimilarity(vec1, vec2)
+	similarity := store.CosineSimilarity(vec1, vec2)
 	assert.Equal(t, 1.0, similarity, "Identical vectors should have similarity of 1.0")
 
 	// Test orthogonal vectors
 	vec3 := []float32{1.0, 0.0, 0.0}
 	vec4 := []float32{0.0, 1.0, 0.0}
-	similarity = cosineSimilarity(vec3, vec4)
+	similarity = store.CosineSimilarity(vec3, vec4)
 	assert.Equal(t, 0.0, similarity, "Orthogonal vectors should have similarity of 0.0")
 
 	// Test opposite vectors
 	vec5 := []float32{1.0, 0.0, 0.0}
 	vec6 := []float32{-1.0, 0.0, 0.0}
-	similarity = cosineSimilarity(vec5, vec6)
+	similarity = store.CosineSimilarity(vec5, vec6)
 	assert.Equal(t, -1.0, similarity, "Opposite vectors should have similarity of -1.0")
 
 	// Test different lengths (should return 0)
 	vec7 := []float32{1.0, 0.0}
 	vec8 := []float32{1.0, 0.0, 0.0}
-	similarity = cosineSimilarity(vec7, vec8)
+	similarity = store.CosineSimilarity(vec7, vec8)
 	assert.Equal(t, 0.0, similarity, "Different length vectors should return 0.0")
 
 	// Test empty vectors
 	vec9 := []float32{}
 	vec10 := []float32{}
-	similarity = cosineSimilarity(vec9, vec10)
+	similarity = store.CosineSimilarity(vec9, vec10)
 	assert.Equal(t, 0.0, similarity, "Empty vectors should return 0.0")
 }
 
@@ -163,31 +163,4 @@ func TestGetTaskAlignmentWeight(t *testing.T) {
 	// Test unknown memory type with known intent
 	weight = GetTaskAlignmentWeight(classifier.Debug, "unknown_type")
 	assert.Equal(t, 0.5, weight, "Unknown memory type should fall back to generic weight")
-}
-
-func TestComputeRecencyRange(t *testing.T) {
-	now := time.Now()
-	
-	memories := []store.MemoryEntry{
-		{Timestamp: now.Add(-1 * time.Hour)},
-		{Timestamp: now.Add(-5 * time.Hour)},
-		{Timestamp: now.Add(-2 * time.Hour)},
-	}
-
-	scorer := &Scorer{now: now}
-	min, max := scorer.computeRecencyRange(memories)
-	
-	assert.InDelta(t, 1.0, min, 1e-6, "Minimum hours should be approximately 1.0")
-	assert.InDelta(t, 5.0, max, 1e-6, "Maximum hours should be approximately 5.0")
-
-	// Test single memory
-	singleMemory := []store.MemoryEntry{{Timestamp: now.Add(-3 * time.Hour)}}
-	min, max = scorer.computeRecencyRange(singleMemory)
-	assert.InDelta(t, 3.0, min, 1e-6, "Single memory min should be approximately 3.0")
-	assert.InDelta(t, 3.0, max, 1e-6, "Single memory max should be approximately 3.0")
-
-	// Test empty slice
-	min, max = scorer.computeRecencyRange([]store.MemoryEntry{})
-	assert.Equal(t, 0.0, min, "Empty slice min should be 0.0")
-	assert.Equal(t, 0.0, max, "Empty slice max should be 0.0")
 }

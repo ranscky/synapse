@@ -47,9 +47,6 @@ func (s *Scorer) Score(ctx context.Context, query []float32, candidates []store.
 		return []ScoredMemory{}
 	}
 
-	// Precompute recency normalization values
-	minHours, maxHours := s.computeRecencyRange(candidates)
-
 	// Create scored memories slice
 	scoredMemories := make([]ScoredMemory, len(candidates))
 
@@ -67,7 +64,7 @@ func (s *Scorer) Score(ctx context.Context, query []float32, candidates []store.
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go s.worker(ctx, jobs, results, &wg, query, candidates, minHours, maxHours)
+		go s.worker(ctx, jobs, results, &wg, query, candidates)
 	}
 
 	// Send job indices
@@ -109,7 +106,6 @@ func (s *Scorer) worker(
 	wg *sync.WaitGroup,
 	query []float32,
 	candidates []store.MemoryEntry,
-	minHours, maxHours float64,
 ) {
 	defer wg.Done()
 
@@ -118,16 +114,16 @@ func (s *Scorer) worker(
 		case <-ctx.Done():
 			return
 		default:
-			scored := s.scoreMemory(query, candidates[i], minHours, maxHours)
+			scored := s.scoreMemory(query, candidates[i])
 			results <- scored
 		}
 	}
 }
 
 // scoreMemory computes all four scores for a single memory entry
-func (s *Scorer) scoreMemory(query []float32, memory store.MemoryEntry, minHours, maxHours float64) ScoredMemory {
+func (s *Scorer) scoreMemory(query []float32, memory store.MemoryEntry) ScoredMemory {
 	// S (Semantic Similarity): cosine similarity
-	scoreS := cosineSimilarity(query, memory.Embedding)
+	scoreS := store.CosineSimilarity(query, memory.Embedding)
 
 	// R (Recency): fixed half-life exponential decay, anchored to an
 	// absolute time scale rather than normalized against the current
@@ -139,7 +135,14 @@ func (s *Scorer) scoreMemory(query []float32, memory store.MemoryEntry, minHours
 	// weight budget every time, while importance (a fixed 0-1 lookup
 	// table) never got that same boost. This anchors "recent" to the same
 	// meaning in every batch, independent of what else is in it.
-	hoursSince := time.Since(memory.Timestamp).Hours()
+	//
+	// Uses s.now (the clock injected via NewScorer) rather than
+	// time.Since/time.Now() directly -- the injected now was previously
+	// accepted as a constructor parameter but never actually read here,
+	// which meant tests passing a fixed `now` got wall-clock-relative
+	// scores anyway, and recency scores in general drifted by however
+	// long had elapsed between NewScorer() and Score() being called.
+	hoursSince := s.now.Sub(memory.Timestamp).Hours()
 	if hoursSince < 0 {
 		hoursSince = 0
 	}
@@ -178,55 +181,6 @@ func (s *Scorer) scoreMemory(query []float32, memory store.MemoryEntry, minHours
 		ScoreT:      scoreT,
 		Total:       total,
 	}
-}
-
-// computeRecencyRange calculates the min/max hours for normalization
-func (s *Scorer) computeRecencyRange(candidates []store.MemoryEntry) (float64, float64) {
-	if len(candidates) == 0 {
-		return 0, 0
-	}
-
-	minHours := math.MaxFloat64
-	maxHours := 0.0
-
-	for _, memory := range candidates {
-		hoursSince := time.Since(memory.Timestamp).Hours()
-		if hoursSince < 0 {
-			hoursSince = 0
-		}
-		if hoursSince < minHours {
-			minHours = hoursSince
-		}
-		if hoursSince > maxHours {
-			maxHours = hoursSince
-		}
-	}
-
-	if minHours == math.MaxFloat64 {
-		minHours = 0
-	}
-
-	return minHours, maxHours
-}
-
-// cosineSimilarity computes the cosine similarity between two vectors
-func cosineSimilarity(a, b []float32) float64 {
-	if len(a) != len(b) || len(a) == 0 {
-		return 0.0
-	}
-
-	var dotProduct, normA, normB float64
-	for i := range a {
-		dotProduct += float64(a[i] * b[i])
-		normA += float64(a[i] * a[i])
-		normB += float64(b[i] * b[i])
-	}
-
-	if normA == 0 || normB == 0 {
-		return 0.0
-	}
-
-	return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
 // getImportanceScore returns the importance weight for a memory type

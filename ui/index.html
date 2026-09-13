@@ -535,6 +535,15 @@ input[type="number"] {
 
 .trace-memory-item { background: var(--raised); border: 1px solid var(--border); margin-bottom: 6px; }
 .trace-memory-item.excluded { opacity: 0.45; }
+.trace-group-header {
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-lo);
+    margin: 12px 0 6px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
 .trace-mem-head {
     padding: 8px 11px;
     display: flex;
@@ -1075,8 +1084,23 @@ input[type="number"] {
         </div>
     `;
 
-    if (trace.memories && trace.memories.length > 0) {
-        html += trace.memories.map(m => renderMemoryTrace(m)).join('');
+        if (trace.memories && trace.memories.length > 0) {
+        // scoredMemories (and therefore trace.memories) arrives pre-sorted
+        // by total score descending, so filtering into two groups here
+        // preserves that ordering within each group -- the Rejected list
+        // still shows its highest-scoring (closest) near-misses first,
+        // not an arbitrary order.
+        const selected = trace.memories.filter(m => m.included);
+        const rejected = trace.memories.filter(m => !m.included);
+
+        if (selected.length > 0) {
+            html += `<div class="trace-group-header">Selected (${selected.length})</div>`;
+            html += selected.map(m => renderMemoryTrace(m)).join('');
+        }
+        if (rejected.length > 0) {
+            html += `<div class="trace-group-header">Rejected (${rejected.length})</div>`;
+            html += rejected.map(m => renderMemoryTrace(m)).join('');
+        }
     }
 
     traceOutput.innerHTML = html;
@@ -1106,7 +1130,7 @@ function renderMemoryTrace(memory) {
                     <span class="type-badge type-${memory.memory_type}">${memory.memory_type}</span>
                     <span class="trace-mem-preview">${memory.content_preview.substring(0, 40)}${memory.content_preview.length > 40 ? '…' : ''}</span>
                 </div>
-                ${!memory.included ? `<span class="excl-badge">${memory.exclusion_reason || 'excluded'}</span>` : ''}
+                ${!memory.included ? `<span class="excl-badge"${memory.superseded_by ? ` title="Superseded by ${memory.superseded_by}"` : ''}>${memory.exclusion_reason === 'superseded' && memory.superseded_by ? `superseded &rarr; ${memory.superseded_by.slice(0, 8)}` : (memory.exclusion_reason || 'excluded')}</span>` : ''}
             </div>
             <div class="trace-mem-scores">
                 <div class="score-bar">

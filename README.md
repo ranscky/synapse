@@ -1,12 +1,10 @@
 # Synapse Context Compiler
 
-[![CI](https://github.com/ranscky/synapse/actions/workflows/ci.yml/badge.svg)](https://github.com/ranscky/synapse/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/ranscky/synapse)](https://github.com/ranscky/synapse/releases/latest)
-[![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue)](LICENSE)
+[![CI](...)] [![Release](...)] [![License: BSL 1.1](...)]
 
-> **46.4% token reduction** on established multi-session conversations — verified with semantic embeddings (all-MiniLM-L6-v2), not mock data. A brand-new session has no prior memory to draw from yet, so reduction grows as a conversation does — see [Utility tools](#utility-tools) to reproduce this number yourself.
+Synapse compiles your conversation history into the smallest, most relevant context your model actually needs — instead of forwarding the raw, ever-growing message log every provider defaults to. A Go reverse proxy sits between your AI client and your model: it classifies intent, scores every candidate memory on four independent factors, deduplicates near-identical content, and packs what survives into an exact token budget before forwarding it upstream. Your model sees less, but better — and every decision is inspectable: what got selected, what got rejected, and why (see the [trace inspector](#api-reference)).
 
-A Go reverse proxy that sits between your AI client and your model. It intercepts every API call, scores and prunes conversation history using a 4-factor model, and forwards a token-budgeted, task-aware context instead of the raw, noisy history. Your model sees less, but better.
+On an established multi-session conversation, that discipline verifiably cuts token usage by **46.4%** — measured with real semantic embeddings (all-MiniLM-L6-v2), not mock data. A brand-new session has no prior memory to draw from yet, so reduction grows as a conversation does — see [Utility tools](#utility-tools) to reproduce this number yourself.
 
 ```
 ┌─────────────┐    ┌──────────────────┐    ┌─────────────────┐

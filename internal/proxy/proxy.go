@@ -22,9 +22,11 @@ import (
 	"synapse/internal/compiler"
 	"synapse/internal/config"
 	"synapse/internal/dedup"
+	"synapse/internal/retrieval"
 	"synapse/internal/scorer"
 	"synapse/internal/session"
 	"synapse/internal/store"
+	"synapse/internal/supersession"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -53,6 +55,7 @@ type MemoryStore interface {
 	GetRecent(ctx context.Context, sessionID string, limit int) ([]store.MemoryEntry, error)
 	Search(ctx context.Context, queryEmbedding []float32, sessionID string, topK int) ([]store.MemoryEntry, error)
 	Write(ctx context.Context, entry store.MemoryEntry) error
+	MarkSuperseded(ctx context.Context, oldID, newID string) error
 }
 
 // Proxy represents the reverse proxy handler
@@ -456,32 +459,20 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// no Authorization header is present at all.
 	sessionID := deriveSessionID(r, traceSessionID)
 
-	var candidates []store.MemoryEntry
-	var storeDuration time.Duration
-	if p.store != nil {
-		storeStart := time.Now()
-		candidates, err = p.store.GetRecent(ctx, sessionID, 20)
-		storeDuration = time.Since(storeStart)
-		if err != nil {
-			slog.Error("Failed to get candidates from store", "error", err)
-			p.upstream.ServeHTTP(w, r)
-			return
-		}
+		// 3. Retrieve candidates via the shared retrieval pipeline: embeds the
+	// query, then semantically searches the full session memory store
+	// (rather than pulling the most recent 20 by recency and only scoring
+	// within that window -- see internal/retrieval for why that mattered).
+	retrievalResult, err := retrieval.Candidates(ctx, p.store, p.embedder, sessionID, lastUserMessage, p.config.RetrievalCandidateK)
+	if err != nil {
+		slog.Error("Failed to retrieve candidates", "error", err)
+		p.upstream.ServeHTTP(w, r)
+		return
 	}
-
-	// 3. Generate query embedding (only if embedder is available)
-	var queryEmbedding []float32
-	var embedDuration time.Duration
-	if p.embedder != nil {
-		embedStart := time.Now()
-		queryEmbedding, err = p.embedder.Embed(ctx, lastUserMessage)
-		embedDuration = time.Since(embedStart)
-		if err != nil {
-			slog.Error("Failed to generate query embedding", "error", err)
-			p.upstream.ServeHTTP(w, r)
-			return
-		}
-	}
+	candidates := retrievalResult.Candidates
+	queryEmbedding := retrievalResult.QueryEmbedding
+	storeDuration := retrievalResult.SearchDuration
+	embedDuration := retrievalResult.EmbedDuration
 
 	// 3b. Write this message to the store so memory actually accumulates
 	// from real traffic. Best-effort: a write failure shouldn't block the
@@ -498,13 +489,33 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		if writeErr := p.store.Write(ctx, memEntry); writeErr != nil {
 			slog.Error("Failed to write memory entry", "error", writeErr)
+		} else if supersededID := supersession.FindSupersededCandidate(memEntry, candidates, p.config.SupersessionSimilarityMin, p.config.SupersessionSimilarityMax); supersededID != "" {
+			// candidates here is the same-session pool internal/retrieval
+			// already fetched for this turn -- see FindSupersededCandidate's
+			// doc comment for why that's a reasonable thing to check against
+			// rather than issuing a separate query.
+			if markErr := p.store.MarkSuperseded(ctx, supersededID, memEntry.ID); markErr != nil {
+				slog.Error("Failed to mark memory as superseded", "error", markErr, "superseded_id", supersededID, "superseding_id", memEntry.ID)
+			} else {
+				slog.Info("Memory superseded", "superseded_id", supersededID, "superseding_id", memEntry.ID)
+			}
 		}
 	}
 
 	// 4. Score candidates using 4-factor model (only if we have candidates and embeddings)
 	var scoredMemories []scorer.ScoredMemory
 	if len(candidates) > 0 && len(queryEmbedding) > 0 {
-		weights := scorer.GetWeights(0.4, 0.2, 0.2, 0.2)
+		// Previously hardcoded as scorer.GetWeights(0.4, 0.2, 0.2, 0.2) --
+		// which didn't even match config.DefaultConfig()'s own weights
+		// (0.4/0.1/0.3/0.2), let alone anything a user set in
+		// synapse.yaml. The configured weight-* fields were being parsed
+		// and validated but never actually reaching the scorer.
+		weights := scorer.GetWeights(
+			p.config.WeightSemanticSimilarity,
+			p.config.WeightRecency,
+			p.config.WeightImportance,
+			p.config.WeightTaskAlignment,
+		)
 		scorerInstance := scorer.NewScorer(weights, intent, float64(confidence), time.Now())
 		scoredMemories = scorerInstance.Score(ctx, queryEmbedding, candidates)
 
@@ -525,10 +536,36 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	deduplicated := dedup.Deduplicate(scoredMemories, dedupThreshold)
 	dedupDuration := time.Since(dedupStart)
 
+	// 5b. Exclude anything already marked superseded from ever being
+	// compiled into context. Superseded memories still flow through
+	// scoring and dedup above (so the trace can show their scores and
+	// which one replaced them), but they must never survive into what the
+	// model actually sees -- that's the entire point of supersession.
+	// Filtering here, right before budget.Fill, is the one place that
+	// actually enforces it; everywhere upstream just tracks the field.
+	//
+	// Known limitation: candidates was fetched in step 3, before step 3b
+	// wrote this request's own message and (possibly) marked something
+	// superseded. That mark is a real DB UPDATE, but candidates is an
+	// in-memory snapshot taken before it -- so a memory superseded by
+	// *this same request* still shows SupersededBy=="" here and can still
+	// be selected into *this* request's own compiled output. The
+	// exclusion only reliably takes effect starting the *next* request,
+	// once a fresh retrieval.Candidates() call re-reads the now-updated
+	// row from the database. Fixing the same-request case would mean
+	// re-fetching or patching candidates in place after 3b -- deferred for
+	// now since it's a one-turn-late correction, not a permanent leak.
+	eligibleForBudget := make([]scorer.ScoredMemory, 0, len(deduplicated))
+	for _, m := range deduplicated {
+		if m.SupersededBy == "" {
+			eligibleForBudget = append(eligibleForBudget, m)
+		}
+	}
+
 	// 6. Apply token budget
 	budgetStart := time.Now()
 	tokenBudget := p.config.TokenBudget
-	selectedMemories, totalTokens := budget.Fill(deduplicated, tokenBudget)
+	selectedMemories, totalTokens := budget.Fill(eligibleForBudget, tokenBudget)
 	budgetDuration := time.Since(budgetStart)
 
 	// 7. Compile final context with trace

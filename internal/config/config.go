@@ -25,6 +25,9 @@ type Config struct {
 	WeightTaskAlignment      float64  `yaml:"weight-task-alignment"`
 	DeduplicationThreshold   float64  `yaml:"deduplication-threshold"`
 	LogLevel                 string   `yaml:"log-level"`
+	RetrievalCandidateK      int      `yaml:"retrieval-candidate-k"`
+	SupersessionSimilarityMin float64 `yaml:"supersession-similarity-min"`
+	SupersessionSimilarityMax float64 `yaml:"supersession-similarity-max"`
 }
 
 // defaultDataDir resolves the stable, per-OS data directory used as the
@@ -129,6 +132,16 @@ func DefaultConfig() *Config {
 		WeightTaskAlignment:      0.2,
 		DeduplicationThreshold:   0.92, // Default deduplication threshold
 		LogLevel:                 "info",
+		RetrievalCandidateK:      50, // Candidate pool size pulled from semantic search before scoring
+		// These two are a rough starting guess, not a tuned value -- there's
+		// no real-usage data behind them yet. The band needs to sit below
+		// DeduplicationThreshold (0.92): dedup already catches near-identical
+		// restatements above that line, so supersession's job is the "same
+		// topic, different answer" zone below it. Revisit once real
+		// conversations show whether 0.5-0.90 actually separates
+		// "related but different" from "unrelated" and "duplicate" well.
+		SupersessionSimilarityMin: 0.5,
+		SupersessionSimilarityMax: 0.90,
 	}
 }
 
@@ -155,6 +168,25 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("openai-api-key is required when using OpenAI embedder")
 	}
 	
+	// A negative candidate pool size is nonsensical; zero is left permissive
+	// here (same treatment as TokenBudget and the scoring weights above) so
+	// that hand-built Config structs in tests don't need to set every field
+	// -- callers that actually run retrieval should treat zero/unset as
+	// "fall back to the DefaultConfig value" rather than erroring here.
+	// "fall back to the DefaultConfig value" rather than erroring here.
+	if c.RetrievalCandidateK < 0 {
+		return fmt.Errorf("retrieval-candidate-k must not be negative")
+	}
+
+	// Only reject the one combination that can never be meaningfully
+	// correct -- an empty or inverted band. Values outside [0,1] are left
+	// permissive (matching the DeduplicationThreshold precedent above)
+	// since cosine similarity can technically go negative for genuinely
+	// opposite embeddings, and this is a heuristic knob still being tuned.
+	if c.SupersessionSimilarityMin > c.SupersessionSimilarityMax {
+		return fmt.Errorf("supersession-similarity-min must not be greater than supersession-similarity-max")
+	}
+
 	// Upstream URL is required
 	if c.UpstreamURL == "" {
 		return fmt.Errorf("upstream-url is required")

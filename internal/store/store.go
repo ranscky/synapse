@@ -26,6 +26,7 @@ type MemoryEntry struct {
 	Timestamp  time.Time `json:"timestamp"`             // Creation timestamp
 	Importance float64   `json:"importance,omitempty"`  // Importance score
 	Embedding  []float32 `json:"embedding,omitempty"`   // 384-dim embedding vector
+	SupersededBy string    `json:"superseded_by,omitempty"`  // ID of the memory that superseded this one, if any. Empty means still active/current. Populated by a later write, never set at the same time a memory is first created.
 }
 
 // embeddingToBytes serializes a []float32 embedding into a byte slice for
@@ -113,7 +114,8 @@ func (s *Store) initSchema() error {
 		memory_type TEXT NOT NULL,
 		timestamp DATETIME NOT NULL,
 		importance REAL DEFAULT 0.0,
-		embedding BLOB
+		embedding BLOB,
+		superseded_by TEXT DEFAULT ''
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_memories_session_id ON memories(session_id);
@@ -124,6 +126,22 @@ func (s *Store) initSchema() error {
 	_, err := s.db.Exec(query)
 	if err != nil {
 		return fmt.Errorf("failed to create tables: %w", err)
+	}
+
+	// CREATE TABLE IF NOT EXISTS above is a no-op against a database that
+	// already has a `memories` table from before this column existed --
+	// which describes every real synapse.db created before this change,
+	// including any existing dev database. SQLite has no
+	// "ADD COLUMN IF NOT EXISTS", so this attempts the migration
+	// unconditionally on every startup and swallows the one specific error
+	// that means "already applied" (a previous startup already migrated
+	// this file), surfacing anything else as a real failure. The DEFAULT
+	// '' backfills existing rows so SupersededBy scans as an empty string
+	// rather than needing sql.NullString everywhere that reads it back.
+	if _, err := s.db.Exec(`ALTER TABLE memories ADD COLUMN superseded_by TEXT DEFAULT ''`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("failed to migrate superseded_by column: %w", err)
+		}
 	}
 
 	return nil
@@ -153,10 +171,10 @@ func (s *Store) Write(ctx context.Context, entry MemoryEntry) error {
 		entry.Content = truncated
 	}
 
-	// Insert memory entry
+		// Insert memory entry
 	insertQuery := `
-	INSERT OR REPLACE INTO memories (id, session_id, content, memory_type, timestamp, importance, embedding)
-	VALUES (?, ?, ?, ?, ?, ?, ?)
+	INSERT OR REPLACE INTO memories (id, session_id, content, memory_type, timestamp, importance, embedding, superseded_by)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	var embeddingBytes []byte
@@ -164,7 +182,7 @@ func (s *Store) Write(ctx context.Context, entry MemoryEntry) error {
 		embeddingBytes = embeddingToBytes(entry.Embedding)
 	}
 
-	_, err := s.db.ExecContext(ctx, insertQuery, entry.ID, entry.SessionID, entry.Content, entry.MemoryType, entry.Timestamp, entry.Importance, embeddingBytes)
+	_, err := s.db.ExecContext(ctx, insertQuery, entry.ID, entry.SessionID, entry.Content, entry.MemoryType, entry.Timestamp, entry.Importance, embeddingBytes, entry.SupersededBy)
 	if err != nil {
 		return fmt.Errorf("failed to insert memory: %w", err)
 	}
@@ -192,8 +210,8 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, sessionID 
 	// similarity, not just the most recent topK (recency and relevance are
 	// different things; limiting here before ranking would silently throw
 	// away the most semantically relevant older entries).
-	searchQuery := `
-	SELECT id, session_id, content, memory_type, timestamp, importance, embedding
+		searchQuery := `
+	SELECT id, session_id, content, memory_type, timestamp, importance, embedding, superseded_by
 	FROM memories
 	WHERE session_id = ?
 	`
@@ -208,7 +226,7 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, sessionID 
 	for rows.Next() {
 		var entry MemoryEntry
 		var embeddingBytes []byte
-		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance, &embeddingBytes)
+		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance, &embeddingBytes, &entry.SupersededBy)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan memory entry: %w", err)
 		}
@@ -234,13 +252,13 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, sessionID 
 	}
 
 	// Rank by cosine similarity against the query embedding.
-	type scoredEntry struct {
+		type scoredEntry struct {
 		entry      MemoryEntry
 		similarity float64
 	}
 	scored := make([]scoredEntry, 0, len(entries))
 	for _, e := range entries {
-		sim := cosineSimilarity(queryEmbedding, e.Embedding)
+		sim := CosineSimilarity(queryEmbedding, e.Embedding)
 		scored = append(scored, scoredEntry{entry: e, similarity: sim})
 	}
 
@@ -260,14 +278,19 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, sessionID 
 	return results, nil
 }
 
-// cosineSimilarity computes the cosine similarity between two vectors.
-// Duplicated from internal/scorer rather than imported, since internal/
-// scorer imports internal/store - importing scorer here would create a
-// circular import. Keep this in sync with scorer's version if either
-// changes; both must use math.Sqrt(normA)*math.Sqrt(normB), not
-// normA*normB (a real bug found and fixed in internal/dedup earlier in
-// this project for exactly this reason).
-func cosineSimilarity(a, b []float32) float64 {
+// CosineSimilarity computes the cosine similarity between two vectors.
+//
+// This used to be duplicated three ways -- separately in internal/scorer,
+// internal/dedup, and here -- on the theory that importing this package
+// from those would create a circular dependency. It wouldn't have: store
+// has no internal dependencies of its own, so it's scorer and dedup that
+// should import store's copy, not the other way around. The triplication
+// wasn't just redundant, it was actively dangerous: dedup's copy at one
+// point used normA*normB instead of math.Sqrt(normA)*math.Sqrt(normB), a
+// real bug caused by three independent implementations drifting out of
+// sync with no single source of truth to check against. This is now that
+// single source of truth -- scorer and dedup both call this directly.
+func CosineSimilarity(a, b []float32) float64 {
 	if len(a) != len(b) || len(a) == 0 {
 		return 0.0
 	}
@@ -294,7 +317,7 @@ func (s *Store) GetRecent(ctx context.Context, sessionID string, limit int) ([]M
 
 	
 query := `
-	SELECT id, session_id, content, memory_type, timestamp, importance, embedding
+	SELECT id, session_id, content, memory_type, timestamp, importance, embedding, superseded_by
 	FROM memories
 	WHERE session_id = ?
 	ORDER BY timestamp DESC
@@ -311,7 +334,7 @@ query := `
 	for rows.Next() {
 		var entry MemoryEntry
 		var embeddingBytes []byte
-		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance, &embeddingBytes)
+		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance, &embeddingBytes, &entry.SupersededBy)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan memory entry: %w", err)
 		}
@@ -367,6 +390,37 @@ func (s *Store) Delete(ctx context.Context, sessionID string) error {
 		return fmt.Errorf("failed to delete memories for session %s: %w", sessionID, err)
 	}
 	
+	return nil
+}
+
+// MarkSuperseded records that oldID has been superseded by newID -- e.g.
+// an earlier "we use PostgreSQL" decision replaced by a newer "we migrated
+// to MongoDB" one. This is a separate, small UPDATE rather than folded
+// into Write(), since Write() always inserts or fully replaces a row for
+// a *new* memory, whereas this mutates an *existing* row's superseded_by
+// field in place without touching anything else about it.
+//
+// Returns an error (rather than silently no-op'ing) if oldID doesn't
+// exist, so a caller with a bad ID finds out immediately rather than the
+// mismatch going unnoticed.
+func (s *Store) MarkSuperseded(ctx context.Context, oldID, newID string) error {
+	if oldID == "" || newID == "" {
+		return fmt.Errorf("MarkSuperseded requires non-empty oldID and newID")
+	}
+
+	result, err := s.db.ExecContext(ctx, `UPDATE memories SET superseded_by = ? WHERE id = ?`, newID, oldID)
+	if err != nil {
+		return fmt.Errorf("failed to mark memory %s as superseded: %w", oldID, err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to confirm supersession update for memory %s: %w", oldID, err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("no memory found with id %s to mark as superseded", oldID)
+	}
+
 	return nil
 }
 

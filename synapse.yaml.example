@@ -42,3 +42,26 @@ deduplication-threshold: 0.92
 # any http(s) URL; localhost/127.x.x.x is always implicitly allowed for
 # Ollama). Example: allowed-upstream-hosts: ["api.anthropic.com"]
 # allowed-upstream-hosts: []
+
+# Number of candidates pulled from semantic search (by embedding similarity
+# across the full memory store) before the 4-factor scorer ranks them down
+# to what fits the token budget. Higher values widen recall at the cost of
+# more embedding/scoring work per request; lower values are cheaper but can
+# miss relevant older memories. Tune this once you have real usage to
+# benchmark against -- 50 is a reasonable starting point.
+retrieval-candidate-k: 50
+
+# Similarity band (cosine similarity) a new memory must fall within,
+# relative to an existing same-type memory in the same session, before
+# that existing memory becomes eligible to be marked superseded -- e.g. an
+# old "we use PostgreSQL" decision being replaced by a new "we migrated to
+# MongoDB" one. This alone is not enough to trigger supersession: the new
+# memory's content also has to contain an explicit signal phrase (e.g.
+# "instead of", "switched to", "no longer") -- similarity only identifies
+# *candidates* for supersession, the phrase gate decides whether it
+# actually happens. Kept below deduplication-threshold on purpose: dedup
+# already owns near-identical restatements above that line, this band is
+# for "same topic, different answer" below it. These are a rough starting
+# guess, not a value tuned against real conversations yet.
+supersession-similarity-min: 0.5
+supersession-similarity-max: 0.90
