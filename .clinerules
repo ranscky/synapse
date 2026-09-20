@@ -1,64 +1,67 @@
-# Synapse Context Compiler — .clinerules
-# Drop this in the project root. Cline reads it at session start.
+# Synapse Context Compiler — .clinerules (v2)
+# Replace v1 .clinerules entirely.
 
-## Tech stack & versions
+## Tech stack
+# v1 (do not modify):
 - Go 1.22+
-- sqlite-vec v0.1.x (github.com/asg017/sqlite-vec-go-bindings)
-- onnxruntime-go v1.x (github.com/yalue/onnxruntime_go) — all-MiniLM-L6-v2 ONNX
-- tiktoken-go v0.x (github.com/pkoukk/tiktoken-go)
-- chi v5 (github.com/go-chi/chi/v5) — HTTP router for REST API
-- go-yaml v3 (gopkg.in/yaml.v3) — config parsing
-- testify v1 (github.com/stretchr/testify) — assertions
-- Node.js (none — no JS build pipeline; web UI is single-file vanilla HTML/JS)
+- sqlite-vec v0.1.x  (github.com/asg017/sqlite-vec-go-bindings)
+- onnxruntime-go v1.31.0 (github.com/yalue/onnxruntime_go)
+  model pinned: ca2c6b84644f6c2f4b7c879851ad9d364ae375f6
+- tiktoken-go         (github.com/pkoukk/tiktoken-go)
+- chi v5              (github.com/go-chi/chi/v5)
+- go-yaml v3          (gopkg.in/yaml.v3)
+- testify v1          (github.com/stretchr/testify)
+- charmbracelet/log   (structured logging)
+- google/uuid
 
-## Folder structure
-synapse/
-├── cmd/
-│   └── synapse/
-│       └── main.go          # Binary entrypoint, flag parsing
-├── internal/
-│   ├── proxy/               # Reverse proxy handler, request interception
-│   ├── classifier/          # Intent classifier (TF-IDF + keyword rules)
-│   ├── scorer/              # 4-Factor Sieve — S, R, I, T computation
-│   ├── store/               # sqlite-vec memory store, embedding write/read
-│   ├── embedder/            # ONNX embedding model wrapper + OpenAI fallback
-│   ├── dedup/               # Cosine deduplication pass
-│   ├── budget/              # tiktoken-go token counter + greedy fill
-│   ├── compiler/            # Assembles compiled messages[] + Trace manifest
-│   ├── api/                 # REST API handlers (chi router)
-│   └── config/              # YAML config loader + defaults
-├── ui/
-│   └── index.html           # Single-file trace inspector (vanilla HTML/JS)
-├── schemas/
-│   └── memory-trace.schema.json  # Published JSON Schema for trace output
-├── testdata/                # Sample sessions for benchmark tests
-├── .clinerules              # This file
-├── synapse.yaml.example     # Annotated example config
-└── README.md
+# v2 additions:
+- pgx v5              (github.com/jackc/pgx/v5)
+- pgvector-go         (github.com/pgvector/pgvector-go)
+- golang-jwt/jwt v5   (github.com/golang-jwt/jwt/v5)
+- mcp-go              (github.com/mark3labs/mcp-go)
+- crypto/hmac         (stdlib — no new dependency)
 
-## Coding style
-- async patterns: use goroutines + channels, not callbacks
-- functional over stateful structs where practical — pure functions for scoring
-- camelCase for unexported, PascalCase for exported; kebab-case for config keys
-- max 300 lines per file — split by responsibility if approaching limit
-- interfaces for every external dependency (store, embedder, classifier) — enables mocking in tests
-- no global state — pass config/deps via constructor injection
-- comments on all exported types and functions; inline comments only for non-obvious logic
+## v1 internals — do NOT modify unless a v2 bug explicitly requires it:
+  proxy, classifier, scorer, store, embedder, dedup, budget,
+  compiler, api, config, retrieval, supersession, trace
 
-## Error handling
-- always wrap errors: `fmt.Errorf("scorer: %w", err)`
-- return errors up the stack — do not log + swallow
-- top-level handlers log at ERROR level and return 500 with a sanitized message (never leak internals)
-- use slog (stdlib) for structured logging — no third-party logger
-- startup validation: if config is invalid, log.Fatal with clear message — no silent defaults that hide misconfiguration
-- never log Authorization headers or bearer tokens at any log level
+## v2 internals:
+  plane, sync, conflict, ledger, mcp, tenant, metering, billing
 
-## Guardrails
-- do not install new dependencies without asking — the binary size and single-binary goal matter
-- do not touch files outside the current phase's scope
-- no hardcoded secrets, API keys, or localhost URLs — everything via config or env
-- do not refactor working code from a prior phase unless a bug requires it
-- Authorization headers must NEVER appear in log output — this is a security requirement, not a preference
-- proxy default binding is 127.0.0.1 — never change default to 0.0.0.0
-- all config files written by Synapse must be created with 0600 permissions
-- Memory Trace JSON is in-memory only by default; persistence requires explicit --persist-traces flag
+## Coding style (unchanged from v1)
+- goroutines + channels, not callbacks
+- interfaces for every external dependency
+- no global state — constructor injection
+- max 300 lines per file
+- camelCase unexported, PascalCase exported, kebab-case config keys
+- fmt.Errorf("module: %w", err) for all error wrapping
+- charmbracelet/log for structured logging
+- comments on all exported types and functions
+- verify with real go test output before treating any fix as confirmed
+
+## v2 hard rules
+- NEVER UPDATE or DELETE rows in the ledger table — append-only
+- NEVER use row-level filter as sole tenant isolation — schema-per-tenant required
+- NEVER log JWT secrets, HMAC signing keys, or tenant API keys
+- MCP tools MUST share the same sanitization pipeline as REST
+- Conflict resolution MUST keep both memory versions with conflict marker
+- Control plane MUST boot with zero external deps other than Postgres
+- ListenAddr for plane defaults to 127.0.0.1:9090 — never 0.0.0.0
+- SYNAPSE_JWT_SECRET and SYNAPSE_DB_DSN from env only — fatal if missing in prod
+- MCP responses MUST include score breakdown (S/R/I/T) and trace_id
+  so users can see WHY a memory was surfaced (differentiation from OpenMemory MCP)
+
+## v1 rules (still apply — no exceptions)
+- Default bind 127.0.0.1:8080 — never 0.0.0.0
+- Authorization AND x-api-key headers NEVER in any log output
+- All Synapse-created files: 0600 permissions
+- Memory content sanitized before storage
+- Traces in-memory only unless --persist-traces
+
+## Phase discipline
+- One Cline session per phase (build)
+- One separate Cline session per phase (debug) — never debug in the build chat
+- Do not implement Phase N+1 features while in Phase N
+- Update PROGRESS.md after each phase before closing
+- Do not install new dependencies without explicit confirmation
+- Verify every fix with real go test output from your terminal
