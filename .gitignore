@@ -1,7 +1,12 @@
 models/
 synapse.yaml
+synapse-plane.yaml
 payload.json
 /synapse
+/bin/plane
+/bin/plane.exe
+/plane
+/plane.exe
 *.db
 *.db-shm
 *.db-wal

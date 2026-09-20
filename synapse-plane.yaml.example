@@ -1,0 +1,50 @@
+# Synapse Control Plane (v2) Configuration Example
+#
+# Copy this to synapse-plane.yaml and edit it. Every key can also come from the
+# environment: when the matching SYNAPSE_* variable is set to a non-empty
+# value it wins over whatever is written below, which is how a real deployment
+# injects secrets without storing them on disk.
+#
+# The plane never logs the value of database-dsn, jwt-secret, admin-token, or
+# master-key. Startup logs report them as "set" or "unset" only, and validation
+# errors name the offending key without echoing it.
+
+# Bind address for the control plane HTTP server. No environment override.
+# Must stay loopback (127.0.0.1, localhost, or ::1): the plane refuses to
+# start on 0.0.0.0 or any public interface.
+listen-addr: "127.0.0.1:9090"
+
+# Postgres connection string used by the v2 plane. Overridden by
+# SYNAPSE_DB_DSN. Required: startup is fatal when both this key and the
+# environment variable are empty. Secret: never logged.
+# DEV PLACEHOLDER -- no database is contacted yet in Phase 1; replace it in
+# any real deployment.
+database-dsn: "postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable"
+
+# HMAC signing key for issued JWTs. Overridden by SYNAPSE_JWT_SECRET.
+# Required and must be at least 32 characters: startup is fatal otherwise.
+# Secret: never logged, never echoed in error messages.
+# DEV PLACEHOLDER -- generate a real one with: openssl rand -hex 32
+jwt-secret: "dev-only-placeholder-secret-not-for-any-real-deployment"
+
+# Token guarding the plane's admin endpoints. Overridden by
+# SYNAPSE_ADMIN_TOKEN. Not enforced yet: Phase 1 registers no authenticated
+# route, so it becomes required in the phase that adds admin auth.
+# Secret: never logged.
+# DEV PLACEHOLDER -- replace or blank it in any real deployment.
+admin-token: "dev-only-placeholder-admin-token"
+
+# Key used to wrap per-tenant API keys before storage. Overridden by
+# SYNAPSE_MASTER_KEY. Unused in Phase 1: no tenant material exists yet.
+# Secret: never logged.
+# DEV PLACEHOLDER -- replace or blank it in any real deployment.
+master-key: "dev-only-placeholder-master-key"
+
+# Startup log verbosity: debug, info, warn, or error (anything else falls back
+# to info). No environment override.
+log-level: "info"
+
+# Days of ledger history kept available for reporting/archival tooling. The
+# ledger table is append-only and is never updated or deleted, so this value
+# never triggers data removal. No environment override.
+ledger-retention-days: 365
