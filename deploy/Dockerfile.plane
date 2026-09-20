@@ -1,0 +1,20 @@
+# Build the Synapse v2 control plane. Build context is the repository root:
+#   docker build -f deploy/Dockerfile.plane -t synapse-plane .
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY . .
+# CGO_ENABLED=0 is required, not cosmetic: golang:alpine ships no C toolchain
+# ("additional related tools (such as git, gcc, or bash) are not included in
+# Alpine-based images"), and ./cmd/plane pulls cgo-requiring standard packages
+# when cgo is on (net, via net/http). Building with CGO_ENABLED=1 there fails
+# with: cgo: C compiler "gcc" not found, reported against package runtime/cgo.
+# The plane itself has no cgo dependency -- sqlite and onnxruntime live in
+# internal/store and internal/embedder, which ./cmd/plane never imports -- so
+# the result is a static binary.
+ENV CGO_ENABLED=0
+RUN go build -o /bin/plane ./cmd/plane
+
+FROM alpine:3.19
+COPY --from=builder /bin/plane /bin/plane
+EXPOSE 9090
+ENTRYPOINT ["/bin/plane"]

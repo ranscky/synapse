@@ -1,0 +1,68 @@
+# Synapse Context Compiler (v2) -- self-hosted control plane + Postgres.
+#
+#   cd deploy && docker compose up --build
+#   curl http://127.0.0.1:9090/health
+#   {"status":"ok","version":"2.0.0","db":"connected"}
+#
+# Networking: internal/plane refuses to boot on anything but a loopback
+# listen-addr (PlaneConfig.Validate), and there is no environment override for
+# listen-addr -- only the four secret keys are overridable. A published Docker
+# port is DNAT'ed to the container's eth0 address, never to the container's own
+# 127.0.0.1, so a bridge-networked plane bound to 127.0.0.1:9090 is unreachable
+# from the host no matter what "ports:" says. The plane therefore runs with
+# network_mode: host and keeps its loopback bind: host loopback is then the very
+# loopback the plane listens on, and the ".clinerules" rule that the plane is
+# never exposed on 0.0.0.0 still holds. Postgres stays on the compose bridge
+# network with its port published on the host loopback only, which is how the
+# host-networked plane reaches it.
+#
+# Limitation: network_mode: host is Linux-only (Docker Desktop on macOS/Windows
+# does not support it). On those hosts the plane would need an explicit
+# non-loopback bind, which the plane currently rejects by design.
+services:
+  db:
+    # The official postgres:16 image ships no pgvector, so
+    # shared_preload_libraries=vector would abort startup with
+    # 'could not access file "vector"'. The pgvector image is Postgres 16 plus
+    # the prebuilt extension, which makes the command below valid.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: synapse
+      POSTGRES_DB: synapse
+    command: ["postgres", "-c", "shared_preload_libraries=vector"]
+    volumes:
+      - synapse_pg_data:/var/lib/postgresql/data
+    ports:
+      # Loopback-only on purpose: the database must not be reachable from the
+      # network. The host-networked plane connects to it through this mapping.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  plane:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.plane
+      # Build context is the repository root so .dockerignore there applies.
+    # Host networking keeps the plane's loopback bind meaningful (see header).
+    # No "ports:" here: port publishing is ignored under host networking.
+    network_mode: host
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # 127.0.0.1:5432 is the db service's published loopback port, reachable
+      # because this container shares the host network namespace.
+      SYNAPSE_DB_DSN: postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable
+      # 40 characters, above the plane's 32-character minimum. DEV VALUES:
+      # replace all three before any real deployment.
+      SYNAPSE_JWT_SECRET: change-me-in-production-must-be-32-chars
+      SYNAPSE_ADMIN_TOKEN: change-me-admin-token
+      SYNAPSE_MASTER_KEY: change-me-master-key-32-chars-min
+
+volumes:
+  synapse_pg_data:

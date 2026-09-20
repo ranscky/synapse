@@ -1,0 +1,33 @@
+# Docker build context exclusions. The compose plane service builds with
+# context ".." (the repository root), so this file is what keeps the context
+# small and keeps secrets out of the image.
+#
+# Docker artifacts
+onnx/
+bin/
+*.db
+*.db-wal
+*.db-shm
+.git/
+
+# Model weights and development-only trees the plane never reads. Excluding
+# them matters: the repo is ~430M on a dev machine (models/ is 87M, .git/ 279M)
+# and every byte of context is shipped to the builder on each build.
+models/
+ui/
+testdata/
+schemas/
+
+# Stale host-built binaries from earlier phases.
+/plane
+/synapse
+
+# Local configuration, including secrets: cmd/plane's default config path is
+# ./synapse-plane.yaml relative to WORKDIR /app, so a developer's own config
+# file would otherwise be baked into the image and could set listen-addr.
+synapse.yaml
+synapse-plane.yaml
+
+# Release archives
+*.tar.gz
+*.zip

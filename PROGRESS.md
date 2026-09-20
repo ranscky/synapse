@@ -474,3 +474,241 @@ package was touched — `go test ./...` above is the proof.
 Next phase: not started. Tenant-scoped data schemas, API-key authentication
 (`tenant.VerifyAPIKey` against `synapse_global.tenant_keys`), master-key sealing
 for `tenant_secrets`, metering, and the ledger are all still ahead.
+
+Verification (real output, this phase):
+
+```text
+$ docker --version
+Docker version 29.8.1, build 4a63305
+$ docker compose version
+Docker Compose version v5.5.1
+$ docker ps -a --format '{{.Names}}'     # engine state before the first run
+(empty)                                   # 0 images, 0 containers, 0 volumes
+
+$ cd deploy && docker compose config      # offline validation, exit 0
+name: deploy
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    ports:
+      - mode: ingress
+        host_ip: 127.0.0.1
+        target: 5432
+        published: "5432"
+  plane:
+    build:
+      context: /home/ranscky/Dev/synapse
+      dockerfile: deploy/Dockerfile.plane
+    network_mode: host
+```
+
+The cold run, `docker compose up --build` against that empty engine (pull
+progress and the initdb banner abridged; everything else is verbatim):
+
+```text
+#10 [builder 3/4] COPY . .                     # 1.5s -- .dockerignore kept the context small
+#10 DONE 1.5s
+#11 [builder 4/4] RUN go build -o /bin/plane ./cmd/plane
+#13 naming to docker.io/library/deploy-plane:latest 0.0s done
+db-1  | 2026-09-20 12:23:07.100 UTC [1] LOG:  starting PostgreSQL 16.15 (Debian 16.15-1.pgdg12+2) ...
+db-1  | 2026-09-20 12:23:07.100 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+db-1  | 2026-09-20 12:23:07.412 UTC [1] LOG:  database system is ready to accept connections
+ Container deploy-db-1 Healthy
+ Container deploy-plane-1 Starting
+plane-1  | 12:23PM WARN plane: Control plane config file not found, using defaults and environment path=synapse-plane.yaml
+plane-1  | 12:23PM INFO plane: Control plane config loaded listen_addr=127.0.0.1:9090 database_dsn=set jwt_secret=set admin_token=set master_key=set log_level=info ledger_retention_days=365
+ Container deploy-plane-1 Started
+plane-1  | 12:23PM INFO plane: migrations complete schema=synapse_global
+plane-1  | 12:23PM INFO plane: Synapse Control Plane v2.0.0 listening addr=127.0.0.1:9090
+
+$ curl -sS -i http://127.0.0.1:9090/health
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Sun, 20 Sep 2026 12:23:27 GMT
+Content-Length: 50
+
+{"status":"ok","version":"2.0.0","db":"connected"}
+```
+
+Postgres above logs `listening on IPv4 address "0.0.0.0"` *inside its own
+container*; on the host only the two loopback endpoints exist:
+
+```text
+$ ss -ltn | grep -E ':(5432|9090)'
+LISTEN 0 4096 127.0.0.1:9090 0.0.0.0:*
+LISTEN 0 4096 127.0.0.1:5432 0.0.0.0:*
+```
+
+pgvector in the switched image, with the requested preload flag actually taking
+effect (no `could not access file "vector"` anywhere in the log):
+
+```text
+$ docker exec deploy-db-1 psql -U synapse -d synapse -c \
+    "select name, default_version from pg_available_extensions where name='vector'"
+  name  | default_version
+--------+-----------------
+ vector | 0.8.6
+
+$ docker exec deploy-db-1 psql -U synapse -d synapse -tAc 'show shared_preload_libraries'
+vector
+```
+
+Negative control for the networking decision — the same image, bridge-networked,
+with the published port the original compose sketch asked for:
+
+```text
+$ docker run -d --rm --name plane-bridge-probe --network deploy_default -p 9099:9099 \
+    -e SYNAPSE_DB_DSN='postgres://synapse:synapse@db:5432/synapse?sslmode=disable' \
+    -e SYNAPSE_JWT_SECRET='change-me-in-production-must-be-32-chars' \
+    deploy-plane:latest --port 9099
+
+$ curl -sS -i http://127.0.0.1:9099/health      # from the host, via the published port
+curl: (56) Recv failure: Connection reset by peer
+
+$ docker exec plane-bridge-probe wget -q -O - http://127.0.0.1:9099/health
+{"status":"ok","version":"2.0.0","db":"connected"}
+```
+
+Same image, same database, same healthy plane — only the host-side published path
+fails, because the listener is on the container's own loopback. That is why the
+compose service runs with `network_mode: host` instead of a `ports:` mapping.
+
+Provisioning through the deployed stack, so the deployment is proven functional
+beyond `/health`:
+
+```text
+$ curl -sS -i -X POST http://127.0.0.1:9090/v2/tenants \
+    -H 'Authorization: change-me-admin-token' -H 'Content-Type: application/json' \
+    -d '{"slug":"compose-team","plan":"team"}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+Content-Length: 526
+
+{"tenant_id":"e2d093ed-84ed-469a-a86e-53d04e456b70","jwt":"eyJhbGciOi...","api_key":"192c98b9..."}
+
+$ docker exec deploy-db-1 psql -U synapse -d synapse -c \
+    'select id, slug, plan, compliance_tier, status from synapse_global.tenants'
+                  id                  |     slug     | plan | compliance_tier | status
+--------------------------------------+--------------+------+-----------------+--------
+ e2d093ed-84ed-469a-a86e-53d04e456b70 | compose-team | team | team            | active
+
+$ docker exec deploy-db-1 psql -U synapse -d synapse -tAc \
+    "select count(*) from synapse_global.tenant_keys where key_hash = '192c98b9...'"
+0            # the stored value is the hash; the plaintext key never reaches the table
+```
+
+Secrets in the full compose log, each must be 0:
+
+```text
+change-me-admin-token                    -> 0
+change-me-in-production-must-be-32-chars -> 0
+change-me-master-key-32-chars-min        -> 0
+postgres://synapse:synapse               -> 0
+```
+
+Timings, measured on this machine (4 cores, 7.6G RAM, ~1.4MB/s pull throughput):
+
+```text
+cold first run, empty engine:     362s   # ~240MB of images plus Go module downloads
+warm docker compose up --build:    23s   # every build step CACHED
+warm docker compose up:            12s   # images cached, volume already initialized
+```
+
+The two-minute target holds for any run where the three images are already
+present (12-23s). It is missed on the very first run here, and the cause is pull
+throughput rather than the stack: with the images absent, `--build` spends about
+five minutes downloading. `docker compose pull` ahead of time, or a faster link,
+is what brings a first-ever run inside two minutes.
+
+Teardown:
+
+```text
+$ docker compose down
+ Container deploy-plane-1 Removing
+ Container deploy-plane-1 Removed
+ Container deploy-db-1 Stopping
+ Container deploy-db-1 Stopped
+ Container deploy-db-1 Removing
+ Container deploy-db-1 Removed
+ Network deploy_default Removing
+ Network deploy_default Removed
+
+$ docker ps -a --format '{{.Names}} {{.Status}}'   # empty
+$ docker volume ls                                 # deploy_synapse_pg_data kept (down without -v)
+```
+
+`git ls-files --others --exclude-standard` reports exactly `.dockerignore` and
+the two files under `deploy/`: no Go source and no v1 package changed.
+`CGO_ENABLED=0 go build ./cmd/plane`, `go vet ./cmd/plane ./internal/plane
+./internal/tenant` and `go test ./internal/plane/... ./internal/tenant/...`
+remain green — the same control the earlier phases used.
+
+## Phase 4 — docker compose self-hosted deployment (complete)
+
+Commit `feat: Phase 4 - docker compose self-hosted deployment`
+
+`cd deploy && docker compose up --build` now brings the v2 plane and its Postgres
+up together, and `curl http://127.0.0.1:9090/health` answers from the host. One
+new directory plus one new ignore file: no Go file was touched, `internal/plane`
+and `internal/tenant` are unchanged, and no v1 internal package was opened.
+
+New files:
+
+- `deploy/docker-compose.yml` — `db` (pgvector/pgvector:pg16, named volume
+  `synapse_pg_data`, port published on the host loopback only, `pg_isready`
+  healthcheck) and `plane` (built from the repository root, started only after
+  `service_healthy`, with the four `SYNAPSE_*` secrets injected from the
+  environment).
+- `deploy/Dockerfile.plane` — `golang:1.22-alpine` builder stage, `alpine:3.19`
+  runtime stage, `CGO_ENABLED=0`.
+- `.dockerignore` — at the repository root, because that is the plane image's
+  build context.
+- `PROGRESS.md` — this entry.
+
+Decisions made in this phase:
+
+- **`postgres:16` cannot satisfy the requested `command:`.** The official image
+  installs only `gnupg`, `less`, `ca-certificates`, `wget`, `locales`,
+  `libnss-wrapper`, `xz-utils`, `zstd`, `gosu` and `postgresql-16` — no pgvector,
+  so `-c shared_preload_libraries=vector` aborts startup with
+  `could not access file "vector"`. The base image is therefore
+  `pgvector/pgvector:pg16`, which is Postgres 16 plus the prebuilt extension and
+  makes the flag valid. Confirmed at runtime below rather than assumed.
+- **`CGO_ENABLED=0` is required, not an optimization.** Alpine golang images ship
+  no C toolchain, and `./cmd/plane` pulls cgo-requiring standard packages when
+  cgo is enabled (`net`, via `net/http`). Reproduced in this repo before the
+  Dockerfile was changed:
+  `CC=/nonexistent/gcc CGO_ENABLED=1 go build ./cmd/plane` →
+  `cgo: C compiler "/nonexistent/gcc" not found`, reported against
+  `runtime/cgo`. The plane has no cgo dependency of its own — sqlite and
+  onnxruntime live in `internal/store` and `internal/embedder`, which `cmd/plane`
+  never imports — so the result is a static binary and the runtime stage needs no
+  extra packages.
+- **The plane keeps its loopback bind; the compose service uses
+  `network_mode: host`.** `PlaneConfig.Validate` refuses any non-loopback
+  `listen-addr` and offers no environment override, while a published Docker port
+  is DNAT'ed to the container's `eth0` address — never to the container's own
+  `127.0.0.1`. Under host networking the plane's loopback *is* the host's
+  loopback, so `127.0.0.1:9090` is reachable from the host while the plane still
+  never listens on `0.0.0.0`. The db stays on the compose bridge network with
+  `127.0.0.1:5432:5432`, and the plane's DSN targets `127.0.0.1:5432` rather than
+  the compose DNS name `db` — a host-networked container cannot resolve compose
+  service names. The negative control below is the proof, not the argument.
+- **`.dockerignore` goes beyond the four requested groups.** `onnx/` does not
+  exist in this repo (the v1 model directory is `models/`), so `models/`, `ui/`,
+  `testdata/`, `schemas/`, the stale root binaries and `synapse*.yaml` were added
+  too: the untrimmed context is ~430M (`.git/` 279M, `models/` 87M, `bin/` 32M).
+  Ignoring `synapse-plane.yaml` is also a correctness fix: the plane's default
+  config path is `./synapse-plane.yaml` relative to `WORKDIR /app`, so a
+  developer's own config file would otherwise be baked into the image and could
+  set `listen-addr`.
+- **Phase 3's migrations need no `vector` extension.** `RunMigrations` creates
+  plain tables, so `/health` does not depend on the extension today; the image
+  choice is what makes the requested preload flag valid and what the future
+  tenant schemas will need. `EXPOSE 9090` is kept for documentation value even
+  though host networking makes it decorative.
+- **Known limitation:** `network_mode: host` is Linux-only. Docker Desktop on
+  macOS and Windows does not support it; such hosts would need either an explicit
+  non-loopback bind (which the plane rejects by design today) or a relay
+  container sharing the plane's network namespace.
+
