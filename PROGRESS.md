@@ -929,3 +929,235 @@ is clean, and `go build ./...` compiles the whole module -- including
 unchanged, because `control-plane-url` defaults to empty.
 
 Next phase: not started. Do not add Phase 6 surface here.
+
+## Phase 6 — cross-tenant isolation test (complete)
+
+Commit `feat: Phase 6 - cross-tenant isolation test`
+
+One test file, no production code: `internal/store` gained the regression test for
+the guarantee the rest of the v2 plane assumes -- tenant A's memories live in a
+schema tenant B cannot reach. `pgstore.go` (md5 identical to HEAD),
+`pgmigrate.go`, `pgread.go`, and `factory.go` are unchanged, and no v1 internal
+package was opened.
+
+New files:
+
+- `internal/store/isolation_test.go` (212 lines) — `TestCrossTenantIsolation`
+  under `//go:build integration`, plus `isolationPool` and
+  `isolationRandomEmbedding`.
+
+Changed:
+
+- `PROGRESS.md` — this entry.
+
+The test, in the order it runs:
+
+1. `NewPGStore(pool, "tenant-alpha")` and `NewPGStore(pool, "tenant-beta")` over
+   one shared pool, plus
+   `require.NotEqual(alpha.schemaName(), beta.schemaName())`.
+2. Five `MemoryEntry` values written to tenant-alpha with known hardcoded
+   embeddings — entry *i* is the unit vector on axis *i*, the Phase 5 convention
+   — in a session id unique to the run.
+3. The query vector is byte-identical to tenant-alpha entry 3 (L2 distance 0), so
+   if any read path could reach that row, this is the vector that would find it.
+4. `beta.Search(query, sessionID, 10)` must return 0, the same query tenant-wide
+   (`""`) must return 0, and then 10 deterministic random 384-dim vectors, each
+   checked session-scoped and tenant-wide, must return 0.
+5. Non-vacuity control: tenant-alpha's own `Search` for that query must return
+   exactly the five memories, with entry 3 first.
+6. A final assertion that bypasses `Search` entirely: `SELECT count(*) FROM
+   tenant_tenant_beta.memories` must be 0, so the empty results come from an
+   empty table rather than from a filter that hides rows.
+
+Decisions made in this phase:
+
+- **Live compose Postgres, not testcontainers-go.** testcontainers-go is not a
+  dependency of this module and adding one needs confirmation, so the file is
+  build-tagged `integration` and uses the database Phase 4 publishes on
+  `127.0.0.1:5432`. CI runs `go test -v ./...` with no tags, so the file is
+  invisible there: no database is needed, and no existing test changed behavior.
+- **The DSN defaults to the compose string**, which is why the DoD command needs
+  no environment variable; `SYNAPSE_TEST_DB_DSN` still overrides it, matching
+  `internal/tenant` and the Phase 5 tests.
+- **An unreachable database is fatal here, not a skip.** A skipped security test
+  reports success without having checked anything — the one failure mode a
+  boundary test must not have. The build tag is the opt-in.
+- **Both stores share one pool.** That removes pool and connection identity as
+  variables, leaving the schema each store resolves as the only thing separating
+  them.
+- **Fixed slugs, per-run session id.** The slugs are the ones the task names;
+  note `tenant-alpha` maps to schema `tenant_tenant_alpha`, because `schemaName()`
+  prefixes `tenant_`. tenant-alpha therefore accumulates rows across runs, so
+  this run's five memories live under their own session id and the "exactly 5"
+  control stays exact. tenant-beta is never written to by anything, so its schema
+  stays empty and the tenant-wide assertions stay meaningful on every rerun.
+- **Leak assertions compare lengths as values** (`assert.Equal(t, 0, len(got))`)
+  rather than using `assert.Len`, so a leak reports `expected: 0, actual: 5`
+  instead of dumping five entries and five 384-dim embeddings — a security
+  assertion's failure output has to be readable.
+- **Deterministic "random" vectors.** `math/rand` seeded with a fixed constant:
+  the values are arbitrary, but a failure has to be replayable.
+- **`pgstore.go` was edited and reverted twice** — once with the wrong schema
+  name, which failed as a missing relation rather than as a leak, which is how
+  the `tenant_` prefix was confirmed — to prove the test is sensitive to a broken
+  read path. `git status` after reverting shows no production change.
+
+Verification (real output, this phase):
+
+The Phase 4 compose database was already up for this phase (`deploy-db-1`,
+pgvector/pgvector:pg16, PostgreSQL 16.15, healthy on 127.0.0.1:5432); only the
+`db` service is involved, and no v1 package was opened.
+
+```text
+$ gofmt -l internal/store/isolation_test.go        # empty
+$ go vet -tags integration ./internal/store/...
+VET OK
+
+$ go test ./internal/store/... -run TestCrossTenantIsolation -v -tags integration
+=== RUN   TestCrossTenantIsolation
+=== RUN   TestCrossTenantIsolation/control:_tenant-alpha_reaches_its_own_memories
+=== RUN   TestCrossTenantIsolation/tenant-beta_cannot_reach_tenant-alpha's_memories
+=== RUN   TestCrossTenantIsolation/tenant-beta_cannot_reach_them_tenant-wide_either
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_1
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_2
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_3
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_4
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_5
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_6
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_7
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_8
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_9
+=== RUN   TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_10
+=== RUN   TestCrossTenantIsolation/tenant-beta's_table_is_empty_at_the_storage_layer
+--- PASS: TestCrossTenantIsolation (0.21s)
+    --- PASS: TestCrossTenantIsolation/control:_tenant-alpha_reaches_its_own_memories (0.00s)
+    --- PASS: TestCrossTenantIsolation/tenant-beta_cannot_reach_tenant-alpha's_memories (0.00s)
+    --- PASS: TestCrossTenantIsolation/tenant-beta_cannot_reach_them_tenant-wide_either (0.00s)
+    --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta (0.01s)
+        --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_1 (0.00s)
+        --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_2 (0.00s)
+        --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_3 (0.00s)
+        --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_4 (0.00s)
+        --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_5 (0.00s)
+        --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_6 (0.00s)
+        --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_7 (0.00s)
+        --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_8 (0.00s)
+        --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_9 (0.00s)
+        --- PASS: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta/query_10 (0.00s)
+    --- PASS: TestCrossTenantIsolation/tenant-beta's_table_is_empty_at_the_storage_layer (0.00s)
+PASS
+ok  	synapse/internal/store	0.212s
+```
+
+The DoD also requires that the test fails when isolation is deliberately broken,
+so it was broken on purpose: `PGStore.Search` was pointed at
+`"tenant_tenant_alpha"."memories"` instead of the store's own schema, which is
+exactly the "Search queries the wrong schema" case, and reverted with
+`git checkout -- internal/store/pgstore.go` before this commit.
+
+```text
+$ git diff internal/store/pgstore.go
+-		pgColumns, s.table(), where, len(args)+1)
++		pgColumns, `"tenant_tenant_alpha"."memories"`, where, len(args)+1)
+
+$ go test ./internal/store/... -run TestCrossTenantIsolation -v -tags integration
+    isolation_test.go:177:
+        Error:   Not equal:
+                 expected: 0
+                 actual  : 5
+        Messages: same session id, same embedding as a tenant-alpha memory: tenant-beta must still find nothing
+    isolation_test.go:184:
+        Error:   Not equal:
+                 expected: 0
+                 actual  : 10
+        Messages: an empty session widens the search to the whole tenant, which is still only tenant-beta
+    # query_1 .. query_10: the same two failures, "expected: 0, actual: 5"
+    # session-scoped and "expected: 0, actual: 10" tenant-wide (topK is 10).
+--- FAIL: TestCrossTenantIsolation (0.16s)
+    --- PASS: TestCrossTenantIsolation/control:_tenant-alpha_reaches_its_own_memories (0.00s)
+    --- FAIL: TestCrossTenantIsolation/tenant-beta_cannot_reach_tenant-alpha's_memories (0.00s)
+    --- FAIL: TestCrossTenantIsolation/tenant-beta_cannot_reach_them_tenant-wide_either (0.00s)
+    --- FAIL: TestCrossTenantIsolation/random_queries_return_nothing_from_tenant-beta (0.01s)
+    --- PASS: TestCrossTenantIsolation/tenant-beta's_table_is_empty_at_the_storage_layer (0.00s)
+FAIL
+FAIL	synapse/internal/store	0.170s
+```
+
+Three things about that output are the point of the design: the control still
+passes, because tenant-alpha genuinely reads its own schema -- the break is a leak
+and not a crash, which is the realistic failure mode; every tenant-beta assertion
+trips, so the test is sensitive to exactly the isolation claim it documents; and
+the raw row count against `tenant_tenant_beta` still reports 0, because the leak is
+read-side, which is what shows the storage-layer assertion measures something the
+`Search` assertions cannot.
+
+The untagged suite -- the path CI runs -- is untouched, because the file is not
+compiled without the tag:
+
+```text
+$ go test ./... -count=1
+?   	synapse/cmd/benchmark	[no test files]
+?   	synapse/cmd/counttokens	[no test files]
+?   	synapse/cmd/mergesessions	[no test files]
+?   	synapse/cmd/plane	[no test files]
+?   	synapse/cmd/synapse	[no test files]
+ok  	synapse/internal/api	1.073s
+ok  	synapse/internal/budget	0.430s
+ok  	synapse/internal/classifier	0.021s
+ok  	synapse/internal/compiler	0.525s
+ok  	synapse/internal/config	0.018s
+ok  	synapse/internal/dedup	0.014s
+ok  	synapse/internal/embedder	4.822s
+ok  	synapse/internal/integration	5.388s
+ok  	synapse/internal/plane	0.020s
+ok  	synapse/internal/proxy	0.206s
+?   	synapse/internal/retrieval	[no test files]
+ok  	synapse/internal/scorer	0.020s
+?   	synapse/internal/session	[no test files]
+ok  	synapse/internal/store	2.489s
+ok  	synapse/internal/supersession	0.005s
+ok  	synapse/internal/tenant	0.791s
+ok  	synapse/internal/trace	0.150s
+exit=0
+
+$ env -u SYNAPSE_TEST_DB_DSN go test ./internal/store/... -v -count=1
+--- SKIP: TestPGStore (0.00s)
+--- SKIP: TestPGStoreRejectsInvalidSlug (0.00s)
+--- PASS: TestSanitize (0.00s)
+--- PASS: TestWriteWithSanitization (0.00s)
+--- PASS: TestEmbeddingRoundTrip (0.00s)
+--- PASS: TestSearchRanksBySimilarity (0.00s)
+--- PASS: TestSchemaMigrationAddsSupersededByColumn (0.80s)
+--- PASS: TestSupersededByRoundTrip (0.00s)
+--- PASS: TestMarkSuperseded (0.00s)
+--- PASS: TestMarkSupersededNonexistentID (0.00s)
+--- PASS: TestMarkSupersededEmptyArgs (0.00s)
+--- PASS: TestSyncStatusMigrationAndRoundTrip (0.54s)
+ok  	synapse/internal/store	1.356s
+
+$ go build ./... && go vet ./internal/store/...
+BUILD OK (untagged)
+VET OK (untagged)
+
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+      go test -tags integration ./internal/store/... -count=1
+ok  	synapse/internal/store	1.836s      # Phase 5's tests and this one together
+```
+
+The rows this phase wrote are left in place, exactly as Phase 5 left its own
+schemas: this run's assertions are scoped to its own session id, and tenant-beta's
+schema is empty, so the test stays green on reruns. Checked against the live
+database:
+
+```text
+$ docker exec deploy-db-1 psql -U synapse -d synapse -tAc \
+    "select nspname from pg_namespace where nspname in ('tenant_tenant_alpha','tenant_tenant_beta');"
+tenant_tenant_alpha
+tenant_tenant_beta
+```
+
+Next phase: not started. This phase added no production code; the rest of the v2
+surface (sync, conflict, ledger, mcp, metering, billing) is untouched.
+
+
