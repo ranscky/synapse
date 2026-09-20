@@ -38,6 +38,13 @@ func NewProvisioner(cfg *plane.PlaneConfig, store *Store) *Provisioner {
 // response body -- nowhere else. Nothing in this path logs: neither the key, the
 // hash, the JWT, nor the signing secret.
 //
+// When the request names an agent (and optionally a team), both become claims in
+// the returned token. That is what gives the plane a verified identity to
+// evaluate memory visibility against, rather than a request body's word for who
+// is asking; the claims are signed here because this is the only place that
+// holds the signing key. A request that names no agent mints a tenant-level
+// token, whose reader sees org-scoped memories only.
+//
 // A duplicate slug surfaces as plane.ErrTenantExists; the translation happens
 // here so the tenant package's sentinel never has to be imported by the HTTP
 // layer. If token signing fails after the row is committed the tenant exists
@@ -76,7 +83,14 @@ func (p *Provisioner) Provision(ctx context.Context, req plane.ProvisionRequest)
 		return plane.ProvisionResult{}, err
 	}
 
-	token, err := IssueToken(p.cfg, tenantID, req.Slug, req.Plan, tier)
+	token, err := IssueToken(p.cfg, TokenIdentity{
+		TenantID: tenantID,
+		Slug:     req.Slug,
+		Plan:     req.Plan,
+		Tier:     tier,
+		AgentID:  req.AgentID,
+		TeamID:   req.TeamID,
+	})
 	if err != nil {
 		return plane.ProvisionResult{}, err
 	}

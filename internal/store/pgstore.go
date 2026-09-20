@@ -152,14 +152,23 @@ func (s *PGStore) Write(ctx context.Context, entry MemoryEntry) error {
 		agentID = defaultAgentID
 	}
 
+	// The scope the row is stored under, and the team id that goes with it.
+	// Both are normalized here rather than at each call site, so a pushed
+	// memory and a locally written one cannot end up with different scopes for
+	// the same input -- see visibilityForWrite.
+	visibility, teamID, err := visibilityForWrite(entry.ID, entry)
+	if err != nil {
+		return err
+	}
+
 	query := `INSERT INTO ` + s.table() + ` (
-	id, session_id, content, memory_type, importance, sync_status, superseded_by, embedding, created_at, agent_id
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	id, session_id, content, memory_type, importance, sync_status, superseded_by, embedding, created_at, agent_id, visibility, team_id
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (id) DO NOTHING`
 
-	_, err := s.pool.Exec(ctx, query,
+	_, err = s.pool.Exec(ctx, query,
 		entry.ID, entry.SessionID, content, entry.MemoryType, entry.Importance,
-		syncStatus, supersededBy, embedding, createdAt, agentID,
+		syncStatus, supersededBy, embedding, createdAt, agentID, visibility, teamID,
 	)
 	if err != nil {
 		return fmt.Errorf("store: insert memory: %w", err)
@@ -168,8 +177,20 @@ ON CONFLICT (id) DO NOTHING`
 	return nil
 }
 
-// Search returns the topK nearest live memories to queryEmbedding, ordered by
-// pgvector L2 distance (<->), which is what the HNSW index is built for.
+// Search returns the topK nearest live memories to queryEmbedding that the
+// caller is allowed to see, ordered by pgvector L2 distance (<->), which is what
+// the HNSW index is built for.
+//
+// Visibility is enforced in SQL by visibilityWhere, and it is the only
+// authorization rule on this path. agentID and teamID are the caller's own
+// verified identity -- on the plane they come from the signed token, never from
+// a request body -- and currentSessionID is the session the caller is working
+// in. Together they decide which rows exist as far as this call is concerned:
+// org-scoped memories from any agent, team-scoped memories from the caller's own
+// team, and only the caller's own private memories from the caller's own
+// session. A memory outside that set is not filtered out of the result; it is
+// never selected, so it cannot leak through a fallback, a limit, or a caller
+// that forgets to filter.
 //
 // Two deliberate differences from the SQLite backend's Search, documented
 // rather than silent:
@@ -177,32 +198,31 @@ ON CONFLICT (id) DO NOTHING`
 //   - Superseded memories are excluded in SQL. The v1 callers drop them anyway
 //     (proxy, api, and supersession all skip SupersededBy != ""), so this is the
 //     same result set with less data crossing the wire.
-//   - A non-empty sessionID scopes the search to that session; an empty one
-//     searches the whole tenant. The SQLite backend always scopes to a session,
-//     but a tenant-wide search is the point of having a shared plane.
+//   - An org-scoped memory is reachable regardless of session, which is the
+//     point of a shared plane: this is the one read that can widen past one
+//     session, and the scope predicate is what keeps that widening safe. The
+//     SQLite backend scopes every search to one session and has no scopes at
+//     all, because one file is one agent.
 //
-// An empty query vector falls back to recency ordering: <-> cannot compare
-// against nothing, and the retrieval pipeline relies on that fallback whenever
-// there is no embedder or no query text. A wrong-width vector is a caller bug
-// and is reported instead of being guessed at.
-func (s *PGStore) Search(ctx context.Context, queryEmbedding []float32, sessionID string, topK int) ([]MemoryEntry, error) {
+// An empty query vector falls back to recency ordering -- which applies the very
+// same predicate, so the fallback is not a way around visibility -- because <->
+// cannot compare against nothing: the retrieval pipeline relies on that fallback
+// whenever there is no embedder or no query text. A wrong-width vector is a
+// caller bug and is reported instead of being guessed at.
+func (s *PGStore) Search(ctx context.Context, queryEmbedding []float32, agentID, teamID, currentSessionID string, topK int) ([]MemoryEntry, error) {
 	if topK <= 0 {
 		topK = defaultSearchTopK
 	}
 
 	if len(queryEmbedding) == 0 {
-		return s.recent(ctx, sessionID, topK)
+		return s.recent(ctx, agentID, teamID, currentSessionID, topK)
 	}
 	if len(queryEmbedding) != EmbeddingDimensions {
 		return nil, fmt.Errorf("store: query embedding has %d dimensions, want %d", len(queryEmbedding), EmbeddingDimensions)
 	}
 
 	args := []any{pgvector.NewVector(queryEmbedding)}
-	where := `superseded_by IS NULL`
-	if sessionID != "" {
-		where += fmt.Sprintf(` AND session_id = $%d`, len(args)+1)
-		args = append(args, sessionID)
-	}
+	where := `superseded_by IS NULL AND ` + visibilityWhere(&args, agentID, teamID, currentSessionID)
 
 	query := fmt.Sprintf(`SELECT %s FROM %s WHERE %s ORDER BY embedding <-> $1 LIMIT $%d`,
 		pgColumns, s.table(), where, len(args)+1)
@@ -216,8 +236,17 @@ func (s *PGStore) Search(ctx context.Context, queryEmbedding []float32, sessionI
 //
 // The session scope is unconditional here (matching the SQLite backend and the
 // documented contract): a caller asking for one session's recent memories must
-// not receive another session's. Search is the one read that can be widened to
-// the whole tenant, and only when it is explicitly asked to.
+// not receive another session's.
+//
+// It deliberately applies no visibility predicate, and that is a real gap
+// rather than a decision: Search is the only read that enforces scope. It is not
+// reachable as a leak today because nothing calls GetRecent on a PGStore -- the
+// plane's own HTTP surface (plane.MemorySearcher) exposes Search alone, and the
+// v1 endpoints that do call GetRecent (api's GET /api/memories, the sync queue)
+// are wired to the local SQLite store. Narrowing it needs two more parameters
+// and changes two v1 interfaces, which is why it is recorded here and in
+// PROGRESS.md as the follow-up this phase did not do rather than quietly left
+// out.
 func (s *PGStore) GetRecent(ctx context.Context, sessionID string, limit int) ([]MemoryEntry, error) {
 	if limit <= 0 {
 		limit = defaultRecentLimit
@@ -229,25 +258,6 @@ ORDER BY created_at DESC
 LIMIT $2`
 
 	return s.queryEntries(ctx, query, sessionID, limit)
-}
-
-// recent is the recency-ordered read behind Search's no-embedding fallback: the
-// same ordering GetRecent uses, but with the session filter only applied when a
-// session was named, so a tenant-wide search stays tenant-wide on the fallback
-// path too.
-func (s *PGStore) recent(ctx context.Context, sessionID string, limit int) ([]MemoryEntry, error) {
-	query := `SELECT ` + pgColumns + ` FROM ` + s.table() + ` WHERE superseded_by IS NULL`
-	args := []any{}
-
-	if sessionID != "" {
-		args = append(args, sessionID)
-		query += fmt.Sprintf(` AND session_id = $%d`, len(args))
-	}
-
-	query += fmt.Sprintf(` ORDER BY created_at DESC LIMIT $%d`, len(args)+1)
-	args = append(args, limit)
-
-	return s.queryEntries(ctx, query, args...)
 }
 
 // MarkSuperseded records that oldID has been superseded by newID.

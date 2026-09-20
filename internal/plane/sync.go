@@ -174,8 +174,14 @@ func (s *Server) handleSyncMemories(w http.ResponseWriter, r *http.Request) {
 // string key that happens to match.
 type ctxKey int
 
-// tenantSlugKey is where a verified token's tenant slug is parked.
-const tenantSlugKey ctxKey = iota
+// Context keys for the verified claims this package's endpoints read back out,
+// one per claim. They are values of an unexported int type (declared just above)
+// so no other package can collide with them by reusing a string key.
+const (
+	tenantSlugKey ctxKey = iota
+	agentIDKey
+	teamIDKey
+)
 
 // WithTenantSlug returns a copy of ctx carrying a verified tenant slug.
 //
@@ -195,4 +201,42 @@ func TenantSlugFromCtx(ctx context.Context) string {
 	slug, _ := ctx.Value(tenantSlugKey).(string)
 
 	return slug
+}
+
+// WithAgentID returns a copy of ctx carrying the verified agent id.
+//
+// Same arrangement as WithTenantSlug: internal/tenant's middleware calls this
+// with a claim it has already verified, because its own keys are unexported and
+// this package cannot read them.
+//
+// This value is the caller's own identity as far as memory visibility is
+// concerned -- it is what decides whether a private memory is in the result set
+// -- so it may only ever be set from a verified claim. An empty agent id is the
+// fail-closed default and means an org-only reader, never "every agent".
+func WithAgentID(ctx context.Context, agentID string) context.Context {
+	return context.WithValue(ctx, agentIDKey, agentID)
+}
+
+// AgentIDFromCtx returns the verified agent id attached by WithAgentID, or ""
+// when the token named no agent. Empty means org-only: a caller without a
+// verified agent identity cannot be shown any agent's private memories.
+func AgentIDFromCtx(ctx context.Context) string {
+	agentID, _ := ctx.Value(agentIDKey).(string)
+
+	return agentID
+}
+
+// WithTeamID returns a copy of ctx carrying the verified team id, with the same
+// verified-claim-only rule as WithAgentID. An empty team id is fail-closed: it
+// matches no team-scoped memory.
+func WithTeamID(ctx context.Context, teamID string) context.Context {
+	return context.WithValue(ctx, teamIDKey, teamID)
+}
+
+// TeamIDFromCtx returns the verified team id attached by WithTeamID, or "" when
+// the token named none.
+func TeamIDFromCtx(ctx context.Context) string {
+	teamID, _ := ctx.Value(teamIDKey).(string)
+
+	return teamID
 }

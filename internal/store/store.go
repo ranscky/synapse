@@ -19,16 +19,18 @@ import (
 
 // MemoryEntry represents a stored memory entry
 type MemoryEntry struct {
-	ID         string    `json:"id"`                    // UUID
-	SessionID  string    `json:"session_id"`            // Session identifier
-	Content    string    `json:"content"`               // Memory content (max 2048 bytes)
-	MemoryType string    `json:"memory_type"`           // "decision"|"fact"|"error"|"preference"|"context"
-	Timestamp  time.Time `json:"timestamp"`             // Creation timestamp
-	Importance float64   `json:"importance,omitempty"`  // Importance score
-	Embedding  []float32 `json:"embedding,omitempty"`   // 384-dim embedding vector
-	SupersededBy string    `json:"superseded_by,omitempty"`  // ID of the memory that superseded this one, if any. Empty means still active/current. Populated by a later write, never set at the same time a memory is first created.
-	SyncStatus   string    `json:"sync_status,omitempty"`    // Where this memory currently lives, relative to a control plane: "local_only" | "sync_pending" | "synced". A memory written by the standalone v1 binary has never left the machine, so its zero value is normalized to "local_only" on write; a memory written through a tenant's Postgres schema is already on the plane, so its zero value is normalized to "synced". See the SyncStatus* constants.
-	AgentID      string    `json:"agent_id,omitempty"`       // The agent that wrote this memory: the node that pushed it to a control plane, or this node on a locally written row. Populated on every read that can carry it -- a candidate pulled from a plane carries the agent_id of the edge that pushed it -- and left empty by the local SQLite backend, whose table has no agent column (a standalone node IS the agent). Never an isolation key: the tenant is always the verified token's schema, never a value from a row.
+	ID           string    `json:"id"`                      // UUID
+	SessionID    string    `json:"session_id"`              // Session identifier
+	Content      string    `json:"content"`                 // Memory content (max 2048 bytes)
+	MemoryType   string    `json:"memory_type"`             // "decision"|"fact"|"error"|"preference"|"context"
+	Timestamp    time.Time `json:"timestamp"`               // Creation timestamp
+	Importance   float64   `json:"importance,omitempty"`    // Importance score
+	Embedding    []float32 `json:"embedding,omitempty"`     // 384-dim embedding vector
+	SupersededBy string    `json:"superseded_by,omitempty"` // ID of the memory that superseded this one, if any. Empty means still active/current. Populated by a later write, never set at the same time a memory is first created.
+	SyncStatus   string    `json:"sync_status,omitempty"`   // Where this memory currently lives, relative to a control plane: "local_only" | "sync_pending" | "synced". A memory written by the standalone v1 binary has never left the machine, so its zero value is normalized to "local_only" on write; a memory written through a tenant's Postgres schema is already on the plane, so its zero value is normalized to "synced". See the SyncStatus* constants.
+	AgentID      string    `json:"agent_id,omitempty"`      // The agent that wrote this memory: the node that pushed it to a control plane, or this node on a locally written row. Populated on every read that can carry it -- a candidate pulled from a plane carries the agent_id of the edge that pushed it -- and left empty by the local SQLite backend, whose table has no agent column (a standalone node IS the agent). Never an isolation key: the tenant is always the verified token's schema, never a value from a row.
+	Visibility   string    `json:"visibility,omitempty"`    // Who may read this memory: "private" | "team" | "org" (see the Visibility* constants). Enforced by the Postgres backend's Search; the local SQLite backend has no visibility concept at all, because one file is one process is one agent, so a local row is private by construction and this field is inert there. Blank means the column's own default, "org".
+	TeamID       string    `json:"team_id,omitempty"`       // The team a "team"-scoped memory belongs to, matched against the reader's own team id. Left empty when the memory is org- or private-scoped. Never an isolation key: the tenant is still the verified token's schema, and a team id can only ever narrow a search inside it.
 }
 
 // embeddingToBytes serializes a []float32 embedding into a byte slice for
@@ -224,7 +226,17 @@ func (s *Store) Write(ctx context.Context, entry MemoryEntry) error {
 // a few hundred entries), but doesn't scale the way a real vector index
 // would for very large stores. Noted as a future upgrade, not pretended
 // away.
-func (s *Store) Search(ctx context.Context, queryEmbedding []float32, sessionID string, topK int) ([]MemoryEntry, error) {
+//
+// agentID, teamID, and currentSessionID exist so this method satisfies the same
+// contract as the Postgres backend's Search, and are deliberately ignored here:
+// a local SQLite file belongs to exactly one process, one agent, and one
+// operator, so there is no tenant, no team, and no other agent whose memories
+// could be reached in the first place -- every row in it is already private to
+// the only reader it has. Enforcing visibility locally would mean inventing a
+// scope the schema does not store (the memories table has no visibility or
+// team_id column), so the honest implementation is to accept the parameters and
+// not pretend they do something.
+func (s *Store) Search(ctx context.Context, queryEmbedding []float32, agentID, teamID, sessionID string, topK int) ([]MemoryEntry, error) {
 	if topK <= 0 {
 		topK = 20 // Default to 20 if not specified
 	}

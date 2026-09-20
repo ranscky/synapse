@@ -43,10 +43,17 @@ const (
 // embedding is the same 384-float vector the local store would search with, and
 // the agent names itself exactly as it does on a push, so a plane can attribute
 // a query to the node that made it.
+//
+// agent_id and team_id here are attribution, not authority: the plane decides
+// what this node may read from the claims in the signed token it presents, never
+// from this body. They are sent because the documented protocol carries them and
+// because a plane may want to corroborate the two -- but a node whose token says
+// one agent and whose body says another changes nothing about what it can read.
 type searchRequest struct {
 	QueryEmbedding []float32 `json:"query_embedding"`
 	SessionID      string    `json:"session_id"`
 	AgentID        string    `json:"agent_id"`
+	TeamID         string    `json:"team_id"`
 	TopK           int       `json:"top_k"`
 }
 
@@ -91,6 +98,7 @@ func (s *Syncer) PullCandidates(ctx context.Context, queryEmbedding []float32, s
 		QueryEmbedding: queryEmbedding,
 		SessionID:      sessionID,
 		AgentID:        s.cfg.AgentID,
+		TeamID:         s.cfg.TeamID,
 		TopK:           topK,
 	})
 	if err != nil {

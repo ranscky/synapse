@@ -16,8 +16,12 @@ import (
 // SQLite backend scans an empty string for the same state. agent_id is included
 // because a search result has to name the agent that pushed the memory -- that
 // is what an edge node scores and displays, and it is why the tenant column
-// exists at all.
-const pgColumns = `id::text, session_id, content, memory_type, created_at, importance, sync_status, coalesce(superseded_by::text, ''), embedding, agent_id`
+// exists at all. visibility and team_id are included for the same reason the
+// caller's own scope is bound into the query: a result has to say which scope it
+// came from, or a caller has no way to tell an org-wide memory from its own
+// private one, and team_id is coalesced because it is NULL whenever a memory is
+// not team-scoped.
+const pgColumns = `id::text, session_id, content, memory_type, created_at, importance, sync_status, coalesce(superseded_by::text, ''), embedding, agent_id, visibility, coalesce(team_id, '')`
 
 // queryEntries runs one read statement and scans every row, so both read paths
 // share a single error-wrapping and iteration story.
@@ -51,7 +55,9 @@ func (s *PGStore) queryEntries(ctx context.Context, query string, args ...any) (
 // agent_id is NOT NULL in the schema, so it always scans into a string; the
 // only reason it is a plain string rather than a pointer is that the schema
 // guarantees the default ('default') rather than NULL for a row that never
-// named an agent.
+// named an agent. visibility is NOT NULL for the same reason (its default is
+// 'org'), and team_id is coalesced to the empty string in the projection for
+// every row that is not team-scoped, so three more plain strings are enough.
 func scanEntry(rows pgx.Rows) (MemoryEntry, error) {
 	var (
 		entry      MemoryEntry
@@ -62,7 +68,7 @@ func scanEntry(rows pgx.Rows) (MemoryEntry, error) {
 	err := rows.Scan(
 		&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType,
 		&entry.Timestamp, &entry.Importance, &entry.SyncStatus, &superseded, &embedding,
-		&entry.AgentID,
+		&entry.AgentID, &entry.Visibility, &entry.TeamID,
 	)
 	if err != nil {
 		return MemoryEntry{}, fmt.Errorf("store: scan memory entry: %w", err)
@@ -74,4 +80,23 @@ func scanEntry(rows pgx.Rows) (MemoryEntry, error) {
 	}
 
 	return entry, nil
+}
+
+// recent is the recency-ordered read behind Search's no-embedding fallback.
+//
+// It applies the same visibility predicate Search does, and that is the whole
+// point of it being a separate method rather than a branch inline in Search: the
+// fallback fires exactly when a caller has nothing to embed (no embedder
+// configured, or an empty query), which is a state an attacker can arrange on
+// purpose. A predicate applied only to the vector path would make "send no
+// embedding" a way to read every private memory in the tenant.
+func (s *PGStore) recent(ctx context.Context, agentID, teamID, currentSessionID string, limit int) ([]MemoryEntry, error) {
+	args := []any{}
+	where := `superseded_by IS NULL AND ` + visibilityWhere(&args, agentID, teamID, currentSessionID)
+
+	query := fmt.Sprintf(`SELECT %s FROM %s WHERE %s ORDER BY created_at DESC LIMIT $%d`,
+		pgColumns, s.table(), where, len(args)+1)
+	args = append(args, limit)
+
+	return s.queryEntries(ctx, query, args...)
 }

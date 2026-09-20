@@ -1912,3 +1912,243 @@ populates its plane without a hand-pushed batch — the piece Phase 8 expected t
 phase to be.
 
 
+## Phase 10 — Global Brain visibility scopes (complete)
+
+Commit `feat: Phase 10 - Global Brain visibility scopes`
+
+A shared plane is only useful if a node can read the org's memories *and* cannot
+read another node's private ones. Before this phase every row in a tenant schema
+was reachable by every reader in it: `PGStore.Search` filtered on session and
+nothing else, and `PGStore.Write` never named the `visibility` or `team_id`
+columns, so every row took the schema's defaults (`'org'`, `NULL`). This phase
+makes scope real on both halves of the backend and gives the plane a verified
+identity to evaluate it against.
+
+The predicate, in one place (`internal/store/pgvisibility.go`):
+
+```sql
+WHERE superseded_by IS NULL AND (
+  visibility = 'org'
+  OR (visibility = 'team'    AND team_id  = $teamID)
+  OR (visibility = 'private' AND agent_id = $agentID AND session_id = $sessionID)
+)
+```
+
+Every caller value is a bound parameter; `fmt` is used only to number
+placeholders. The predicate is applied to *both* reads Search can make — the
+HNSW vector path and the no-embedding recency fallback — because "send no
+embedding" is a state an attacker can arrange, and a fallback without the
+predicate would be a way around it.
+
+New files:
+
+| File | Contents |
+| --- | --- |
+| `internal/store/pgvisibility.go` | `VisibilityPrivate`/`Team`/`Org`, `visibilityWhere` (the read predicate), `visibilityForWrite` (the write normalization) |
+| `internal/store/visibility_test.go` | `TestVisibilityScopes`, `TestVisibilityTeamScopes`, `TestVisibilityWriteNormalization` (+ `idsOf`) |
+| `internal/store/pgtest_test.go` | the Postgres fixtures every store test shares (`testEnvDatabaseDSN`, `testPGPool`, `testPGStore`, `embeddingAt`, `testEntry`, `testReaderAgent`) |
+| `internal/plane/search_scope_test.go` | `TestSearchMemoriesTakesTheScopeFromTheToken`, `TestSearchMemoriesIgnoresTheBodyScope`, `TestSearchMemoriesRefusesABodyThatNamesAnotherAgent` |
+| `internal/plane/provision_scope_test.go` | `TestCreateTenantMintsAnAgentScopedToken`, `TestCreateTenantWithoutAnAgentMintsATenantToken`, `TestCreateTenantRejectsAMalformedIdentity` (+ `claimsFromToken`) |
+| `internal/plane/tenants.go` | the provisioning endpoint, split out of `handlers.go` (`createTenantRequest`/`Response`, `handleCreateTenant`, `slugPattern`/`planPattern`/`identityPattern`, the endpoint's body limit and defaults) |
+
+Changed:
+
+- `internal/store/store.go` — `MemoryEntry.Visibility` and `.TeamID` (additive,
+  `omitempty`, inert on SQLite: one file is one agent, so a local row is already
+  private to its only reader). `(*Store).Search` takes the three scope
+  parameters and ignores them, with the reason written down.
+- `internal/store/pgstore.go` — `PGStore.Search(ctx, embedding, agentID, teamID,
+  currentSessionID, topK)`; `PGStore.Write` inserts `visibility` (blank → the
+  column default) and `team_id` (blank → NULL). The old unconditional session
+  filter is gone: `currentSessionID` now gates *private* rows only.
+- `internal/store/pgread.go` — `pgColumns` carries `visibility` and
+  `coalesce(team_id, '')`; `recent` moved here and applies the same predicate.
+- `internal/store/factory.go` — `Backend.Search` signature.
+- `internal/retrieval/retrieval.go` — `Store.Search`; new exported `Scope`
+  (`AgentID`, `TeamID`, `SessionID`) instead of a bare `sessionID`, because seven
+  parameters with three adjacent strings is a swapped-argument hazard.
+- `internal/proxy/proxy.go`, `internal/api/api.go` — build the scope from their
+  own config (`cfg.AgentID`, `cfg.TeamID`) and the request's session. The edge's
+  identity is configuration, never a request header or body.
+- `internal/sync/pull.go` — `searchRequest` carries `team_id` alongside
+  `agent_id`; both are attribution on the wire, never authority.
+- `internal/plane/search.go` — `MemorySearcher.Search` takes the scope; the
+  handler reads `agentID`/`teamID` from `AgentIDFromCtx`/`TeamIDFromCtx` (the
+  verified token) and never from `req.AgentID`. The body's `agent_id` stays
+  required and stays in the log line as attribution; a body that names a
+  *different* agent than an agent-scoped token is refused with 400
+  `invalid_agent`, so a node configured with the wrong `agent-id` finds out
+  instead of quietly reading another scope.
+- `internal/tenant/memorywriter.go` — passes the scope through to the store.
+- `internal/tenant/token.go` — `IssueToken` now takes a `TokenIdentity` struct
+  (seven positional strings, two of them a scope, was a mix-up waiting to
+  happen); `claims` gains optional `agent_id`/`team_id`, omitted from the payload
+  when empty so a tenant-level token is byte-identical to every token this plane
+  issued before.
+- `internal/tenant/auth.go` — `AgentIDFromCtx`/`TeamIDFromCtx` + ctx keys;
+  `withClaims` publishes both through new `plane.WithAgentID`/`WithTeamID`.
+- `internal/plane/sync.go` — `WithAgentID`/`AgentIDFromCtx`,
+  `WithTeamID`/`TeamIDFromCtx`, documented as verified-claim-only.
+- `internal/plane/handlers.go` — `createTenantRequest` accepts optional
+  `agent_id`/`team_id`, validated against `^[A-Za-z0-9_.-]{1,64}$`, and passes
+  them to the provisioner. This is what makes an agent-scoped token reachable in
+  production rather than only in tests. The endpoint itself then moved to
+  `internal/plane/tenants.go`: those additions took `handlers.go` to 313 lines,
+  past the 300-line ceiling, so it was split the same way `sync.go` and
+  `search.go` were — one endpoint per file. `handlers.go` is 179 lines and
+  `tenants.go` 156.
+- `internal/plane/provision.go`, `internal/tenant/provision.go` — carry
+  `AgentID`/`TeamID` from the request into the signed token.
+- Test doubles and assertions across `internal/store`, `internal/retrieval`,
+  `internal/proxy`, `internal/tenant`, and `internal/plane` moved to the new
+  signatures: `fakeStore`/`mockMemoryStore`/`fakeSearcher` record the scope (so a
+  pipeline that dropped it would fail a test), `retrieval.Candidates` gained
+  `TestCandidatesPassesTheScopeToTheStore` for the deliberately-blank case,
+  `token_test.go` pins both halves of the claim contract (present when set,
+  absent when not), and `pgstore_test.go`'s fixtures moved to `pgtest_test.go`.
+
+### What the write path guarantees
+
+`visibilityForWrite` is where a stored scope can be made unreachable by mistake,
+so every normalization is fail-closed:
+
+- a blank visibility is the schema's own default, `'org'`;
+- a `'team'`-scoped memory with no team id is **narrowed to `'private'`** and
+  logged — stored as written it would put NULL in `team_id`, which no reader can
+  ever match, so the memory would be written successfully and be unreachable
+  forever;
+- a team id is stored as NULL rather than `''`, so one unteamed agent's row can
+  never match another unteamed agent's query;
+- any other visibility value is an error, not a stored value: the column has no
+  CHECK constraint, and a row the predicate does not recognise is a row nobody
+  can read.
+
+### Behavior change worth knowing
+
+**A session no longer bounds an org-scoped search.** Phase 5 documented
+`Search`'s session filter as a deliberate difference from SQLite; the scope model
+replaces it, because an org-scoped memory reaching only the session it was
+written in is not a shared brain. `sessionID` now gates `private` and nothing
+else — an agent reaches the org's memories from any session, and its *own*
+private memories only from the session that wrote them. Four `TestPGStore`
+subtests whose premise was session scoping were rewritten to assert the new
+contract, and `internal/store/isolation_test.go`'s fixture now writes team-scoped
+memories under a per-run team id (`tenant-alpha` is a fixed slug that accumulates
+rows across runs, so an org-scoped fixture can no longer produce an exact count;
+a team id unique to the run still does).
+
+### Limitations this phase deliberately did not close
+
+- **`PGStore.GetRecent` applies no visibility predicate.** It is the one read
+  that still returns a whole session regardless of scope. Not reachable as a leak
+  today: the plane's HTTP surface exposes Search alone, and the v1 endpoints that
+  call `GetRecent` (`GET /api/memories`, the sync queue) are wired to the local
+  SQLite store — `NewStoreFromConfig`, which can return a PGStore, still has no
+  production caller. Closing it needs two more parameters and two more v1
+  interfaces, so it is recorded here rather than quietly left out.
+- **The edge does not stamp `default-visibility` onto what it writes.**
+  `config.DefaultVisibility` is defined and documented but read by nothing, so a
+  locally written memory reaches the plane with a blank scope and is stored
+  `'org'`. The plane is scope-aware end to end now; having the edge *choose* the
+  scope is additive work.
+- **No per-agent token reissue.** An existing tenant's token cannot be upgraded
+  to an agent-scoped one without provisioning again; there is still no
+  reissue/mint endpoint. A tenant-level token remains valid and remains an
+  org-only reader.
+- **Still no `sync_pending` marking** (unchanged from Phases 8-9): the flusher
+  finds an empty queue on a fresh node.
+- `openapi.yaml` documents only the v1 endpoints; the v2 plane routes
+  (`/v2/tenants`, `/v2/memories/search`) have never been in it, and Phase 10 did
+  not add them.
+
+### Verification (real output, this phase)
+
+```text
+$ gofmt -l <every file touched>   # each already-dirty v1 file at HEAD excepted
+(no newly-dirty file: the pre-existing unformatted v1 files were left alone,
+ confirmed by formatting each HEAD revision and comparing)
+
+$ go vet ./...
+(no output)
+
+$ go build ./...
+BUILD OK
+$ CGO_ENABLED=0 go build -o /dev/null ./cmd/plane
+CGO_ENABLED=0 PLANE BUILD OK
+
+$ go test ./... -count=1                     # no database: PG tests skip
+ok  synapse/internal/api 1.107s       ok  synapse/internal/plane 0.056s
+ok  synapse/internal/budget 0.386s    ok  synapse/internal/proxy 0.557s
+ok  synapse/internal/classifier ...   ok  synapse/internal/retrieval ...
+ok  synapse/internal/compiler ...     ok  synapse/internal/scorer ...
+ok  synapse/internal/config ...       ok  synapse/internal/store 3.906s
+ok  synapse/internal/dedup ...        ok  synapse/internal/supersession ...
+ok  synapse/internal/embedder ...     ok  synapse/internal/sync 3.811s
+ok  synapse/internal/integration ...  ok  synapse/internal/tenant 0.796s
+                                      ok  synapse/internal/trace 0.194s
+
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+    go test ./internal/store/... -run TestVisibility -v
+=== RUN   TestVisibilityScopes
+=== RUN   TestVisibilityScopes/control:_the_writer_reads_all_of_its_own_memories
+=== RUN   TestVisibilityScopes/agent_b_sees_agent_a's_org_memories_and_none_of_its_private_ones
+=== RUN   TestVisibilityScopes/agent_b_in_agent_a's_own_session_still_sees_only_the_org_memories
+=== RUN   TestVisibilityScopes/the_no-embedding_fallback_cannot_reach_private_memories
+=== RUN   TestVisibilityScopes/a_blank_agent_id_is_an_org-only_reader
+--- PASS: TestVisibilityScopes (0.33s)
+    --- PASS: .../control:_the_writer_reads_all_of_its_own_memories (0.00s)
+    --- PASS: .../agent_b_sees_agent_a's_org_memories... (0.00s)
+    --- PASS: .../agent_b_in_agent_a's_own_session... (0.00s)
+    --- PASS: .../the_no-embedding_fallback... (0.00s)
+    --- PASS: .../a_blank_agent_id_is_an_org-only_reader (0.00s)
+=== RUN   TestVisibilityTeamScopes
+=== RUN   TestVisibilityTeamScopes/a_teammate_reads_the_team's_memories
+=== RUN   TestVisibilityTeamScopes/a_team-scoped_memory_round-trips_its_team_id
+=== RUN   TestVisibilityTeamScopes/a_reader_with_no_team_id_reaches_no_team-scoped_memory
+=== RUN   TestVisibilityTeamScopes/another_team_reaches_no_team-scoped_memory
+--- PASS: TestVisibilityTeamScopes (0.22s)
+    --- PASS: .../a_teammate_reads_the_team's_memories (0.00s)
+    --- PASS: .../a_team-scoped_memory_round-trips_its_team_id (0.00s)
+    --- PASS: .../a_reader_with_no_team_id_reaches_no_team-scoped_memory (0.00s)
+    --- PASS: .../another_team_reaches_no_team-scoped_memory (0.00s)
+=== RUN   TestVisibilityWriteNormalization
+=== RUN   TestVisibilityWriteNormalization/a_blank_visibility_is_stored_as_the_column's_default
+=== RUN   TestVisibilityWriteNormalization/an_unknown_visibility_is_refused_rather_than_stored
+=== RUN   TestVisibilityWriteNormalization/a_team_scope_with_no_team_id_is_narrowed_to_private
+2026/09/20 14:15:40 WARN Team-scoped memory without a team id stored as private
+    memory_id=7a2a15ef-db99-42ca-aca6-0b42f5ae8d13 visibility=team
+--- PASS: TestVisibilityWriteNormalization (0.40s)
+    --- PASS: .../a_blank_visibility... (0.01s)
+    --- PASS: .../an_unknown_visibility... (0.00s)
+    --- PASS: .../a_team_scope_with_no_team_id... (0.21s)
+PASS
+ok  synapse/internal/store 0.956s
+
+$ SYNAPSE_TEST_DB_DSN='...' go test ./internal/store/... ./internal/tenant/... ./internal/plane/... -count=1
+ok  synapse/internal/store 6.218s
+ok  synapse/internal/tenant 1.571s
+ok  synapse/internal/plane 0.078s
+
+$ SYNAPSE_TEST_DB_DSN='...' go test ./internal/store/... -run TestCrossTenantIsolation -tags integration
+ok  synapse/internal/store 0.148s
+
+# The isolation test was re-verified to fail when isolation is broken, since
+# Phase 10 changed its fixture: with PGStore.Search temporarily reading
+# tenant_tenant_alpha's table for every store, the control subtest PASSES and
+# every tenant-beta assertion FAILS (expected 0, got the leaked rows) -- the ten
+# random queries included. The temporary patch was reverted, and `git diff` on
+# pgmigrate.go/pgstore.go confirms only the intended changes remain.
+```
+
+Phase 10's answer to "why this memory?": the scope a memory was surfaced under is
+now part of the result, not just of the query — each `MemoryEntry` carries
+`visibility` and `team_id`, so a caller can see whether what it got was org-wide,
+its team's, or its own, and a search can only ever return what the caller's
+*verified* identity is allowed to read. Surfacing that scope alongside the S/R/I/T
+score breakdown and `trace_id` (the MCP work) is what makes the plane auditable
+rather than merely opaque.
+
+Next phase: mark memories `sync_pending` on the write path (still the piece
+Phase 8 expected Phase 9 to be), or make the edge stamp `default-visibility` onto
+what it writes — both are now the missing halves of a pipeline whose ends exist.
+

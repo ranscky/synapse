@@ -30,7 +30,7 @@ func (m *mockMemoryStore) GetRecent(ctx context.Context, sessionID string, limit
 	return []store.MemoryEntry{}, nil
 }
 
-func (m *mockMemoryStore) Search(ctx context.Context, queryEmbedding []float32, sessionID string, topK int) ([]store.MemoryEntry, error) {
+func (m *mockMemoryStore) Search(ctx context.Context, queryEmbedding []float32, agentID, teamID, sessionID string, topK int) ([]store.MemoryEntry, error) {
 	return []store.MemoryEntry{}, nil
 }
 

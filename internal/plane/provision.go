@@ -22,6 +22,15 @@ type ProvisionRequest struct {
 	Plan string
 	// ComplianceTier is the tenant's compliance tier.
 	ComplianceTier string
+	// AgentID optionally names the agent the returned token speaks for. It
+	// becomes the token's agent_id claim, which is the identity a private
+	// memory's visibility is checked against. Empty mints a tenant-level token:
+	// org-scoped memories only.
+	AgentID string
+	// TeamID optionally names that agent's team, and becomes the token's
+	// team_id claim, matched against a team-scoped memory's team_id. Only
+	// meaningful alongside AgentID.
+	TeamID string
 }
 
 // ProvisionResult is the material a freshly provisioned tenant needs.

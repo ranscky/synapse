@@ -31,8 +31,11 @@ const openPoolTimeout = 15 * time.Second
 type Backend interface {
 	// Write stores a memory entry, sanitized, replacing nothing.
 	Write(ctx context.Context, entry MemoryEntry) error
-	// Search returns the topK most semantically similar entries.
-	Search(ctx context.Context, queryEmbedding []float32, sessionID string, topK int) ([]MemoryEntry, error)
+	// Search returns the topK most semantically similar entries the caller is
+	// allowed to see: agentID, teamID, and currentSessionID are the reader's
+	// own verified scope, and the Postgres backend enforces visibility with
+	// them. The SQLite backend accepts and ignores them (see its own docs).
+	Search(ctx context.Context, queryEmbedding []float32, agentID, teamID, sessionID string, topK int) ([]MemoryEntry, error)
 	// GetRecent returns a session's most recent entries, newest first.
 	GetRecent(ctx context.Context, sessionID string, limit int) ([]MemoryEntry, error)
 	// MarkSuperseded records that one memory has been replaced by another.

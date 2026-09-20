@@ -64,7 +64,32 @@ func newSyncRouter(t *testing.T, cfg *plane.PlaneConfig, writer plane.MemoryWrit
 func tenantToken(t *testing.T, cfg *plane.PlaneConfig) string {
 	t.Helper()
 
-	token, err := tenant.IssueToken(cfg, testTenantID, testTenantSlug, "team", "team")
+	token, err := tenant.IssueToken(cfg, tenant.TokenIdentity{
+		TenantID: testTenantID,
+		Slug:     testTenantSlug,
+		Plan:     "team",
+		Tier:     "team",
+	})
+	require.NoError(t, err)
+
+	return token
+}
+
+// agentToken mints a real agent-scoped token: the same tenant as tenantToken,
+// plus the agent_id and team_id claims Phase 10's memory visibility is evaluated
+// against. It goes through tenant.IssueToken for the same reason tenantToken
+// does -- these tests exercise the verifier production runs.
+func agentToken(t *testing.T, cfg *plane.PlaneConfig, agentID, teamID string) string {
+	t.Helper()
+
+	token, err := tenant.IssueToken(cfg, tenant.TokenIdentity{
+		TenantID: testTenantID,
+		Slug:     testTenantSlug,
+		Plan:     "team",
+		Tier:     "team",
+		AgentID:  agentID,
+		TeamID:   teamID,
+	})
 	require.NoError(t, err)
 
 	return token
@@ -113,7 +138,12 @@ func TestSyncMemoriesRequiresAVerifiedTenantToken(t *testing.T) {
 		JWTSecret:  strings.Repeat("x", 48),
 		AdminToken: adminToken,
 	}
-	foreign, err := tenant.IssueToken(otherPlane, testTenantID, testTenantSlug, "team", "team")
+	foreign, err := tenant.IssueToken(otherPlane, tenant.TokenIdentity{
+		TenantID: testTenantID,
+		Slug:     testTenantSlug,
+		Plan:     "team",
+		Tier:     "team",
+	})
 	require.NoError(t, err)
 
 	body := syncPayload(t, "session-1", "edge-agent-1", []store.MemoryEntry{

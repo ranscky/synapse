@@ -42,17 +42,28 @@ const (
 	planKey
 	complianceTierKey
 	adminKey
+	agentIDKey
+	teamIDKey
 )
 
 // claims is the tenant JWT payload the control plane depends on. The JSON
 // names are the wire contract and must stay in sync with the tokens the plane
 // issues; RegisteredClaims carries exp/iat/nbf so expiry is enforced by the
 // parser rather than by hand.
+//
+// AgentID and TeamID are the caller's scope inside its tenant: they decide which
+// memories a request may read (org-scoped ones always, its own team's, and its
+// own private ones from the session it names). They are optional, because a
+// tenant-level token predates them and must keep working -- but their absence is
+// not "all agents": an empty agent id can read org-scoped memories and nothing
+// narrower.
 type claims struct {
 	TenantID       string `json:"tenant_id"`
 	TenantSlug     string `json:"tenant_slug"`
 	Plan           string `json:"plan"`
 	ComplianceTier string `json:"compliance_tier"`
+	AgentID        string `json:"agent_id,omitempty"`
+	TeamID         string `json:"team_id,omitempty"`
 	Admin          bool   `json:"admin"`
 
 	jwt.RegisteredClaims
@@ -142,6 +153,21 @@ func ComplianceTierFromCtx(ctx context.Context) string {
 	return stringFromCtx(ctx, complianceTierKey)
 }
 
+// AgentIDFromCtx returns the verified agent_id claim attached by JWTMiddleware,
+// or "" when the token named no agent.
+//
+// Empty is the fail-closed org-only reader: a caller without a verified agent
+// identity must never be treated as "every agent".
+func AgentIDFromCtx(ctx context.Context) string {
+	return stringFromCtx(ctx, agentIDKey)
+}
+
+// TeamIDFromCtx returns the verified team_id claim attached by JWTMiddleware, or
+// "" when the token named no team. Empty matches no team-scoped memory.
+func TeamIDFromCtx(ctx context.Context) string {
+	return stringFromCtx(ctx, teamIDKey)
+}
+
 // IsAdminFromCtx reports the verified admin claim attached by JWTMiddleware.
 // It is false when the claim is absent, which is the safe default.
 func IsAdminFromCtx(ctx context.Context) bool {
@@ -188,13 +214,20 @@ func withClaims(ctx context.Context, c *claims) context.Context {
 	ctx = context.WithValue(ctx, planKey, c.Plan)
 	ctx = context.WithValue(ctx, complianceTierKey, c.ComplianceTier)
 	ctx = context.WithValue(ctx, adminKey, c.Admin)
+	ctx = context.WithValue(ctx, agentIDKey, c.AgentID)
+	ctx = context.WithValue(ctx, teamIDKey, c.TeamID)
 
-	// The slug is also published through internal/plane's own accessor, because
-	// the keys above are unexported here and the plane's sync endpoint -- which
-	// cannot import this package -- needs the slug to pick the tenant's schema.
-	// Both accessors carry the same verified value; nothing is re-derived and
-	// the claim is never taken from anywhere but this signed token.
-	return plane.WithTenantSlug(ctx, c.TenantSlug)
+	// The slug, agent id, and team id are also published through internal/plane's
+	// own accessors, because the keys above are unexported here and the plane's
+	// endpoints -- which cannot import this package -- need them: the slug picks
+	// the tenant's schema, and the agent and team are the scope its memory
+	// visibility predicate is evaluated against. Every accessor carries the same
+	// verified value; nothing is re-derived and no claim is ever taken from
+	// anywhere but this signed token.
+	ctx = plane.WithTenantSlug(ctx, c.TenantSlug)
+	ctx = plane.WithAgentID(ctx, c.AgentID)
+
+	return plane.WithTeamID(ctx, c.TeamID)
 }
 
 // stringFromCtx reads a string claim, returning "" when the key is absent or

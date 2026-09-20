@@ -9,9 +9,11 @@
 // itself, and it is deliberately built so that it cannot pass vacuously:
 //
 //   - tenant-alpha's own store must first return exactly the five memories this
-//     run wrote, through the very query the isolation assertions use, so an
-//     empty tenant-beta result cannot be explained by a broken fixture, a write
-//     that never landed, or a query that reaches no row at all.
+//     run wrote -- identified by the team id that is unique to this run, since a
+//     fixed slug accumulates rows across runs -- through the very query the
+//     isolation assertions use, so an empty tenant-beta result cannot be
+//     explained by a broken fixture, a write that never landed, or a query that
+//     reaches no row at all.
 //   - the query vector is byte-identical to one of tenant-alpha's stored
 //     embeddings (L2 distance 0), so if any read path could reach that row,
 //     this is the vector that would find it.
@@ -55,6 +57,13 @@ const (
 	// isolationTenantBeta is the tenant that must be unable to reach them.
 	isolationTenantBeta = "tenant-beta"
 
+	// isolationReaderAgent is the agent these searches are made as. The claim
+	// under test is about schemas rather than scopes, but the scope is spelled
+	// out anyway: Phase 10 made a search's result depend on the agent, team, and
+	// session it is made with, so a reader has to be named for the query to mean
+	// anything at all.
+	isolationReaderAgent = "isolation-agent"
+
 	// isolationDefaultDSN is the database the Phase 4 compose stack publishes on
 	// host loopback with the credentials in deploy/docker-compose.yml. It is the
 	// fallback when SYNAPSE_TEST_DB_DSN is unset, so the command above works
@@ -63,6 +72,11 @@ const (
 
 	// isolationEntryCount is how many memories are written to tenant-alpha.
 	isolationEntryCount = 5
+	// isolationControlTopK bounds the control query. Deliberately generous:
+	// tenant-alpha is a fixed slug and accumulates rows across runs, and the
+	// control query has to be able to see this run's five whatever is already
+	// there.
+	isolationControlTopK = 100
 	// isolationRandomQueries is how many arbitrary query vectors are tried
 	// against tenant-beta on top of the identical-embedding query.
 	isolationRandomQueries = 10
@@ -138,10 +152,19 @@ func TestCrossTenantIsolation(t *testing.T) {
 		alpha.schemaName(), beta.schemaName(),
 		"two tenants must never resolve to one schema")
 
-	// Unique per run. tenant-alpha is a fixed slug, so memories accumulate there
-	// across runs; scoping this run's memories to their own session keeps the
-	// non-vacuity count below exact however many times the suite has run.
+	// Unique per run, and the reason the counts below stay exact: tenant-alpha is
+	// a fixed slug, so memories accumulate in that schema across runs.
+	//
+	// This run's memories are written team-scoped under a team id of its own.
+	// Before Phase 10 the session id alone was enough to isolate them, but an
+	// org-scoped memory is now reachable from any session, so a session-scoped
+	// fixture would no longer produce an exact count -- while a team id still
+	// does, because no earlier run used this one. Every leak assertion below is
+	// then made with the same team id and the same agent, which is what keeps
+	// them non-vacuous: a broken schema filter would surface these five rows for
+	// the control query and for tenant-beta alike.
 	sessionID := uuid.NewString()
+	teamID := "isolation-" + uuid.NewString()
 
 	// Entry i is the unit vector on axis i -- the same hardcoded, known
 	// embeddings the Phase 5 test uses -- written through the store's own Write
@@ -151,6 +174,9 @@ func TestCrossTenantIsolation(t *testing.T) {
 	for i := range ids {
 		ids[i] = uuid.NewString()
 		entry := testEntry(ids[i], sessionID, embeddingAt(i, 1))
+		entry.AgentID = isolationReaderAgent
+		entry.Visibility = VisibilityTeam
+		entry.TeamID = teamID
 		entry.Timestamp = base.Add(time.Duration(i) * time.Second)
 		require.NoError(t, alpha.Write(ctx, entry), "writing tenant-alpha entry %d", i)
 	}
@@ -160,16 +186,34 @@ func TestCrossTenantIsolation(t *testing.T) {
 	query := embeddingAt(3, 1)
 
 	t.Run("control: tenant-alpha reaches its own memories", func(t *testing.T) {
-		got, err := alpha.Search(ctx, query, sessionID, isolationEntryCount*2)
+		got, err := alpha.Search(ctx, query, isolationReaderAgent, teamID, sessionID, isolationControlTopK)
 		require.NoError(t, err)
-		require.Len(t, got, isolationEntryCount,
+
+		// Counted by scope rather than by result length. tenant-alpha is a fixed
+		// slug with a history: earlier runs -- and, before Phase 10 made a search
+		// scope-aware, earlier writes -- left org-scoped rows in it that any
+		// reader can still reach, so the raw result is longer than this run's
+		// five and its ordering is full of equidistant rows. The team id is
+		// unique to this run, so the rows that carry it are exactly the rows
+		// written below, and requiring all five of them is what keeps the leak
+		// assertions meaningful: they can only fail if this query reaches rows,
+		// which it demonstrably does.
+		gotIDs := make(map[string]bool, len(got))
+		for _, e := range got {
+			if e.TeamID == teamID {
+				gotIDs[e.ID] = true
+			}
+		}
+
+		require.Len(t, gotIDs, isolationEntryCount,
 			"tenant-alpha must see exactly the memories this run wrote; without this the assertions below would prove nothing")
-		assert.Equal(t, ids[3], got[0].ID,
-			"the entry whose embedding equals the query must rank first")
+		for _, id := range ids {
+			assert.True(t, gotIDs[id], "tenant-alpha must reach the memory this run wrote (%s)", id)
+		}
 	})
 
 	t.Run("tenant-beta cannot reach tenant-alpha's memories", func(t *testing.T) {
-		got, err := beta.Search(ctx, query, sessionID, isolationEntryCount*2)
+		got, err := beta.Search(ctx, query, isolationReaderAgent, teamID, sessionID, isolationEntryCount*2)
 		require.NoError(t, err)
 		// Lengths are compared as values rather than with assert.Len/Empty so a
 		// leak reports "expected 0, actual 5" instead of dumping every leaked
@@ -179,7 +223,7 @@ func TestCrossTenantIsolation(t *testing.T) {
 	})
 
 	t.Run("tenant-beta cannot reach them tenant-wide either", func(t *testing.T) {
-		got, err := beta.Search(ctx, query, "", isolationEntryCount*2)
+		got, err := beta.Search(ctx, query, isolationReaderAgent, teamID, "", isolationEntryCount*2)
 		require.NoError(t, err)
 		assert.Equal(t, 0, len(got),
 			"an empty session widens the search to the whole tenant, which is still only tenant-beta")
@@ -191,11 +235,11 @@ func TestCrossTenantIsolation(t *testing.T) {
 			t.Run(fmt.Sprintf("query %d", i+1), func(t *testing.T) {
 				q := isolationRandomEmbedding(rng)
 
-				inSession, err := beta.Search(ctx, q, sessionID, isolationEntryCount*2)
+				inSession, err := beta.Search(ctx, q, isolationReaderAgent, teamID, sessionID, isolationEntryCount*2)
 				require.NoError(t, err)
 				assert.Equal(t, 0, len(inSession), "session-scoped query reached tenant-beta rows")
 
-				tenantWide, err := beta.Search(ctx, q, "", isolationEntryCount*2)
+				tenantWide, err := beta.Search(ctx, q, isolationReaderAgent, teamID, "", isolationEntryCount*2)
 				require.NoError(t, err)
 				assert.Equal(t, 0, len(tenantWide), "tenant-wide query reached tenant-beta rows")
 			})

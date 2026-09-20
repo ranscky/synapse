@@ -256,7 +256,17 @@ func (a *APIServer) runCompilePipeline(ctx context.Context, sessionID string, me
 	// production again -- embeds the query, then semantically searches the
 	// full session memory store instead of pulling the most recent 20 by
 	// recency.
-	retrievalResult, err := retrieval.Candidates(ctx, a.store, a.embedder, a.plane, sessionID, lastUserMessage, a.config.RetrievalCandidateK)
+	//
+	// The scope matches the proxy path's exactly: this node's configured
+	// agent-id and team-id, and this request's session. The playground is
+	// therefore subject to the same visibility rules as live traffic, which is
+	// the point of sharing the pipeline rather than reimplementing it.
+	scope := retrieval.Scope{
+		AgentID:   a.config.AgentID,
+		TeamID:    a.config.TeamID,
+		SessionID: sessionID,
+	}
+	retrievalResult, err := retrieval.Candidates(ctx, a.store, a.embedder, a.plane, scope, lastUserMessage, a.config.RetrievalCandidateK)
 	if err != nil {
 		return nil, err
 	}

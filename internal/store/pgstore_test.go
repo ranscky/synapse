@@ -2,85 +2,13 @@ package store
 
 import (
 	"context"
-	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// testEnvDatabaseDSN is the environment variable that points the Postgres-backed
-// tests at a real instance, matching internal/tenant's convention:
-//
-//	SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' go test ./internal/store/...
-//
-// The Postgres tests skip when it is unset, so the unit suite -- and CI, which
-// runs `go test ./...` with no database at all -- stays green anywhere.
-const testEnvDatabaseDSN = "SYNAPSE_TEST_DB_DSN"
-
-// testPGPool returns a pool for the database named by testEnvDatabaseDSN, or
-// skips the test when it is not configured.
-func testPGPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-
-	dsn := os.Getenv(testEnvDatabaseDSN)
-	if dsn == "" {
-		t.Skipf("set %s to run the Postgres-backed tests", testEnvDatabaseDSN)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	pool, err := OpenPGPool(ctx, dsn)
-	require.NoError(t, err, "could not open a pool for %s", testEnvDatabaseDSN)
-
-	t.Cleanup(pool.Close)
-
-	return pool
-}
-
-// testPGStore returns a PGStore over a tenant slug no earlier run used, so
-// repeated runs cannot see each other's rows. Nothing is deleted afterwards: the
-// schema is cheap, and every assertion is scoped to this run's own slug.
-func testPGStore(t *testing.T) *PGStore {
-	t.Helper()
-
-	st, err := NewPGStore(testPGPool(t), fmt.Sprintf("pgs%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-
-	t.Cleanup(func() { _ = st.Close() })
-
-	return st
-}
-
-// embeddingAt returns a 384-dim vector that is zero everywhere except index i,
-// which is set to v.
-//
-// The embeddings in TestPGStore are hardcoded through this helper rather than
-// written out as five literal 384-element slices: the one number that matters
-// per entry is its axis, and a wall of zeros would bury it.
-func embeddingAt(i int, v float32) []float32 {
-	vec := make([]float32, EmbeddingDimensions)
-	vec[i] = v
-	return vec
-}
-
-// testEntry builds a minimal valid entry for sessionID.
-func testEntry(id, sessionID string, embedding []float32) MemoryEntry {
-	return MemoryEntry{
-		ID:         id,
-		SessionID:  sessionID,
-		Content:    "memory " + id,
-		MemoryType: "fact",
-		Importance: 0.5,
-		Timestamp:  time.Now().UTC(),
-		Embedding:  embedding,
-	}
-}
 
 func TestPGStore(t *testing.T) {
 	st := testPGStore(t)
@@ -105,14 +33,14 @@ func TestPGStore(t *testing.T) {
 	query[1] = 0.1
 
 	t.Run("search ranks the nearest memory first", func(t *testing.T) {
-		got, err := st.Search(ctx, query, "session-a", 5)
+		got, err := st.Search(ctx, query, testReaderAgent, "", "session-a", 5)
 		require.NoError(t, err)
 		require.Len(t, got, 5)
 		assert.Equal(t, ids[3], got[0].ID, "the memory nearest the query embedding must rank first")
 	})
 
 	t.Run("search round-trips the stored fields", func(t *testing.T) {
-		got, err := st.Search(ctx, query, "session-a", 1)
+		got, err := st.Search(ctx, query, testReaderAgent, "", "session-a", 1)
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 
@@ -132,34 +60,43 @@ func TestPGStore(t *testing.T) {
 			"expected %s, got %s", entries[3].Timestamp.UTC(), got[0].Timestamp.UTC())
 	})
 
-	t.Run("search is scoped to the named session", func(t *testing.T) {
-		otherSession := uuid.NewString()
-		require.NoError(t, st.Write(ctx, testEntry(uuid.NewString(), "session-b", embeddingAt(3, 1))))
+	t.Run("an org-scoped memory is reachable from another session", func(t *testing.T) {
+		// Phase 10 changed what a session means to a search: it no longer
+		// bounds the result set, it only gates private memories (see
+		// TestVisibilityScopes). An org-scoped memory written in another
+		// session is therefore reachable from this one, which is what makes a
+		// shared plane a shared brain rather than a set of private buckets.
+		//
+		// This runs against a store of its own so the claim cannot depend on
+		// what the subtests above wrote.
+		cross := testPGStore(t)
+		crossSession := uuid.NewString()
+		require.NoError(t, cross.Write(ctx, testEntry(crossSession, "session-other", embeddingAt(3, 1))))
 
-		got, err := st.Search(ctx, query, "session-a", 10)
+		got, err := cross.Search(ctx, query, testReaderAgent, "", "session-a", 10)
 		require.NoError(t, err)
-		for _, e := range got {
-			assert.Equal(t, "session-a", e.SessionID)
-			assert.NotEqual(t, otherSession, e.ID)
-		}
+		require.Len(t, got, 1)
+		assert.Equal(t, crossSession, got[0].ID,
+			"session does not bound an org-scoped search twice over: the memory is reachable even from a session that is not this store's own")
+		assert.Equal(t, "session-other", got[0].SessionID)
 	})
 
 	t.Run("search with no session searches the whole tenant", func(t *testing.T) {
-		got, err := st.Search(ctx, query, "", 10)
+		got, err := st.Search(ctx, query, testReaderAgent, "", "", 10)
 		require.NoError(t, err)
 		require.NotEmpty(t, got)
 		assert.Equal(t, ids[3], got[0].ID)
 	})
 
 	t.Run("search without a query embedding falls back to recency", func(t *testing.T) {
-		got, err := st.Search(ctx, nil, "session-a", 5)
+		got, err := st.Search(ctx, nil, testReaderAgent, "", "session-a", 5)
 		require.NoError(t, err)
 		require.Len(t, got, 5)
 		assert.Equal(t, ids[4], got[0].ID, "newest first when there is nothing to compare against")
 	})
 
 	t.Run("search rejects a wrong-width embedding", func(t *testing.T) {
-		_, err := st.Search(ctx, []float32{1, 0, 0}, "session-a", 5)
+		_, err := st.Search(ctx, []float32{1, 0, 0}, testReaderAgent, "", "session-a", 5)
 		require.Error(t, err)
 	})
 
@@ -215,14 +152,21 @@ func TestPGStore(t *testing.T) {
 		anonymous := testEntry(uuid.NewString(), "session-agent", embeddingAt(1, 1))
 		require.NoError(t, st.Write(ctx, anonymous))
 
-		got, err := st.Search(ctx, query, "session-agent", 10)
+		// Both rows are org-scoped, so from Phase 10 on this search also sees
+		// the org-scoped memories earlier subtests wrote into the same tenant.
+		// The assertion is therefore "both rows are present and carry the right
+		// agent id" rather than "these are the only two rows" -- which is what
+		// it was checking anyway; the length check was only ever standing in
+		// for reachability.
+		got, err := st.Search(ctx, query, testReaderAgent, "", "session-agent", 50)
 		require.NoError(t, err)
-		require.Len(t, got, 2)
 
 		byID := make(map[string]string, len(got))
 		for _, e := range got {
 			byID[e.ID] = e.AgentID
 		}
+		require.Contains(t, byID, named.ID, "a memory written by a named agent must be searchable")
+		require.Contains(t, byID, anonymous.ID)
 		assert.Equal(t, "edge-agent-1", byID[named.ID], "a named agent must survive the write")
 		assert.Equal(t, "default", byID[anonymous.ID], "a blank agent id is stored as the schema's own default, never as an empty string")
 	})
@@ -244,7 +188,7 @@ func TestPGStore(t *testing.T) {
 		require.Len(t, got, 1)
 		assert.Equal(t, otherID, got[0].ID)
 
-		mine, err := st.Search(ctx, query, "", 20)
+		mine, err := st.Search(ctx, query, testReaderAgent, "", "", 20)
 		require.NoError(t, err)
 		for _, e := range mine {
 			assert.NotEqual(t, otherID, e.ID)
@@ -252,11 +196,18 @@ func TestPGStore(t *testing.T) {
 	})
 
 	t.Run("superseded memories drop out of search and recent", func(t *testing.T) {
+		// Counted before and after rather than against a fixed number: from
+		// Phase 10 on this search spans the tenant's org-scoped memories, and
+		// how many of those exist depends on the subtests above. The invariant
+		// under test is that superseding a live memory removes exactly one row.
+		before, err := st.Search(ctx, query, testReaderAgent, "", "session-a", 50)
+		require.NoError(t, err)
+
 		require.NoError(t, st.MarkSuperseded(ctx, ids[1], ids[3]))
 
-		got, err := st.Search(ctx, query, "session-a", 10)
+		got, err := st.Search(ctx, query, testReaderAgent, "", "session-a", 50)
 		require.NoError(t, err)
-		require.Len(t, got, 4)
+		assert.Equal(t, len(before)-1, len(got), "a superseded memory must leave the result set")
 		for _, e := range got {
 			assert.NotEqual(t, ids[1], e.ID, "a superseded memory must not be surfaced")
 		}

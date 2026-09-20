@@ -91,18 +91,25 @@ func (w *MemoryWriter) WriteBatch(ctx context.Context, tenantSlug string, entrie
 }
 
 // Search returns the topK memories nearest queryEmbedding in tenantSlug's own
-// schema. It implements plane.MemorySearcher.
+// schema that the caller's scope may read. It implements plane.MemorySearcher.
 //
 // It is the read half of the same tenant cache WriteBatch uses, so a read and a
 // write for one tenant share one PGStore and one connection pool rather than
 // opening a second store -- and, just as importantly, share one construction
 // path, which is what keeps the DDL and the query column list from drifting.
 //
-// sessionID scopes the search when it is non-empty and widens it to the whole
-// tenant when it is empty, which is store.PGStore.Search's own contract: an edge
-// asking about one session stays scoped to it, and a caller asking with no
-// session gets the org's memories.
-func (w *MemoryWriter) Search(ctx context.Context, tenantSlug string, queryEmbedding []float32, sessionID string, topK int) ([]store.MemoryEntry, error) {
+// The four scope parameters are not this method's business beyond passing them
+// on: tenantSlug, agentID, and teamID all come from the verified token (the
+// caller's http layer is what reads them out of the context), and sessionID is
+// the session the caller is working in. Enforcing visibility is deliberately the
+// store's job, in one SQL predicate, so that every read path -- this one, the
+// plane's, and any future one -- cannot enforce it slightly differently. The
+// only scope this method adds is the tenant's schema, which is what makes a
+// second tenant's rows unnameable rather than merely filtered.
+//
+// An empty agentID is an org-only reader, not an error: a tenant token that
+// names no agent still reads the tenant's org-scoped memories.
+func (w *MemoryWriter) Search(ctx context.Context, tenantSlug string, queryEmbedding []float32, agentID, teamID, sessionID string, topK int) ([]store.MemoryEntry, error) {
 	if w == nil || w.pool == nil {
 		return nil, fmt.Errorf("tenant: memory writer has no database pool")
 	}
@@ -112,7 +119,7 @@ func (w *MemoryWriter) Search(ctx context.Context, tenantSlug string, queryEmbed
 		return nil, err
 	}
 
-	return st.Search(ctx, queryEmbedding, sessionID, topK)
+	return st.Search(ctx, queryEmbedding, agentID, teamID, sessionID, topK)
 }
 
 // storeFor returns the tenant's store, opening it on first use.

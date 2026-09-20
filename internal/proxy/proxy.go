@@ -53,7 +53,7 @@ type Embedder interface {
 // Defined here to allow easy mocking in tests.
 type MemoryStore interface {
 	GetRecent(ctx context.Context, sessionID string, limit int) ([]store.MemoryEntry, error)
-	Search(ctx context.Context, queryEmbedding []float32, sessionID string, topK int) ([]store.MemoryEntry, error)
+	Search(ctx context.Context, queryEmbedding []float32, agentID, teamID, sessionID string, topK int) ([]store.MemoryEntry, error)
 	Write(ctx context.Context, entry store.MemoryEntry) error
 	MarkSuperseded(ctx context.Context, oldID, newID string) error
 }
@@ -84,6 +84,23 @@ type Proxy struct {
 // trusted to mean "no plane".
 func (p *Proxy) SetPlaneCandidates(plane retrieval.PlaneCandidates) {
 	p.plane = plane
+}
+
+// retrievalScope is the identity this node retrieves memories as: the agent-id
+// and team-id from its own configuration, plus the session the current request
+// belongs to.
+//
+// Built in one place so the live path here and the playground path in
+// internal/api cannot drift into two different answers to "who is asking".
+// Neither value ever comes from the request being proxied -- agent-id
+// especially, since a caller that could set it could read another agent's
+// private memories.
+func (p *Proxy) retrievalScope(sessionID string) retrieval.Scope {
+	return retrieval.Scope{
+		AgentID:   p.config.AgentID,
+		TeamID:    p.config.TeamID,
+		SessionID: sessionID,
+	}
 }
 
 // NewProxy creates a new proxy instance
@@ -480,7 +497,14 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// query, then semantically searches the full session memory store
 	// (rather than pulling the most recent 20 by recency and only scoring
 	// within that window -- see internal/retrieval for why that mattered).
-	retrievalResult, err := retrieval.Candidates(ctx, p.store, p.embedder, p.plane, sessionID, lastUserMessage, p.config.RetrievalCandidateK)
+	//
+	// The scope is this node's own identity: its configured agent-id and
+	// team-id, plus the session this request belongs to. Those two config
+	// values are what a Postgres backend's visibility predicate is evaluated
+	// against, so an org-scoped memory is reachable from any node while
+	// another agent's private ones are not -- and nothing in the request can
+	// widen that, because the agent id never comes from a header or a body.
+	retrievalResult, err := retrieval.Candidates(ctx, p.store, p.embedder, p.plane, p.retrievalScope(sessionID), lastUserMessage, p.config.RetrievalCandidateK)
 	if err != nil {
 		slog.Error("Failed to retrieve candidates", "error", err)
 		p.upstream.ServeHTTP(w, r)

@@ -33,7 +33,14 @@ func newIssuingRouter(t *testing.T, cfg *plane.PlaneConfig) (http.Handler, *fake
 
 	provisioner := &fakeProvisioner{}
 	provisioner.issue = func(_ context.Context, req plane.ProvisionRequest) (plane.ProvisionResult, error) {
-		token, err := tenant.IssueToken(cfg, testTenantID, req.Slug, req.Plan, req.ComplianceTier)
+		token, err := tenant.IssueToken(cfg, tenant.TokenIdentity{
+			TenantID: testTenantID,
+			Slug:     req.Slug,
+			Plan:     req.Plan,
+			Tier:     req.ComplianceTier,
+			AgentID:  req.AgentID,
+			TeamID:   req.TeamID,
+		})
 		if err != nil {
 			return plane.ProvisionResult{}, err
 		}

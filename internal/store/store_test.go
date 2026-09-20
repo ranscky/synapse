@@ -175,7 +175,11 @@ func TestSearchRanksBySimilarity(t *testing.T) {
 	// oldest entry (recency-only ordering would put it last).
 	queryEmbedding := []float32{1.0, 0.0, 0.0}
 
-	results, err := store.Search(ctx, queryEmbedding, "search-test", 10)
+	// The empty agent id and team id are explicit rather than implied: the
+	// SQLite backend accepts and ignores them (a local file has exactly one
+	// reader), and passing them here keeps this call shaped like every other
+	// Search call in the codebase.
+	results, err := store.Search(ctx, queryEmbedding, "", "", "search-test", 10)
 	require.NoError(t, err)
 	require.Len(t, results, 3)
 

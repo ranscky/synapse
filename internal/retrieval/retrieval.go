@@ -31,7 +31,39 @@ type Embedder interface {
 // interface and internal/api's *store.Store both already satisfy this with
 // no changes needed on either side.
 type Store interface {
-	Search(ctx context.Context, queryEmbedding []float32, sessionID string, topK int) ([]store.MemoryEntry, error)
+	Search(ctx context.Context, queryEmbedding []float32, agentID, teamID, sessionID string, topK int) ([]store.MemoryEntry, error)
+}
+
+// Scope is who a retrieval is for: the agent and team the caller is acting as,
+// and the session it is working in.
+//
+// It is a type rather than three more string parameters because Candidates
+// already takes seven, and three adjacent strings of the same type are exactly
+// the shape of a mix-up that still compiles -- swapping agentID and teamID
+// would silently widen or narrow what a caller may read. The store's own
+// Search keeps its parameters explicit (they are only ever passed straight
+// through), but above it they travel together.
+//
+// The values reach the Postgres backend's visibility predicate unchanged: an
+// org-scoped memory is visible to any of them, a team-scoped one only to a
+// matching TeamID, and a private one only to the agent that wrote it in the
+// session it is working in. On a standalone node (the SQLite backend) they
+// change nothing at all, because one file is one agent.
+//
+// AgentID and TeamID are the caller's own identity and must come from the
+// caller's own configuration and from a verified credential -- never from
+// anything a request body can name. A request that talks its way into another
+// agent's AgentID is reading that agent's private memories.
+type Scope struct {
+	// AgentID is the agent this retrieval acts as. Empty means an org-only
+	// reader: it can reach org-scoped memories and nothing narrower.
+	AgentID string
+	// TeamID is the team this agent belongs to. Empty matches no team-scoped
+	// memory, which is the fail-closed direction.
+	TeamID string
+	// SessionID is the session the agent is working in. Only private memories
+	// are bounded by it.
+	SessionID string
 }
 
 // PlaneCandidates is the optional control plane candidate source.
@@ -86,6 +118,14 @@ type Result struct {
 // set. Search() ranks by embedding similarity across the whole session
 // first, so relevance (not recency) decides what enters scoring.
 //
+// scope is who this retrieval is for -- the agent, team, and session the
+// candidates are being gathered for (see Scope). It is passed through to the
+// local store's Search, which is where the Postgres backend enforces memory
+// visibility with it, so a plane-backed or Postgres-backed node only ever
+// retrieves what that scope may read: org-scoped memories, its own team's, and
+// its own private ones from the session it is in. The SQLite backend ignores
+// the agent and team, since a standalone node's file has exactly one reader.
+//
 // candidateK <= 0 is passed straight through to store.Search, which falls
 // back to its own default of 20 -- matching the permissive-zero convention
 // already used for config.Config's other numeric fields (see Validate()).
@@ -97,7 +137,7 @@ type Result struct {
 // than returning zero candidates outright. The plane has the same fallback on
 // its own side, so an unembeddable query behaves the same way whichever source
 // answers it.
-func Candidates(ctx context.Context, st Store, emb Embedder, plane PlaneCandidates, sessionID string, query string, candidateK int) (Result, error) {
+func Candidates(ctx context.Context, st Store, emb Embedder, plane PlaneCandidates, scope Scope, query string, candidateK int) (Result, error) {
 	var result Result
 
 	if emb != nil && query != "" {
@@ -112,7 +152,7 @@ func Candidates(ctx context.Context, st Store, emb Embedder, plane PlaneCandidat
 
 	if plane != nil {
 		pullStart := time.Now()
-		candidates, err := plane.PullCandidates(ctx, result.QueryEmbedding, sessionID, candidateK)
+		candidates, err := plane.PullCandidates(ctx, result.QueryEmbedding, scope.SessionID, candidateK)
 		result.SearchDuration = time.Since(pullStart)
 
 		// No error means the plane answered inside its own ceiling, and its
@@ -143,7 +183,7 @@ func Candidates(ctx context.Context, st Store, emb Embedder, plane PlaneCandidat
 	}
 
 	searchStart := time.Now()
-	candidates, err := st.Search(ctx, result.QueryEmbedding, sessionID, candidateK)
+	candidates, err := st.Search(ctx, result.QueryEmbedding, scope.AgentID, scope.TeamID, scope.SessionID, candidateK)
 	result.SearchDuration = time.Since(searchStart)
 	if err != nil {
 		return result, fmt.Errorf("failed to search memories: %w", err)

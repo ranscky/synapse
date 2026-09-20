@@ -24,6 +24,8 @@ type fakeSearcher struct {
 	calls     int
 	slug      string
 	embedding []float32
+	agentID   string
+	teamID    string
 	sessionID string
 	topK      int
 	entries   []store.MemoryEntry
@@ -33,10 +35,12 @@ type fakeSearcher struct {
 // Search implements plane.MemorySearcher. The handler calls it synchronously
 // from the test's own goroutine (httptest.ResponseRecorder does not spawn one),
 // so plain fields need no synchronisation.
-func (f *fakeSearcher) Search(_ context.Context, tenantSlug string, queryEmbedding []float32, sessionID string, topK int) ([]store.MemoryEntry, error) {
+func (f *fakeSearcher) Search(_ context.Context, tenantSlug string, queryEmbedding []float32, agentID, teamID, sessionID string, topK int) ([]store.MemoryEntry, error) {
 	f.calls++
 	f.slug = tenantSlug
 	f.embedding = queryEmbedding
+	f.agentID = agentID
+	f.teamID = teamID
 	f.sessionID = sessionID
 	f.topK = topK
 
@@ -107,7 +111,12 @@ func TestSearchMemoriesRequiresAVerifiedTenantToken(t *testing.T) {
 		JWTSecret:  strings.Repeat("x", 48),
 		AdminToken: adminToken,
 	}
-	foreign, err := tenant.IssueToken(otherPlane, testTenantID, testTenantSlug, "team", "team")
+	foreign, err := tenant.IssueToken(otherPlane, tenant.TokenIdentity{
+		TenantID: testTenantID,
+		Slug:     testTenantSlug,
+		Plan:     "team",
+		Tier:     "team",
+	})
 	require.NoError(t, err)
 
 	body := searchPayload(t, "session-1", "edge-agent-1", vector(1, 1), 20)

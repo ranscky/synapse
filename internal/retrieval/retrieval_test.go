@@ -22,17 +22,30 @@ type fakeStore struct {
 	err        error
 	calls      int
 	gotEmbed   []float32
+	gotAgent   string
+	gotTeam    string
 	gotSession string
 	gotTopK    int
 }
 
-func (f *fakeStore) Search(_ context.Context, queryEmbedding []float32, sessionID string, topK int) ([]store.MemoryEntry, error) {
+func (f *fakeStore) Search(_ context.Context, queryEmbedding []float32, agentID, teamID, sessionID string, topK int) ([]store.MemoryEntry, error) {
 	f.calls++
 	f.gotEmbed = queryEmbedding
+	f.gotAgent = agentID
+	f.gotTeam = teamID
 	f.gotSession = sessionID
 	f.gotTopK = topK
 
 	return f.entries, f.err
+}
+
+// testScope is the identity every Candidates call in these tests is made as.
+//
+// AgentID and TeamID are deliberately non-empty: they are what the Postgres
+// backend's visibility predicate is evaluated against, so a scope that carried
+// nothing would let the pipeline drop them without a test noticing.
+func testScope() Scope {
+	return Scope{AgentID: "agent-1", TeamID: "team-1", SessionID: "session-1"}
 }
 
 // fakeEmbedder stands in for the ONNX embedder: one fixed vector, no model.
@@ -98,7 +111,7 @@ func TestCandidatesUsesThePlaneAndSkipsTheLocalStore(t *testing.T) {
 	plane := &fakePlane{entries: []store.MemoryEntry{candidate("plane-1", "org memory")}}
 	emb := &fakeEmbedder{embedding: embeddingOf(1)}
 
-	result, err := Candidates(context.Background(), local, emb, plane, "session-1", "what did we decide?", 50)
+	result, err := Candidates(context.Background(), local, emb, plane, testScope(), "what did we decide?", 50)
 	require.NoError(t, err)
 	require.Len(t, result.Candidates, 1)
 	assert.Equal(t, "plane-1", result.Candidates[0].ID)
@@ -133,7 +146,7 @@ func TestCandidatesFallsBackToTheLocalStoreWhenThePlaneFails(t *testing.T) {
 			plane := &fakePlane{err: failure.err}
 			emb := &fakeEmbedder{embedding: embeddingOf(2)}
 
-			result, err := Candidates(context.Background(), local, emb, plane, "session-1", "what did we decide?", 50)
+			result, err := Candidates(context.Background(), local, emb, plane, testScope(), "what did we decide?", 50)
 			require.NoError(t, err, "a plane failure is never a compile failure")
 			require.Len(t, result.Candidates, 1)
 			assert.Equal(t, "local-1", result.Candidates[0].ID)
@@ -141,6 +154,8 @@ func TestCandidatesFallsBackToTheLocalStoreWhenThePlaneFails(t *testing.T) {
 			assert.Equal(t, 1, plane.calls, "the plane is asked first")
 			assert.Equal(t, 1, local.calls, "the local store answers when the plane does not")
 			assert.Equal(t, "session-1", local.gotSession)
+			assert.Equal(t, "agent-1", local.gotAgent, "the reader's identity reaches the store even on the fallback path")
+			assert.Equal(t, "team-1", local.gotTeam)
 			assert.Equal(t, 50, local.gotTopK)
 			assert.Equal(t, emb.embedding, local.gotEmbed)
 
@@ -155,16 +170,42 @@ func TestCandidatesWithoutAPlaneSearchesLocally(t *testing.T) {
 	local := &fakeStore{entries: []store.MemoryEntry{candidate("local-1", "local memory")}}
 	emb := &fakeEmbedder{embedding: embeddingOf(3)}
 
-	result, err := Candidates(context.Background(), local, emb, nil, "session-1", "what did we decide?", 50)
+	result, err := Candidates(context.Background(), local, emb, nil, testScope(), "what did we decide?", 50)
 	require.NoError(t, err)
 	require.Len(t, result.Candidates, 1)
 	assert.Equal(t, "local-1", result.Candidates[0].ID)
 
 	assert.Equal(t, 1, local.calls)
 	assert.Equal(t, "session-1", local.gotSession)
+	assert.Equal(t, "agent-1", local.gotAgent)
+	assert.Equal(t, "team-1", local.gotTeam)
 	assert.Equal(t, 50, local.gotTopK)
 	assert.Equal(t, emb.embedding, result.QueryEmbedding)
 	assert.Empty(t, logs.String(), "a standalone node has no plane to log about")
+}
+
+// TestCandidatesPassesTheScopeToTheStore pins the pass-through itself, with a
+// scope that is deliberately empty.
+//
+// An empty agent id is not "no scope to apply": it is the fail-closed org-only
+// reader, and the Postgres backend turns it into "org-scoped memories and
+// nothing narrower". A pipeline that substituted a default agent id for a blank
+// one would turn every un-attributed caller into an agent that can read that
+// agent's private memories, so the blank case has to arrive blank.
+func TestCandidatesPassesTheScopeToTheStore(t *testing.T) {
+	local := &fakeStore{}
+	emb := &fakeEmbedder{embedding: embeddingOf(5)}
+
+	scope := Scope{SessionID: "session-1"}
+
+	result, err := Candidates(context.Background(), local, emb, nil, scope, "anything", 50)
+	require.NoError(t, err)
+	assert.Empty(t, result.Candidates)
+
+	require.Equal(t, 1, local.calls)
+	assert.Equal(t, "session-1", local.gotSession)
+	assert.Empty(t, local.gotAgent, "a blank agent id must reach the store blank, never defaulted")
+	assert.Empty(t, local.gotTeam, "a blank team id matches no team-scoped memory, which is the point")
 }
 
 func TestCandidatesTreatsAnEmptyPlaneAnswerAsTheAnswer(t *testing.T) {
@@ -172,7 +213,7 @@ func TestCandidatesTreatsAnEmptyPlaneAnswerAsTheAnswer(t *testing.T) {
 	plane := &fakePlane{}
 	emb := &fakeEmbedder{embedding: embeddingOf(4)}
 
-	result, err := Candidates(context.Background(), local, emb, plane, "session-1", "anything", 50)
+	result, err := Candidates(context.Background(), local, emb, plane, testScope(), "anything", 50)
 	require.NoError(t, err)
 	assert.Empty(t, result.Candidates)
 
@@ -186,7 +227,7 @@ func TestCandidatesWithoutAQueryStillAsksThePlane(t *testing.T) {
 	// A nil embedder and an empty query is the "nothing to embed" case, which
 	// both backends answer with plain recency ordering. It must reach the plane
 	// rather than short-circuit into an empty candidate set.
-	result, err := Candidates(context.Background(), nil, nil, plane, "session-1", "", 50)
+	result, err := Candidates(context.Background(), nil, nil, plane, testScope(), "", 50)
 	require.NoError(t, err)
 	require.Len(t, result.Candidates, 1)
 	assert.Equal(t, 1, plane.calls)
@@ -198,7 +239,7 @@ func TestCandidatesFailsWhenTheQueryCannotBeEmbedded(t *testing.T) {
 	local := &fakeStore{}
 	emb := &fakeEmbedder{err: errors.New("model missing")}
 
-	result, err := Candidates(context.Background(), local, emb, plane, "session-1", "anything", 50)
+	result, err := Candidates(context.Background(), local, emb, plane, testScope(), "anything", 50)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to generate query embedding")

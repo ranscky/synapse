@@ -35,7 +35,8 @@ const (
 )
 
 // MemorySearcher is everything GET /v2/memories/search needs from the tenant
-// data layer: read one tenant's memories nearest a query embedding.
+// data layer: read one tenant's memories nearest a query embedding, narrowed to
+// what the caller is allowed to see.
 //
 // Like MemoryWriter it is declared on the consumer side, so this package
 // depends on a behaviour rather than on a database handle and the endpoint is
@@ -44,17 +45,28 @@ const (
 // anything the request body could name.
 type MemorySearcher interface {
 	// Search returns the topK memories nearest queryEmbedding in tenantSlug's
-	// own schema, scoped to sessionID when it is non-empty and spanning the
-	// tenant when it is empty.
-	Search(ctx context.Context, tenantSlug string, queryEmbedding []float32, sessionID string, topK int) ([]store.MemoryEntry, error)
+	// own schema that the scope agentID/teamID/sessionID may read: org-scoped
+	// memories from any agent, team-scoped ones from agentID's own team, and
+	// agentID's private ones from sessionID. An empty agentID is an org-only
+	// reader, which is the fail-closed default for a token that names no agent.
+	//
+	// tenantSlug, agentID, and teamID all come from the verified token; only
+	// the embedding, the session, and topK come from the request.
+	Search(ctx context.Context, tenantSlug string, queryEmbedding []float32, agentID, teamID, sessionID string, topK int) ([]store.MemoryEntry, error)
 }
 
 // searchRequest is the GET /v2/memories/search body, in wire order. It is the
 // mirror image of sync.searchRequest on the edge side; the two are the protocol.
+//
+// agent_id and team_id are attribution: they name the node that asked, and the
+// plane logs them. Neither is ever an isolation input -- what this request may
+// read comes from the verified token's own claims (see handleSearchMemories),
+// because a body is exactly the part of a request an attacker writes.
 type searchRequest struct {
 	QueryEmbedding []float32 `json:"query_embedding"`
 	SessionID      string    `json:"session_id"`
 	AgentID        string    `json:"agent_id"`
+	TeamID         string    `json:"team_id"`
 	TopK           int       `json:"top_k"`
 }
 
@@ -69,13 +81,22 @@ type searchResponse struct {
 // handleSearchMemories serves GET /v2/memories/search: validate, search, answer.
 //
 // The tenant comes from the verified token and nowhere else, exactly as on the
-// sync endpoint. The body's agent_id is attribution metadata -- it names which
-// node is asking and is never an isolation key: the schema searched is the one
-// the signed tenant_slug names.
+// sync endpoint -- and so does the caller's visibility scope. agentID and teamID
+// are read from the token's own claims (AgentIDFromCtx, TeamIDFromCtx) and are
+// what the store's visibility predicate is evaluated against; the body's
+// agent_id and team_id are attribution only, logged alongside, and never passed
+// to the data layer. A body is the one part of a request a caller controls
+// completely, so treating it as an isolation input would mean any node could
+// read any other node's private memories by typing its name.
+//
+// A token that names no agent is an org-only reader: it reaches org-scoped
+// memories and nothing narrower. That is the fail-closed default, and it is what
+// keeps every tenant token issued before agent-scoped tokens existed working
+// exactly as it did.
 //
 // Nothing about a memory's content, the query embedding, or the token is ever
-// logged. The one log line names the slug, the agent, and how many memories came
-// back.
+// logged. The one log line names the slug, the verified agent (when the token
+// has one), the agent the body claimed, and how many memories came back.
 func (s *Server) handleSearchMemories(w http.ResponseWriter, r *http.Request) {
 	slug := TenantSlugFromCtx(r.Context())
 	if slug == "" {
@@ -86,6 +107,11 @@ func (s *Server) handleSearchMemories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The verified scope. An empty agentID is not an error: it is the org-only
+	// reader a tenant token without an agent claim is.
+	agentID := AgentIDFromCtx(r.Context())
+	teamID := TeamIDFromCtx(r.Context())
+
 	var req searchRequest
 	if !decodeJSONLimit(w, r, &req, maxSearchBodyBytes) {
 		return
@@ -95,6 +121,16 @@ func (s *Server) handleSearchMemories(w http.ResponseWriter, r *http.Request) {
 	// that cannot attribute a request cannot meter or audit it. Required, so an
 	// unattributed query is a contract violation rather than a normal path.
 	if req.AgentID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_agent")
+		return
+	}
+
+	// A token that names an agent is that agent's credential, so a request
+	// claiming to be someone else is a misconfiguration worth refusing loudly.
+	// A token with no agent claim is not agent-scoped, so its body may name
+	// whatever node is presenting it -- several agents can legitimately share
+	// one tenant token, and each of them is then an org-only reader.
+	if agentID != "" && req.AgentID != agentID {
 		writeError(w, http.StatusBadRequest, "invalid_agent")
 		return
 	}
@@ -119,14 +155,16 @@ func (s *Server) handleSearchMemories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	memories, err := s.searcher.Search(r.Context(), slug, req.QueryEmbedding, req.SessionID, req.TopK)
+	// The scope is the token's, not the body's: agentID and teamID above.
+	memories, err := s.searcher.Search(r.Context(), slug, req.QueryEmbedding, agentID, teamID, req.SessionID, req.TopK)
 	if err != nil {
 		if s.logger != nil {
 			// Counts and identifiers only: no content, no embedding, no token.
 			// A pgx error can quote the connection target, so it is reported
 			// server-side and never returned to the client.
 			s.logger.Error("Memory search failed",
-				"tenant_slug", slug, "agent_id", req.AgentID, "top_k", req.TopK, "error", err)
+				"tenant_slug", slug, "agent_id", agentID, "request_agent_id", req.AgentID,
+				"top_k", req.TopK, "error", err)
 		}
 		writeError(w, http.StatusInternalServerError, "internal")
 		return
@@ -140,7 +178,8 @@ func (s *Server) handleSearchMemories(w http.ResponseWriter, r *http.Request) {
 
 	if s.logger != nil {
 		s.logger.Info("Memories searched",
-			"tenant_slug", slug, "agent_id", req.AgentID, "memories", len(memories))
+			"tenant_slug", slug, "agent_id", agentID, "request_agent_id", req.AgentID,
+			"memories", len(memories))
 	}
 
 	writeJSON(w, http.StatusOK, searchResponse{Memories: memories})
