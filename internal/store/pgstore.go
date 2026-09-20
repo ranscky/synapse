@@ -38,6 +38,11 @@ const (
 	defaultSearchTopK = 20
 	// defaultRecentLimit mirrors the SQLite backend's GetRecent default.
 	defaultRecentLimit = 100
+	// defaultAgentID mirrors the tenant schema's own DEFAULT for agent_id. A
+	// blank AgentID is written as this value rather than as an empty string,
+	// because the column is NOT NULL and an empty string would be a second,
+	// invisible spelling of "unattributed".
+	defaultAgentID = "default"
 	// migrateTimeout bounds the tenant DDL run at construction time.
 	migrateTimeout = 30 * time.Second
 )
@@ -138,14 +143,23 @@ func (s *PGStore) Write(ctx context.Context, entry MemoryEntry) error {
 		supersededBy = entry.SupersededBy
 	}
 
+	// agent_id is NOT NULL in the tenant schema and defaults to 'default', so
+	// a blank one is stored as that same value rather than as an empty string:
+	// every row can then name an agent, and 'default' means exactly what the
+	// column's own default means.
+	agentID := entry.AgentID
+	if agentID == "" {
+		agentID = defaultAgentID
+	}
+
 	query := `INSERT INTO ` + s.table() + ` (
-	id, session_id, content, memory_type, importance, sync_status, superseded_by, embedding, created_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	id, session_id, content, memory_type, importance, sync_status, superseded_by, embedding, created_at, agent_id
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ON CONFLICT (id) DO NOTHING`
 
 	_, err := s.pool.Exec(ctx, query,
 		entry.ID, entry.SessionID, content, entry.MemoryType, entry.Importance,
-		syncStatus, supersededBy, embedding, createdAt,
+		syncStatus, supersededBy, embedding, createdAt, agentID,
 	)
 	if err != nil {
 		return fmt.Errorf("store: insert memory: %w", err)

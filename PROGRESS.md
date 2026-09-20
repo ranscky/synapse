@@ -1557,8 +1557,358 @@ saw exactly one batch of three, and the rows read back `synced`. The configured
 `/v2/sync/memories` — not `//v2/sync/memories` — and the API key appears nowhere
 in the log.
 
-Next phase: Phase 9 marks memories `sync_pending` on the write path. Until it
-does, this phase's flusher runs, finds nothing, and sleeps — which is why the
-endpoint and the queue are tested by seeding the queue directly.
+Next phase, as Phase 8 predicted it, was to mark memories `sync_pending` on the
+write path. That work was reordered: **Phase 9 turned out to be the read half of
+the protocol** (`PullCandidates` and the offline fallback, below), and the
+`sync_pending` marking is still unbuilt. Until it lands, this phase's flusher
+runs, finds nothing, and sleeps — which is why the endpoint and the queue are
+tested by seeding the queue directly.
+
+## Phase 9 — PullCandidates and offline fallback (complete)
+
+Commit `feat: Phase 9 - PullCandidates and offline fallback`
+
+The edge node can now read from the control plane, not just write to it. Before
+scoring, `retrieval.Candidates` asks the plane for org-scoped candidates over
+`GET /v2/memories/search`, under a hard **200ms** ceiling; if the plane is slow,
+refusing, or gone, it logs a WARN and searches local sqlite-vec exactly as it did
+in v1. With no `control-plane-url`, nothing about retrieval changes at all.
+
+New files:
+
+| File | Contents |
+| --- | --- |
+| `internal/sync/pull.go` | `searchPath`, `pullTimeout` (200ms), `maxPullBodyBytes`, `searchRequest`/`searchResponse`, `Syncer.PullCandidates`, `searchEndpoint` |
+| `internal/plane/search.go` | `searchRoute`, `MemorySearcher` interface, `searchRequest`/`searchResponse`, `handleSearchMemories`, `maxSearchBodyBytes`, `maxSearchTopK` |
+| `internal/sync/syncer_test.go` | 5 new tests plus a search stub (`searchRecord`, `newSearchStub`, `nextSearch`) |
+| `internal/retrieval/retrieval_test.go` | 7 tests (one with 3 fallback subtests) and doubles for the store, the embedder, and the plane |
+| `internal/plane/search_test.go` | 7 tests (one with 5 auth subtests, one with 6 malformed-body subtests) |
+
+Changed:
+
+- `internal/sync/syncer.go` — package doc corrected: the claim that "nothing in
+  this package is called from a request path" is no longer true. The pull
+  constants and code live in `pull.go` because `syncer.go` reached 308 lines with
+  them inline (the 300-line cap; same split as `plane/handlers.go` → `sync.go`).
+- `internal/store/store.go` — `MemoryEntry.AgentID` (`json:"agent_id,omitempty"`).
+  Additive, like Phase 5's `SupersededBy`/`SyncStatus`; the SQLite backend has no
+  agent column and leaves it empty.
+- `internal/store/pgstore.go` — `PGStore.Write` inserts `agent_id`, blank →
+  `'default'` (new `defaultAgentID` const), matching the column's own default.
+- `internal/store/pgread.go` — `pgColumns` and `scanEntry` carry `agent_id`.
+- `internal/store/pgstore_test.go` — new subtest: a named agent round-trips and a
+  blank one reads back as `default`.
+- `internal/plane/handlers.go` — `Server.searcher`, one more `NewServer`
+  parameter, and `GET /v2/memories/search` registered behind `requireJWT`.
+- `internal/plane/sync.go` — `handleSyncMemories` sets `memory.AgentID` from the
+  envelope (a memory that names its own agent keeps it).
+- `internal/tenant/memorywriter.go` — `MemoryWriter.Search` (reuses the
+  per-tenant `PGStore` cache `WriteBatch` built), plus a second interface
+  assertion so a signature drift is a build failure.
+- `internal/retrieval/retrieval.go` — `PlaneCandidates` interface; `Candidates`
+  takes the source and asks the plane first; WARN + local fallback on any error.
+- `internal/proxy/proxy.go`, `internal/api/api.go` — a `plane` field, a
+  `SetPlaneCandidates` setter, and one extra argument at the `Candidates` call
+  site. This is the only v1 code this phase edits beyond `internal/retrieval`
+  (approved explicitly: `internal/api` stores a concrete `*store.Store`, so no
+  design could reach a live `/v1/compile` without one line there).
+- `internal/plane/handlers_test.go`, `internal/plane/sync_test.go` — `nil` for the
+  new `NewServer` parameter (3 lines).
+- `cmd/plane/main.go` — one `tenant.NewMemoryWriter(pool)` serves as both the
+  writer and the searcher.
+- `cmd/synapse/main.go` — the syncer is hoisted to a variable and installed on
+  both servers when `control-plane-url` is set; a standalone node leaves both
+  sources nil.
+- `synapse.yaml.example` — the credential now covers both routes.
+- `PROGRESS.md` — this entry.
+
+Decisions made in this phase:
+
+- **The 200ms ceiling is layered on the caller's context, not substituted for
+  it.** `PullCandidates` does `context.WithTimeout(ctx, pullTimeout)`, so a
+  request that is already cancelled stays cancelled, and the pull can never
+  outlive its own budget. A timeout reaches the caller as
+  `context.DeadlineExceeded` through `%w`, so a fallback can distinguish "never
+  answered" from "answered 503" with `errors.Is` instead of string matching.
+- **The compilation SLA is untouched because the ceiling is the plane's, not the
+  compile's.** The local path is the same `store.Search` call it always was, and
+  the fallback adds no retry, no second attempt, and no backoff: measured live,
+  the offline compile returned in 75ms including the failed pull.
+- **A plane answer *is* the candidate set — empty included.** The local store is
+  not consulted and the two sets are not merged. A merged set would make the
+  compiled context depend on which node happened to build it, and the plane is
+  the org's record. (The consequence is recorded under limitations.)
+- **A missing URL or credential is a local error, not a request.** Without it,
+  every compile on a misconfigured node would make an unauthenticated round trip
+  and log a 401 forever; `Push` already made this choice.
+- **`agent_id` had to be persisted for the response to mean anything.** The
+  tenant column existed (`NOT NULL DEFAULT 'default'`) but `PGStore.Write` never
+  set it and the projection never read it, so a search result would have been
+  unattributable. A blank value is now written as `'default'` rather than as an
+  empty string: the column stays `NOT NULL`, and there is exactly one spelling of
+  "unattributed" instead of two.
+- **`AgentID` is additive on `store.MemoryEntry`,** following Phase 5's precedent
+  for `SupersededBy`/`SyncStatus`. SQLite has no agent column and scans it empty,
+  so no v1 file's schema changed and no existing test's expectation moved.
+- **`PlaneCandidates` lives in `internal/retrieval` and is satisfied
+  structurally** by `*sync.Syncer`. retrieval therefore imports neither
+  `internal/sync` nor `internal/config`, stays mockable with a three-field
+  double, and the edge's HTTP client remains a detail of the binary that wires
+  it up.
+- **A setter, not a constructor parameter, on both v1 servers.** `NewProxy` and
+  `NewAPIServer` are called from 2 and 13 test sites respectively; a setter means
+  none of them changed, and "no plane" is expressed by omission rather than by an
+  argument whose nil-ness a caller has to get right.
+- **The plane's read half is its own interface and its own `NewServer`
+  parameter.** A plane can accept pushes without serving reads, and each endpoint
+  then degrades on its own; `cmd/plane` passes one `tenant.MemoryWriter` for both
+  roles so the read reuses the writer's per-tenant `PGStore` cache instead of
+  opening a second store (and a second pool) per tenant.
+- **Validation returns the status the caller can act on.** A wrong-width
+  embedding is a 400 (`invalid_embedding`) rather than the 500 the store would
+  have produced for a client-side mistake; an empty embedding is *allowed*
+  because both backends answer it with recency ordering; `top_k > 500` is a 400
+  so no caller can ask one request to drag a whole tenant schema across the wire;
+  unknown JSON fields are a 400 as everywhere else in this plane.
+- **The fallback is silent to the caller and loud in the log.** The compile never
+  fails because of the plane, so `plane_unavailable=true fallback=local` is the
+  only observable signal — which is why it is asserted in tests as a literal
+  string, and why the error is logged (it carries no credential by construction).
+- **`pull.go` and `search.go` exist because of the 300-line cap,** not because
+  either half is independently useful: `syncer.go` would have been 308 lines and
+  `handlers.go` 300+ with the new code inline. Both splits mirror an existing
+  precedent in the same packages.
+
+Limitations this phase deliberately did not close:
+
+- **A reachable plane means local memories are not consulted at all.** This is
+  the specified behavior ("if success: use the plane results"), and it has a
+  sharp consequence: a node pointed at an *empty* plane compiles with no memories
+  even though its own SQLite store has rows. Merging the two sets is a product
+  decision, not an oversight, and is left for a phase that can reason about
+  ranking across sources.
+- **`sync_pending` marking is still unbuilt,** so an edge node cannot populate
+  the plane by itself yet. The live verification below therefore seeds the plane
+  through `POST /v2/sync/memories` — the same route the edge's own flusher uses.
+- **Supersession can select a plane-sourced candidate.** `FindSupersededCandidate`
+  runs over whatever candidates retrieval returned, so a plane uuid can reach
+  `MarkSuperseded` on the local store, which reports "no memory found with id
+  …". That is logged, not fatal, and pre-dates this phase's read path.
+- **The plane still verifies a tenant JWT, not the opaque API key**, so
+  `control-plane-api-key` must be the jwt returned at provisioning. Both the
+  push and the new pull route are behind the same middleware.
+- **Success costs latency; the 200ms is only a ceiling on failure.** A local
+  plane with one row answered in 123ms total, versus 75ms offline — the compile
+  now waits for the network on the happy path, which is the trade the phase
+  specifies.
+- **The trace carries counts, not provenance.** `MemoryTrace` has no "which side
+  answered" field, so the fallback is visible in logs rather than in the trace
+  inspector; adding it would mean editing `internal/trace` (v1).
+- **`internal/proxy/proxy.go`, `internal/api/api.go`, `cmd/synapse/main.go` (and
+  `internal/store/store.go`) remain `gofmt -l` candidates** — as they already
+  were at HEAD (73, 383, 94 and 217 diff lines). The added lines follow the
+  surrounding style rather than reformatting v1 code wholesale, which is the same
+  choice Phase 5 recorded.
+
+Verification (real output, this phase):
+
+```text
+$ gofmt -l internal/sync/pull.go internal/sync/syncer.go internal/sync/syncer_test.go \
+    internal/plane/search.go internal/plane/search_test.go internal/plane/handlers.go \
+    internal/plane/sync.go internal/plane/handlers_test.go internal/plane/sync_test.go \
+    internal/retrieval/retrieval.go internal/retrieval/retrieval_test.go \
+    internal/tenant/memorywriter.go internal/store/pgread.go internal/store/pgstore.go \
+    internal/store/pgstore_test.go internal/plane/provision.go
+(no output -- every new file and every line added to a clean file is gofmt-clean)
+$ gofmt -l internal/proxy/proxy.go internal/api/api.go cmd/synapse/main.go internal/store/store.go
+internal/proxy/proxy.go
+internal/api/api.go
+cmd/synapse/main.go
+internal/store/store.go
+(already unformatted at HEAD: 73, 383, 94 and 217 diff lines respectively)
+
+$ go vet ./...
+(no output)
+
+$ go test ./internal/sync/... -count=1 -v
+--- PASS: TestNewSyncerUsesConfiguredValuesAndGuardsZeroes (0.00s)
+--- PASS: TestPushSendsOneRequestWithEveryMemory (0.00s)
+--- PASS: TestPushMixedSessionsSendsAnEmptyEnvelopeSession (0.00s)
+--- PASS: TestPushRejectsNon2xxWithoutLeakingTheCredential (0.00s)
+--- PASS: TestPushWrapsATransportError (0.00s)
+--- PASS: TestPushWithoutCredentialOrEntries (0.00s)
+--- PASS: TestFlushMarksEverythingThePlaneAccepted (0.30s)
+--- PASS: TestFlushLeavesMemoriesPendingWhenThePlaneRefuses (0.25s)
+--- PASS: TestFlushDrainsInBatchesOfTheConfiguredBatchSize (0.25s)
+--- PASS: TestFlushAbandonsTheOldestWhenTheBacklogIsOverTheHardLimit (0.32s)
+--- PASS: TestFlushWarnsOnALargeBacklogBelowTheHardLimit (0.38s)
+--- PASS: TestFlushReportsAnAcknowledgementFailure (0.00s)
+--- PASS: TestRunBackgroundFlushesUntilTheContextIsCancelled (0.29s)
+--- PASS: TestPullCandidatesTimesOutOnASlowPlane (0.25s)
+--- PASS: TestPullCandidatesReportsARefusedRequestImmediately (0.00s)
+--- PASS: TestPullCandidatesReturnsThePlanesMemories (0.00s)
+--- PASS: TestPullCandidatesWithoutACredentialMakesNoRequest (0.00s)
+--- PASS: TestPullCandidatesWrapsATransportError (0.00s)
+PASS
+ok  	synapse/internal/sync	2.037s
+
+$ go test ./internal/retrieval/... ./internal/plane/... -count=1 -v
+PASS
+ok  	synapse/internal/retrieval	0.018s
+--- PASS: TestSearchMemoriesRequiresAVerifiedTenantToken (0.00s)
+--- PASS: TestSearchMemoriesFailsClosedWithoutATokenMiddleware (0.00s)
+--- PASS: TestSearchMemoriesReadsTheTokensTenant (0.00s)
+--- PASS: TestSearchMemoriesAnswersAnEmptyTenantWithAnEmptyArray (0.00s)
+--- PASS: TestSearchMemoriesRejectsMalformedRequests (0.00s)
+--- PASS: TestSearchMemoriesWithoutASearcherAnswersInternal (0.00s)
+--- PASS: TestSearchMemoriesReportsAFailureWithoutLeakingIt (0.00s)
+--- PASS: TestSyncMemoriesRequiresAVerifiedTenantToken (0.00s)   (Phase 8, unchanged)
+--- PASS: TestSyncMemoriesFailsClosedWithoutATokenMiddleware (0.00s)
+--- PASS: TestSyncMemoriesStoresTheBatchInTheTokensTenant (0.00s)
+--- PASS: TestSyncMemoriesAcceptsAnEmptyBatch (0.00s)
+--- PASS: TestSyncMemoriesRejectsBadInput (0.06s)
+--- PASS: TestSyncMemoriesReportsAStorageFailureAsInternal (0.00s)
+--- PASS: TestSyncMemoriesWithoutAWriterAnswersInternally (0.00s)
+PASS
+ok  	synapse/internal/plane	0.246s
+
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+    go test ./internal/store/... ./internal/tenant/... -count=1 -v -run 'TestPGStore|TestRunMigrations'
+=== RUN   TestPGStore/an_agent_id_round-trips_and_a_blank_one_becomes_the_column_default
+--- PASS: TestPGStore (0.81s)
+    --- PASS: TestPGStore/an_agent_id_round-trips_and_a_blank_one_becomes_the_column_default (0.02s)
+--- PASS: TestPGStoreRejectsInvalidSlug (0.07s)
+PASS
+ok  	synapse/internal/store	0.884s
+--- PASS: TestRunMigrationsIsIdempotentAndCreatesEveryDocumentedTable (0.04s)
+PASS
+ok  	synapse/internal/tenant	0.053s
+
+$ go test ./... -count=1
+ok  	synapse/internal/api	0.877s
+ok  	synapse/internal/budget	0.323s
+ok  	synapse/internal/classifier	0.009s
+ok  	synapse/internal/compiler	0.318s
+ok  	synapse/internal/config	0.006s
+ok  	synapse/internal/dedup	0.007s
+ok  	synapse/internal/embedder	2.429s
+ok  	synapse/internal/integration	2.236s
+ok  	synapse/internal/plane	0.053s
+ok  	synapse/internal/proxy	0.285s
+ok  	synapse/internal/retrieval	0.011s
+ok  	synapse/internal/scorer	0.011s
+ok  	synapse/internal/store	3.309s
+ok  	synapse/internal/supersession	0.005s
+ok  	synapse/internal/sync	3.442s
+ok  	synapse/internal/tenant	0.783s
+ok  	synapse/internal/trace	0.181s
+```
+
+Live end-to-end test — real binaries, real Postgres, real traffic. The compose
+`db` service from Phase 4 was already up (`docker compose ps`: `db` healthy,
+`127.0.0.1:5432->5432`), so only the plane and the edge node were started. The
+plane ran with its four secrets from the environment and no config file; the edge
+ran with `control-plane-url: http://127.0.0.1:9090`, `control-plane-api-key` set
+to the tenant JWT from provisioning, and `agent-id: edge-agent-1`. The edge's
+config file was written 0600 and both the JWT and the API key are masked or
+absent from everything printed below.
+
+```text
+$ SYNAPSE_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+  SYNAPSE_JWT_SECRET='…' SYNAPSE_ADMIN_TOKEN='…' SYNAPSE_MASTER_KEY='…' \
+  ./bin/plane > /tmp/synapse-phase9/plane.log 2>&1 &
+--- plane.pid=204826
+$ curl -s http://127.0.0.1:9090/health
+{"status":"ok","version":"2.0.0","db":"connected"}
+
+$ curl -s -X POST http://127.0.0.1:9090/v2/tenants -H 'Authorization: <admin token>' \
+      -H 'Content-Type: application/json' -d '{"slug":"phase9-edge"}' -o tenant.json
+$ jq '{tenant_id, jwt_len: (.jwt|length), api_key_len: (.api_key|length)}' tenant.json
+{ "tenant_id": "8493f5cd-6068-4806-8d88-c3991d386701", "jwt_len": 385, "api_key_len": 64 }
+
+$ ./bin/synapse --config /tmp/synapse-phase9/edge.yaml    # 0600, credential redacted above
+INFO synapse: Store initialized db_path=/tmp/synapse-phase9/edge.db
+INFO synapse: sync: background flusher started control_plane_url=http://127.0.0.1:9090/v2/sync/memories agent_id=edge-agent-1 interval_seconds=30 batch_size=20
+INFO synapse: ONNX embedder initialized with real inference model=/home/ranscky/Dev/synapse/models/all-MiniLM-L6-v2/model.onnx
+INFO synapse: Synapse security: proxy bound to 127.0.0.1:8080, upstream 127.0.0.1:11434, …
+
+# --- compile #1: plane reachable, tenant schema empty -------------------------
+$ curl -s -X POST http://127.0.0.1:8080/v1/compile -H 'Content-Type: application/json' \
+    -d '{"session_id":"sess-phase9","messages":[{"role":"user","content":"what did we decide about the retrieval pipeline?"}]}' \
+    -o compile1.json -w 'HTTP %{http_code} in %{time_total}s\n'
+HTTP 200 in 0.304428s
+$ jq '.trace | {candidates_retrieved, candidates_after_dedup, tokens_used}' compile1.json
+{ "candidates_retrieved": 0, "candidates_after_dedup": 0, "tokens_used": 0 }
+$ jq -r '.compiled_messages[] | "[\(.role)] \(.content)"' compile1.json
+[user] what did we decide about the retrieval pipeline?
+plane.log: INFO plane: Memories searched tenant_slug=phase9-edge agent_id=edge-agent-1 memories=0
+   ^ the edge really did ask the plane, and the plane's org-scoped answer was
+     empty -- which is the correct first answer on a fresh tenant
+
+# --- seed a memory that exists ONLY on the plane ------------------------------
+$ curl -s -X POST http://127.0.0.1:9090/v2/sync/memories -H "Authorization: Bearer $JWT" \
+    -H 'Content-Type: application/json' -d @push.json        # 384-float embedding, session sess-phase9
+{"written":1,"sanitized":0}
+plane.log: INFO plane: Memories synced tenant_slug=phase9-edge agent_id=edge-agent-1 written=1 sanitized=0
+```
+
+```text
+# --- compile #2: the same request, now that the plane holds an org memory ------
+$ curl -s -X POST http://127.0.0.1:8080/v1/compile -H 'Content-Type: application/json' \
+    -d '{"session_id":"sess-phase9","messages":[{"role":"user","content":"what did we decide about the retrieval pipeline?"}]}' \
+    -o compile2.json -w 'HTTP %{http_code} in %{time_total}s\n'
+HTTP 200 in 0.123633s
+$ jq '.trace | {candidates_retrieved, candidates_after_dedup, tokens_used}' compile2.json
+{ "candidates_retrieved": 1, "candidates_after_dedup": 1, "tokens_used": 20 }
+$ jq -r '.compiled_messages[] | "[\(.role)] \(.content)"' compile2.json
+[user] [Memory: decision] PLANE-ONLY-MEMORY: the org decided the retrieval pipeline embeds once per turn.
+
+what did we decide about the retrieval pipeline?
+plane.log: INFO plane: Memories searched tenant_slug=phase9-edge agent_id=edge-agent-1 memories=1
+
+# the memory that just entered the compiled context is NOT in local SQLite --
+# the only way it could have been compiled is from the plane's answer:
+$ python3 -c "import sqlite3;print(sqlite3.connect('/tmp/synapse-phase9/edge.db').execute('select id, substr(content,1,45) from memories').fetchall())"
+[('req-1789911788250180931', 'what did we decide about the retrieval p'), ('req-1789911802670566057', 'what did we decide about the retrieval p')]
+
+# --- compile #3: the plane process is killed -----------------------------------
+$ kill $(cat plane.pid)
+$ curl -s -m 2 http://127.0.0.1:9090/health
+connection refused
+$ curl -s -X POST http://127.0.0.1:8080/v1/compile -H 'Content-Type: application/json' \
+    -d '{"session_id":"sess-phase9","messages":[{"role":"user","content":"what did we decide about the retrieval pipeline?"}]}' \
+    -o compile3.json -w 'HTTP %{http_code} in %{time_total}s\n'
+HTTP 200 in 0.076302s
+edge.log: WARN synapse: Control plane candidate pull failed, falling back to local search \
+          plane_unavailable=true fallback=local \
+          error="sync: search request: Get \"http://127.0.0.1:9090/v2/memories/search\": dial tcp 127.0.0.1:9090: connect: connection refused"
+$ jq '.trace | {candidates_retrieved, candidates_after_dedup, tokens_used}' compile3.json
+{ "candidates_retrieved": 2, "candidates_after_dedup": 1, "tokens_used": 9 }
+$ jq -r '.compiled_messages[] | "[\(.role)] \(.content)"' compile3.json
+[user] [Memory: context] what did we decide about the retrieval pipeline?
+
+what did we decide about the retrieval pipeline?
+```
+
+That transcript is the phase's contract working in both directions:
+
+- **Plane reachable** — the plane's own log line (`Memories searched …
+  memories=0`, then `memories=1`) proves the edge asked, and compile #2 compiled a
+  memory that exists nowhere in the edge's SQLite file: org-scoped retrieval,
+  end to end.
+- **Plane killed** — one WARN with `plane_unavailable=true fallback=local`, HTTP
+  200 in 76ms, and the local store's own rows (2 retrieved, 1 after dedup, both
+  from this session's earlier turns) compiled instead. The compile never failed
+  and the credential appears nowhere in the log.
+- **Cost of success vs. cost of failure** — 123ms with the plane answering (its
+  round trip is inside the compile), 76ms offline, where the refused connection
+  costs essentially nothing and the 200ms ceiling never has to fire.
+
+Cleanup after the run: the edge process was stopped, and the JWT-bearing
+`tenant.json`/`edge.yaml` were shredded (both were 0600 and never committed).
+
+Next phase: mark memories `sync_pending` on the write path, so an edge node
+populates its plane without a hand-pushed batch — the piece Phase 8 expected this
+phase to be.
 
 

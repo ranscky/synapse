@@ -205,6 +205,28 @@ func TestPGStore(t *testing.T) {
 		assert.Equal(t, SyncStatusSyncPending, got[0].SyncStatus)
 	})
 
+	// Phase 9: the search endpoint returns agent_id so an edge node can tell
+	// which node wrote a memory, which only works if the write path stores it.
+	t.Run("an agent id round-trips and a blank one becomes the column default", func(t *testing.T) {
+		named := testEntry(uuid.NewString(), "session-agent", embeddingAt(0, 1))
+		named.AgentID = "edge-agent-1"
+		require.NoError(t, st.Write(ctx, named))
+
+		anonymous := testEntry(uuid.NewString(), "session-agent", embeddingAt(1, 1))
+		require.NoError(t, st.Write(ctx, anonymous))
+
+		got, err := st.Search(ctx, query, "session-agent", 10)
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+
+		byID := make(map[string]string, len(got))
+		for _, e := range got {
+			byID[e.ID] = e.AgentID
+		}
+		assert.Equal(t, "edge-agent-1", byID[named.ID], "a named agent must survive the write")
+		assert.Equal(t, "default", byID[anonymous.ID], "a blank agent id is stored as the schema's own default, never as an empty string")
+	})
+
 	t.Run("write rejects an id that is not a uuid", func(t *testing.T) {
 		entry := testEntry("req-1234567890", "session-a", embeddingAt(0, 1))
 		require.Error(t, st.Write(ctx, entry))

@@ -132,11 +132,17 @@ func main() {
 	// the store-backed memory writer (schema-per-tenant, reusing the store's
 	// sanitization) and the tenant JWT middleware, which the plane cannot import
 	// directly (internal/tenant imports this package).
+	//
+	// Phase 9 adds the read half: one tenant-backed value serves as both the
+	// writer and the searcher, so the search endpoint reuses the same per-tenant
+	// PGStore cache (and the same connection pool) the write path built.
+	memoryStore := tenant.NewMemoryWriter(pool)
 	srv := plane.NewServer(
 		cfg,
 		pool,
 		tenant.NewProvisioner(cfg, tenant.NewStore(pool)),
-		tenant.NewMemoryWriter(pool),
+		memoryStore,
+		memoryStore,
 		tenant.JWTMiddleware(cfg),
 		logger,
 	)

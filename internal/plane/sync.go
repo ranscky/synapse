@@ -134,6 +134,14 @@ func (s *Server) handleSyncMemories(w http.ResponseWriter, r *http.Request) {
 		// is where the store's one sanitization pipeline lives.
 		memory.SyncStatus = store.SyncStatusSynced
 
+		// Attribution comes from the envelope's agent_id. It is what the search
+		// endpoint later returns alongside the memory, so the edge can tell
+		// which node wrote what; a memory that carries an agent of its own
+		// keeps it, because the envelope describes the batch, not the memory.
+		if memory.AgentID == "" {
+			memory.AgentID = req.AgentID
+		}
+
 		memories = append(memories, memory)
 	}
 

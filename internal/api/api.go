@@ -35,6 +35,11 @@ type APIServer struct {
 	router          *chi.Mux
 	store           *store.Store
 	embedder        embedder.Embedder
+	// plane, when non-nil, is the control plane candidate source the compile
+	// pipeline consults before the local store -- see retrieval.Candidates.
+	// cmd/synapse installs it with SetPlaneCandidates when control-plane-url is
+	// configured; nil, the default, is local-only retrieval.
+	plane           retrieval.PlaneCandidates
 	config          *config.Config
 	rateLimiter     *RateLimiter
 	persistTraces   bool
@@ -146,6 +151,17 @@ func NewAPIServer(store *store.Store, emb embedder.Embedder, cfg *config.Config,
 	return api
 }
 
+// SetPlaneCandidates installs the control plane source the compile pipeline
+// asks for candidate memories before falling back to its local store. It must
+// be called before the server starts serving.
+//
+// A setter rather than a constructor parameter so that no existing NewAPIServer
+// call site -- production or test -- has to change, and so a standalone node is
+// wired by omission: nil means local-only retrieval, exactly the v1 behavior.
+func (a *APIServer) SetPlaneCandidates(plane retrieval.PlaneCandidates) {
+	a.plane = plane
+}
+
 // setupRoutes configures the API routes
 func (a *APIServer) setupRoutes() {
 	a.router.Use(a.rateLimitMiddleware)
@@ -240,7 +256,7 @@ func (a *APIServer) runCompilePipeline(ctx context.Context, sessionID string, me
 	// production again -- embeds the query, then semantically searches the
 	// full session memory store instead of pulling the most recent 20 by
 	// recency.
-	retrievalResult, err := retrieval.Candidates(ctx, a.store, a.embedder, sessionID, lastUserMessage, a.config.RetrievalCandidateK)
+	retrievalResult, err := retrieval.Candidates(ctx, a.store, a.embedder, a.plane, sessionID, lastUserMessage, a.config.RetrievalCandidateK)
 	if err != nil {
 		return nil, err
 	}

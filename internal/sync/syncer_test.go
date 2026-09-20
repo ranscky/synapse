@@ -476,3 +476,211 @@ func TestRunBackgroundFlushesUntilTheContextIsCancelled(t *testing.T) {
 	// A missing store is a no-op, not a nil-pointer panic in a goroutine.
 	syncer.RunBackground(context.Background(), nil)
 }
+
+// searchRecord is one candidate-pull request the stub plane received.
+type searchRecord struct {
+	method        string
+	path          string
+	authorization string
+	contentType   string
+	body          searchRequest
+}
+
+// newSearchStub returns a control-plane stub for GET /v2/memories/search: it
+// records the request over a channel, sleeps delay, then answers with status
+// (and, for a 2xx, with answer as the body).
+//
+// The record is sent before the delay on purpose. A test has to be able to
+// assert on a request whose answer the edge never reads -- that is exactly the
+// timeout case -- and a stub that only recorded after answering would race with
+// the client giving up.
+func newSearchStub(t *testing.T, delay time.Duration, status int, answer searchResponse) (*httptest.Server, <-chan searchRecord) {
+	t.Helper()
+
+	received := make(chan searchRecord, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read failed", http.StatusBadRequest)
+			return
+		}
+
+		var body searchRequest
+		_ = json.Unmarshal(raw, &body)
+
+		received <- searchRecord{
+			method:        r.Method,
+			path:          r.URL.Path,
+			authorization: r.Header.Get("Authorization"),
+			contentType:   r.Header.Get("Content-Type"),
+			body:          body,
+		}
+
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+
+		w.WriteHeader(status)
+		if status >= 200 && status <= 299 {
+			_ = json.NewEncoder(w).Encode(answer)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	return server, received
+}
+
+// nextSearch returns the next recorded request, failing the test rather than
+// hanging if the syncer never made one.
+func nextSearch(t *testing.T, received <-chan searchRecord) searchRecord {
+	t.Helper()
+
+	select {
+	case record := <-received:
+		return record
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "the syncer never pulled candidates")
+		return searchRecord{}
+	}
+}
+
+// queryVector builds the 384-dim vector a real embedder would hand the syncer.
+func queryVector() []float32 {
+	vec := make([]float32, store.EmbeddingDimensions)
+	vec[0] = 1
+
+	return vec
+}
+
+// planeVector builds a 384-dim vector a plane answer can carry, with one
+// recognisable non-zero element so a JSON round trip is assertable.
+func planeVector() []float32 {
+	vec := make([]float32, store.EmbeddingDimensions)
+	vec[7] = 0.5
+
+	return vec
+}
+
+// TestPullCandidatesTimesOutOnASlowPlane is the phase's central timing
+// assertion: a plane that answers after 250ms must not hold up a compile. The
+// error has to be the timeout (so a caller can recognise it), it has to arrive
+// before the plane's answer does, and it must never carry the credential.
+func TestPullCandidatesTimesOutOnASlowPlane(t *testing.T) {
+	logs := captureLogs(t)
+	server, received := newSearchStub(t, 250*time.Millisecond, http.StatusOK, searchResponse{})
+	syncer := newTestSyncer(server.URL)
+
+	start := time.Now()
+	memories, err := syncer.PullCandidates(context.Background(), queryVector(), testSession, 20)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Nil(t, memories)
+	assert.ErrorIs(t, err, context.DeadlineExceeded, "the 200ms ceiling is what failed, not the plane's answer")
+	assert.Less(t, elapsed, 250*time.Millisecond, "the pull must be abandoned at its own timeout, not when the plane finally answers")
+	assert.GreaterOrEqual(t, elapsed, pullTimeout-20*time.Millisecond, "the pull must actually wait out its budget")
+
+	// The request is asserted anyway: timing out is not the same as not asking,
+	// and the wire shape is what the plane's handler has to accept.
+	record := nextSearch(t, received)
+	assert.Equal(t, http.MethodGet, record.method)
+	assert.Equal(t, "/v2/memories/search", record.path)
+	assert.Equal(t, "Bearer "+testPlaneKey, record.authorization)
+	assert.Equal(t, "application/json", record.contentType)
+	assert.Equal(t, testAgentID, record.body.AgentID)
+	assert.Equal(t, testSession, record.body.SessionID)
+	assert.Equal(t, 20, record.body.TopK)
+	require.Len(t, record.body.QueryEmbedding, store.EmbeddingDimensions, "the query vector crosses the wire whole")
+
+	assert.NotContains(t, err.Error(), testPlaneKey)
+	assert.NotContains(t, logs.String(), testPlaneKey, "a pull failure must never put the credential in a log")
+}
+
+// TestPullCandidatesReportsARefusedRequestImmediately pins the other half of the
+// error contract: a plane that is up but refusing must not make the edge wait
+// out its whole budget before falling back.
+func TestPullCandidatesReportsARefusedRequestImmediately(t *testing.T) {
+	server, received := newSearchStub(t, 0, http.StatusServiceUnavailable, searchResponse{})
+	syncer := newTestSyncer(server.URL)
+
+	start := time.Now()
+	memories, err := syncer.PullCandidates(context.Background(), queryVector(), testSession, 20)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Nil(t, memories)
+	assert.Equal(t, "sync: search failed status=503", err.Error())
+	assert.NotContains(t, err.Error(), testPlaneKey)
+	assert.Less(t, elapsed, 100*time.Millisecond, "503 is an answer, not a hang")
+
+	nextSearch(t, received)
+}
+
+func TestPullCandidatesReturnsThePlanesMemories(t *testing.T) {
+	answer := searchResponse{Memories: []store.MemoryEntry{
+		{
+			ID: "11111111-1111-1111-1111-111111111111", SessionID: testSession,
+			Content: "org memory", MemoryType: "fact", Importance: 0.9,
+			AgentID: "edge-agent-2", Embedding: planeVector(),
+		},
+		{
+			ID: "22222222-2222-2222-2222-222222222222", SessionID: testSession,
+			Content: "another org memory", MemoryType: "decision", AgentID: "edge-agent-3",
+		},
+	}}
+	server, received := newSearchStub(t, 0, http.StatusOK, answer)
+	syncer := newTestSyncer(server.URL)
+
+	memories, err := syncer.PullCandidates(context.Background(), queryVector(), testSession, 5)
+	require.NoError(t, err)
+	require.Len(t, memories, 2)
+
+	assert.Equal(t, answer.Memories[0].ID, memories[0].ID)
+	assert.Equal(t, "org memory", memories[0].Content)
+	assert.Equal(t, "edge-agent-2", memories[0].AgentID, "the agent that pushed a memory is part of the plane's answer")
+	require.Len(t, memories[0].Embedding, store.EmbeddingDimensions, "the embedding has to survive the wire: the scorer needs it")
+	assert.Equal(t, float32(0.5), memories[0].Embedding[7])
+	assert.Equal(t, "fact", memories[0].MemoryType)
+	assert.Equal(t, "edge-agent-3", memories[1].AgentID)
+	assert.Nil(t, memories[1].Embedding, "a memory stored without an embedding stays nil rather than empty")
+
+	record := nextSearch(t, received)
+	assert.Equal(t, testAgentID, record.body.AgentID, "the querying agent names itself")
+	assert.Equal(t, 5, record.body.TopK)
+}
+
+func TestPullCandidatesWithoutACredentialMakesNoRequest(t *testing.T) {
+	server, received := newSearchStub(t, 0, http.StatusOK, searchResponse{})
+
+	noKey := NewSyncer(config.Config{ControlPlaneURL: server.URL, AgentID: testAgentID})
+	memories, err := noKey.PullCandidates(context.Background(), queryVector(), testSession, 20)
+	require.Error(t, err)
+	assert.Nil(t, memories)
+	assert.Contains(t, err.Error(), "control-plane-api-key")
+
+	// A syncer with no plane configured refuses for the same reason: the
+	// alternative is an unauthenticated request to a URL that does not exist on
+	// every single compile.
+	noPlane := NewSyncer(config.Config{ControlPlaneAPIKey: testPlaneKey, AgentID: testAgentID})
+	_, err = noPlane.PullCandidates(context.Background(), queryVector(), testSession, 20)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "control-plane-url")
+
+	assert.Empty(t, received, "neither call may reach the plane")
+}
+
+func TestPullCandidatesWrapsATransportError(t *testing.T) {
+	server, _ := newSearchStub(t, 0, http.StatusOK, searchResponse{})
+	syncer := newTestSyncer(server.URL)
+
+	// Nothing is listening any more, so the pull cannot leave the machine --
+	// the same shape as an edge node whose plane process has died.
+	server.Close()
+
+	memories, err := syncer.PullCandidates(context.Background(), queryVector(), testSession, 20)
+
+	require.Error(t, err)
+	assert.Nil(t, memories)
+	assert.Contains(t, err.Error(), "sync: search request:")
+	assert.NotContains(t, err.Error(), testPlaneKey)
+}

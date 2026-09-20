@@ -1,11 +1,16 @@
-// Package sync is the edge node's push side of the Synapse v2 sync protocol:
-// it ships memories the local store has marked sync_pending to a control plane
-// over HTTP, in batches, from a background goroutine.
+// Package sync is the edge node's side of the Synapse v2 sync protocol: it
+// ships memories the local store has marked sync_pending to a control plane
+// over HTTP, in batches, from a background goroutine, and it fetches the
+// org-scoped candidate memories the compilation path scores.
 //
-// Nothing in this package is called from a request path. The compilation hot
-// path never blocks on a network call; the worst a slow or unreachable plane
-// can do is make the background flusher log a warning and leave rows pending
-// for the next interval (Phase 9 wires the write path to mark them).
+// Push is called from a background goroutine and never from a request path: the
+// worst a slow or unreachable plane can do there is make the flusher log a
+// warning and leave rows pending for the next interval. PullCandidates is
+// called from the compilation path -- deliberately, because a shared plane holds
+// memories this node does not -- but it is bounded by a hard 200ms ceiling and
+// reports every failure to its caller, whose contract is to fall back to the
+// local store. A plane that is slow, broken, or gone therefore costs one
+// request's ceiling and never a failed compilation.
 package sync
 
 import (
@@ -31,6 +36,9 @@ const (
 	// answer inside five seconds is treated as unreachable and the batch simply
 	// stays pending, which is the whole point of doing this off the request path.
 	pushTimeout = 5 * time.Second
+
+	// The read half of this package -- the candidate pull and the latency
+	// budget it is allowed -- lives in pull.go.
 
 	// defaultSyncInterval and defaultSyncBatchSize mirror config.DefaultConfig().
 	// They exist to guard a hand-built config (a test, an embedder-style caller)

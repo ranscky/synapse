@@ -36,9 +36,12 @@ db-path: ""
 # standalone behavior above is unchanged.
 
 # Secret credential this agent presents to the control plane as a Bearer token;
-# seeded from SYNAPSE_PLANE_KEY, never logged, never commit one. The sync route
-# verifies a tenant JWT today, so this value must be the jwt returned when the
-# tenant was provisioned (opaque API-key verification is a later phase).
+# seeded from SYNAPSE_PLANE_KEY, never logged, never commit one. One credential
+# covers both directions: the sync route verifies it on a push, and
+# GET /v2/memories/search verifies it when the compile path pulls candidates.
+# Both routes verify a tenant JWT today, so this value must be the jwt returned
+# when the tenant was provisioned (opaque API-key verification is a later
+# phase).
 # control-plane-api-key: ""
 # Stable identifier for this node; required as soon as control-plane-url is set.
 # agent-id: ""

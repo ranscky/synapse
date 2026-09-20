@@ -56,7 +56,7 @@ func newSyncRouter(t *testing.T, cfg *plane.PlaneConfig, writer plane.MemoryWrit
 	var logs bytes.Buffer
 	logger := charmlog.NewWithOptions(&logs, charmlog.Options{Level: charmlog.DebugLevel, ReportTimestamp: false})
 
-	return plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, writer, tenant.JWTMiddleware(cfg), logger).Routes(), &logs
+	return plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, writer, nil, tenant.JWTMiddleware(cfg), logger).Routes(), &logs
 }
 
 // tenantToken mints a real token with the tenant layer, so these tests exercise
@@ -146,7 +146,7 @@ func TestSyncMemoriesFailsClosedWithoutATokenMiddleware(t *testing.T) {
 	writer := &fakeMemoryWriter{}
 
 	cfg := newConfig(adminToken)
-	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, writer, nil, logger).Routes()
+	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, writer, nil, nil, logger).Routes()
 
 	rec := postSync(router, "Bearer "+tenantToken(t, cfg), syncPayload(t, "session-1", "edge-agent-1", nil))
 

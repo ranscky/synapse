@@ -166,21 +166,24 @@ func main() {
 	}
 	defer storeInstance.Close()
 
-	// v2 edge sync (Phase 8). When a control plane is configured, a background
-	// goroutine drains memories the local write path marks sync_pending and
-	// pushes them in batches. It is the only thing in the process that talks to
-	// the control plane: nothing in the request path calls the syncer, so a slow
-	// or unreachable plane cannot add latency to a compile (Phase 9 is what
-	// marks a memory pending in the first place).
+	// v2 edge sync (Phase 8) and candidate pull (Phase 9). When a control plane
+	// is configured, one Syncer serves both directions: a background goroutine
+	// drains memories the local write path marks sync_pending and pushes them in
+	// batches, and -- further down, once the servers exist -- the compile path
+	// asks the same client for org-scoped candidates before falling back to the
+	// local store.
 	//
 	// The context is this process's own, cancelled by the deferred cancel on the
 	// shutdown path below; a failed push simply leaves rows pending for the next
-	// interval, so there is no error to handle here.
+	// interval, so there is no error to handle here. The pull side takes its own
+	// 200ms ceiling per call, so a slow plane costs one bounded wait rather than
+	// a failed compile.
+	var syncer *sync.Syncer
 	if cfg.ControlPlaneURL != "" {
 		syncCtx, cancelSync := context.WithCancel(context.Background())
 		defer cancelSync()
 
-		syncer := sync.NewSyncer(*cfg)
+		syncer = sync.NewSyncer(*cfg)
 		go syncer.RunBackground(syncCtx, storeInstance)
 	}
 
@@ -238,6 +241,16 @@ func main() {
 	if err != nil {
 		slog.Error("Failed to create proxy", "error", err)
 		os.Exit(1)
+	}
+
+	// Phase 9: the same client that pushes memories answers the compile path's
+	// candidate queries. Both servers receive it, so /v1/compile and live
+	// proxied traffic share one source and one fallback policy. syncer is
+	// non-nil only when control-plane-url is set, and leaving both sources nil
+	// is what keeps a standalone node's retrieval byte-for-byte v1.
+	if syncer != nil {
+		apiServer.SetPlaneCandidates(syncer)
+		proxyInstance.SetPlaneCandidates(syncer)
 	}
 	
 	// Create router

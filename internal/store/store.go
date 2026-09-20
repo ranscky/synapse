@@ -28,6 +28,7 @@ type MemoryEntry struct {
 	Embedding  []float32 `json:"embedding,omitempty"`   // 384-dim embedding vector
 	SupersededBy string    `json:"superseded_by,omitempty"`  // ID of the memory that superseded this one, if any. Empty means still active/current. Populated by a later write, never set at the same time a memory is first created.
 	SyncStatus   string    `json:"sync_status,omitempty"`    // Where this memory currently lives, relative to a control plane: "local_only" | "sync_pending" | "synced". A memory written by the standalone v1 binary has never left the machine, so its zero value is normalized to "local_only" on write; a memory written through a tenant's Postgres schema is already on the plane, so its zero value is normalized to "synced". See the SyncStatus* constants.
+	AgentID      string    `json:"agent_id,omitempty"`       // The agent that wrote this memory: the node that pushed it to a control plane, or this node on a locally written row. Populated on every read that can carry it -- a candidate pulled from a plane carries the agent_id of the edge that pushed it -- and left empty by the local SQLite backend, whose table has no agent column (a standalone node IS the agent). Never an isolation key: the tenant is always the verified token's schema, never a value from a row.
 }
 
 // embeddingToBytes serializes a []float32 embedding into a byte slice for

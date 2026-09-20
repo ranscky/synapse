@@ -64,9 +64,26 @@ type Proxy struct {
 	upstream *httputil.ReverseProxy
 	store    MemoryStore
 	embedder Embedder
+	// plane, when non-nil, is the control plane candidate source consulted
+	// before the local store -- see retrieval.Candidates. cmd/synapse installs
+	// it with SetPlaneCandidates when control-plane-url is configured; nil, the
+	// default, is local-only retrieval and is exactly v1's behavior.
+	plane    retrieval.PlaneCandidates
 	config   *config.Config
 	sessionMgr *session.Manager
 	recordCompileTime func(int64) // Optional callback for recording compile time in tests
+}
+
+// SetPlaneCandidates installs the control plane source this proxy asks for
+// candidate memories before falling back to its local store. It must be called
+// before the proxy starts serving.
+//
+// A setter rather than a constructor parameter on purpose: no existing NewProxy
+// call site (production or test) has to change, and a standalone node is wired
+// by omission rather than by an argument whose zero value would have to be
+// trusted to mean "no plane".
+func (p *Proxy) SetPlaneCandidates(plane retrieval.PlaneCandidates) {
+	p.plane = plane
 }
 
 // NewProxy creates a new proxy instance
@@ -463,7 +480,7 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// query, then semantically searches the full session memory store
 	// (rather than pulling the most recent 20 by recency and only scoring
 	// within that window -- see internal/retrieval for why that mattered).
-	retrievalResult, err := retrieval.Candidates(ctx, p.store, p.embedder, sessionID, lastUserMessage, p.config.RetrievalCandidateK)
+	retrievalResult, err := retrieval.Candidates(ctx, p.store, p.embedder, p.plane, sessionID, lastUserMessage, p.config.RetrievalCandidateK)
 	if err != nil {
 		slog.Error("Failed to retrieve candidates", "error", err)
 		p.upstream.ServeHTTP(w, r)

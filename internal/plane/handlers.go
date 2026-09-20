@@ -69,15 +69,21 @@ type Server struct {
 	db       Database
 	tenants  TenantProvisioner
 	memories MemoryWriter
+	searcher MemorySearcher
 	auth     func(http.Handler) http.Handler
 	logger   *charmlog.Logger
 }
 
 // NewServer returns a Server serving the control plane routes. db, tenants,
-// memories, and auth may be nil: the health endpoint then reports a
+// memories, searcher, and auth may be nil: the health endpoint then reports a
 // disconnected database, the provisioning endpoint answers 500, and the sync
-// endpoint refuses every request instead of panicking or trusting an
+// and search endpoints refuse every request instead of panicking or trusting an
 // unverified tenant.
+//
+// memories and searcher are separate parameters rather than one wider interface
+// because they are two different capabilities: a plane can be wired to accept
+// pushes without serving reads, and each endpoint then degrades on its own.
+// cmd/plane passes the same tenant-backed implementation for both.
 //
 // logger may be nil, in which case this package logs nothing.
 func NewServer(
@@ -85,19 +91,22 @@ func NewServer(
 	db Database,
 	tenants TenantProvisioner,
 	memories MemoryWriter,
+	searcher MemorySearcher,
 	auth func(http.Handler) http.Handler,
 	logger *charmlog.Logger,
 ) *Server {
-	return &Server{cfg: cfg, db: db, tenants: tenants, memories: memories, auth: auth, logger: logger}
+	return &Server{cfg: cfg, db: db, tenants: tenants, memories: memories, searcher: searcher, auth: auth, logger: logger}
 }
 
 // Routes returns the plane's router: GET /health is open, POST /v2/tenants is
-// behind the admin token, and POST /v2/sync/memories is behind a tenant token.
+// behind the admin token, and POST /v2/sync/memories plus
+// GET /v2/memories/search are behind a tenant token.
 func (s *Server) Routes() http.Handler {
 	router := chi.NewRouter()
 	router.Get("/health", s.handleHealth)
 	router.With(s.requireAdmin).Post("/v2/tenants", s.handleCreateTenant)
 	router.With(s.requireJWT).Post(syncRoute, s.handleSyncMemories)
+	router.With(s.requireJWT).Get(searchRoute, s.handleSearchMemories)
 
 	return router
 }

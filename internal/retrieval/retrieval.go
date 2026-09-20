@@ -12,6 +12,7 @@ package retrieval
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"synapse/internal/store"
@@ -33,6 +34,24 @@ type Store interface {
 	Search(ctx context.Context, queryEmbedding []float32, sessionID string, topK int) ([]store.MemoryEntry, error)
 }
 
+// PlaneCandidates is the optional control plane candidate source.
+//
+// It is satisfied structurally by *sync.Syncer -- this package deliberately
+// does not import internal/sync (or internal/config), so the edge's HTTP client
+// stays a detail of the binary that wires it up, and this package stays trivial
+// to test with a double.
+//
+// A nil source means "no control plane configured" and Candidates then reads
+// the local store exactly as it did before this interface existed. That is the
+// default for every v1 caller and for every standalone node.
+type PlaneCandidates interface {
+	// PullCandidates returns the control plane's candidates for this query.
+	// It is expected to be bounded by the implementation's own timeout and to
+	// report every failure, because the caller's response to an error is to
+	// fall back to the local store rather than to fail.
+	PullCandidates(ctx context.Context, queryEmbedding []float32, sessionID string, topK int) ([]store.MemoryEntry, error)
+}
+
 // Result bundles the retrieved candidates with the query embedding used to
 // find them (callers need the embedding again downstream: to score
 // candidates against, and to store alongside the new memory entry being
@@ -46,11 +65,20 @@ type Result struct {
 	SearchDuration time.Duration
 }
 
-// Candidates runs the retrieval pipeline: embed the query, then semantically
-// search the full session memory store for the top candidateK matches.
+// Candidates runs the retrieval pipeline: embed the query, then look for the
+// top candidateK memory matches.
 //
-// This replaces the old GetRecent(ctx, sessionID, 20) call that both
-// proxy.go and api.go used to make directly. GetRecent narrowed the
+// Where those candidates come from depends on plane. When a control plane is
+// configured (a non-nil PlaneCandidates) it is asked first, under its own hard
+// timeout: a shared plane holds the org's memories, not just this node's. Any
+// failure -- timeout, connection refused, non-2xx, malformed body -- is logged
+// as a WARN and the local store is searched instead, so an unreachable plane
+// costs one bounded ceiling and never a failed compilation. When plane is nil
+// the local store is the only source and the behavior is exactly what it was
+// before this parameter existed.
+//
+// The local path still replaces the old GetRecent(ctx, sessionID, 20) call that
+// both proxy.go and api.go used to make directly. GetRecent narrowed the
 // candidate pool to the 20 most recent memories *before* any relevance
 // scoring happened, which meant an older memory -- however relevant to the
 // current query -- was structurally invisible to the 4-factor scorer no
@@ -62,12 +90,14 @@ type Result struct {
 // back to its own default of 20 -- matching the permissive-zero convention
 // already used for config.Config's other numeric fields (see Validate()).
 //
-// A nil embedder or empty query skips embedding and calls Search with an
+// A nil embedder or empty query skips embedding and searches with an
 // empty query embedding, which store.Search already handles by falling
 // back to plain recency ordering -- so behavior degrades the same way the
 // old GetRecent(..., 20) path did when there was nothing to embed, rather
-// than returning zero candidates outright.
-func Candidates(ctx context.Context, st Store, emb Embedder, sessionID string, query string, candidateK int) (Result, error) {
+// than returning zero candidates outright. The plane has the same fallback on
+// its own side, so an unembeddable query behaves the same way whichever source
+// answers it.
+func Candidates(ctx context.Context, st Store, emb Embedder, plane PlaneCandidates, sessionID string, query string, candidateK int) (Result, error) {
 	var result Result
 
 	if emb != nil && query != "" {
@@ -78,6 +108,34 @@ func Candidates(ctx context.Context, st Store, emb Embedder, sessionID string, q
 			return result, fmt.Errorf("failed to generate query embedding: %w", err)
 		}
 		result.QueryEmbedding = queryEmbedding
+	}
+
+	if plane != nil {
+		pullStart := time.Now()
+		candidates, err := plane.PullCandidates(ctx, result.QueryEmbedding, sessionID, candidateK)
+		result.SearchDuration = time.Since(pullStart)
+
+		// No error means the plane answered inside its own ceiling, and its
+		// answer is the candidate set -- empty included. The local store is
+		// deliberately not merged in: the plane is the org's record, so mixing
+		// a node's private rows into it would make the compiled context depend
+		// on which node happened to build it.
+		if err == nil {
+			result.Candidates = candidates
+			return result, nil
+		}
+
+		// The fallback is silent to the caller and loud in the log: a plane
+		// that is down must not fail a compile, but an operator has to be able
+		// to see that this node is serving from local memory. The error is
+		// logged, which is the only place it is kept -- it carries no
+		// credential (see sync.PullCandidates) and the caller must not fail on
+		// it.
+		slog.Warn("Control plane candidate pull failed, falling back to local search",
+			"plane_unavailable", true,
+			"fallback", "local",
+			"error", err,
+		)
 	}
 
 	if st == nil {
