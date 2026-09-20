@@ -98,3 +98,109 @@ key-only message): short `jwt-secret`, missing `database-dsn`, missing
 configured port and `/health` answered on 127.0.0.1:9199.
 
 Next phase: not started. Do not add Phase 2 surface here.
+
+## Phase 2 — JWT auth middleware (complete)
+
+Scope was one file plus its test: a chi-compatible middleware that verifies the
+tenant JWT and the accessors handlers use to read the verified claims. No route
+is wired yet, and no v1 package or `cmd/plane` file was touched.
+
+Commit `feat: Phase 2 - JWT auth middleware`
+
+New files:
+
+- `internal/tenant/auth.go` — `JWTMiddleware(*plane.PlaneConfig) func(http.Handler) http.Handler`,
+  the unexported `claims` payload struct (`tenant_id`, `tenant_slug`, `plan`,
+  `compliance_tier`, `admin` + `jwt.RegisteredClaims`), five unexported
+  `ctxKey` values, `writeUnauthorized`, `bearerToken`, `hmacKeyFunc`,
+  `withClaims`, `stringFromCtx`, and the exported accessors
+  `TenantIDFromCtx`, `TenantSlugFromCtx`, `PlanFromCtx`,
+  `ComplianceTierFromCtx`, `IsAdminFromCtx`. 215 lines.
+- `internal/tenant/auth_test.go` — 11 test functions / 29 subtests, all through
+  `httptest.NewRequest` + `httptest.NewRecorder` against a chi router that
+  installs the middleware via `Use`. 296 lines.
+
+Changed files:
+
+- `go.mod` / `go.sum` — `github.com/golang-jwt/jwt/v5 v5.3.1`, the phase's only
+  new dependency (zero transitive deps; its `go.mod` declares `go 1.21`, so the
+  module's `go 1.22.5` directive and CI's Go 1.22 matrix are unaffected).
+  `go mod tidy` is a no-op afterwards.
+
+Decisions made in this phase:
+
+- **Strict, fail-closed verification.** A request is a 401 when the header is
+  absent, the scheme is not `Bearer`, the token is blank or malformed, the
+  algorithm is outside `HS256`/`HS384`/`HS512`, the signature does not match,
+  the token has expired, the token carries **no `exp`** (`jwt.WithExpirationRequired`),
+  the verified token names **no `tenant_id`**, or the middleware was built with
+  no secret (`nil` config or empty `JWTSecret`). A signature-valid token that
+  names no tenant is a rejection, not a zero value: under schema-per-tenant an
+  empty isolation key must never reach a handler.
+- **One 401 body for every reason**, `{"error":"unauthorized"}`, so the response
+  cannot be used as an oracle to learn which check failed. `Content-Type:
+  application/json` and `WWW-Authenticate: Bearer` (RFC 6750 §3) are set.
+- **Algorithm confusion is closed twice**: `jwt.WithValidMethods` allow-lists the
+  HMAC algorithms, and the key function type-asserts
+  `*jwt.SigningMethodHMAC`, so `alg: none` and asymmetric headers can never be
+  verified with the shared secret.
+- **The signing key is captured once at construction** and never re-read from
+  `cfg`, so mutating config after middleware construction cannot change how an
+  in-flight token verifies.
+- **Secret leakage is structurally impossible**: `internal/tenant` imports no
+  logger at all, and rejections never reflect the parser error, the token, or a
+  claim value. The only body ever written is the constant above.
+- **Claims live under unexported `ctxKey` values**, so no other package can read
+  or overwrite a claim with a colliding string key, and the accessors return
+  zero values when a request never passed through the middleware.
+- **Not wired to a route.** `cmd/plane` still serves only `GET /health`;
+  registering a protected route belongs to the phase that adds plane endpoints.
+- The middleware deliberately has no unit-test file of its own for parsing: the
+  token payloads in the tests are built with `jwt.MapClaims` and literal JSON key
+  strings, so a typo in a `claims` struct tag fails the tests rather than passing
+  against itself.
+
+Verification (real output, this phase):
+
+```text
+$ gofmt -l internal/tenant          # empty
+$ go vet ./internal/tenant ./cmd/plane
+VET_OK
+$ go build ./cmd/plane
+BUILD_OK
+$ go test ./internal/tenant/... -v
+--- PASS: TestJWTMiddlewareValidTokenAttachesClaims (0.00s)
+--- PASS: TestJWTMiddlewareLowercaseSchemeAccepted (0.00s)
+--- PASS: TestJWTMiddlewareAbsentAdminClaimDefaultsFalse (0.00s)
+--- PASS: TestJWTMiddlewareExpiredTokenRejected (0.00s)
+--- PASS: TestJWTMiddlewareMissingAuthorizationHeaderRejected (0.00s)
+--- PASS: TestJWTMiddlewareWrongSecretRejected (0.00s)
+--- PASS: TestJWTMiddlewareRejectsUnusableCredentials (0.00s)
+    --- PASS: .../non-bearer_scheme  .../scheme_with_no_separator
+    --- PASS: .../bearer_with_empty_token  .../not_a_jwt  .../expired
+    --- PASS: .../no_exp_claim  .../empty_tenant_id  .../missing_tenant_id
+    --- PASS: .../alg_none
+--- PASS: TestJWTMiddlewareFailsClosedWithoutASecret (0.00s)
+    --- PASS: .../nil_config  .../empty_secret
+--- PASS: TestJWTMiddlewareRejectionsLeakNoCredential (0.00s)
+--- PASS: TestClaimHelpersOnEmptyContext (0.00s)
+--- PASS: TestBearerToken (0.00s)
+    --- PASS: .../canonical  .../lowercase_scheme  .../extra_spacing
+    --- PASS: .../empty_header  .../scheme_with_no_separator
+    --- PASS: .../empty_token  .../other_scheme
+PASS
+ok  	synapse/internal/tenant	0.020s
+
+$ go test ./internal/tenant/... -race -count=1
+ok  	synapse/internal/tenant	1.036s
+
+$ go test ./internal/plane/...
+ok  	synapse/internal/plane	0.009s
+```
+
+`git diff --stat` before the commit: `go.mod` (+1 line), `go.sum` (+4 lines),
+and the two new `internal/tenant` files. No v1 package, `internal/plane`, or
+`cmd/plane` file changed.
+
+Next phase: not started. Registering a protected route — and issuing the tokens
+this middleware verifies — belongs to a later phase.
