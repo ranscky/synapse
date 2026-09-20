@@ -1161,3 +1161,161 @@ Next phase: not started. This phase added no production code; the rest of the v2
 surface (sync, conflict, ledger, mcp, metering, billing) is untouched.
 
 
+## Phase 7 — sync config fields and startup validation (complete)
+
+Commit `feat: Phase 7 - sync config fields and startup validation`
+
+Configuration only. This phase defines the fields the sync protocol will read, and
+the one precondition that keeps a half-configured edge node from ever booting.
+There is no sync logic, no network call, and no new dependency: nothing here sends
+a memory anywhere, and the standalone path behaves exactly as it did in Phase 6.
+`internal/store` was not opened at all — see the item 4 decision below for why it
+did not need to be.
+
+Changed:
+
+- `internal/config/config.go` — the `EnvPlaneKey` constant, six new `Config`
+  fields (`ControlPlaneAPIKey`, `AgentID`, `TeamID`, `DefaultVisibility`,
+  `SyncBatchSize`, `SyncIntervalSeconds`), the matching `DefaultConfig()` values,
+  and one doc block covering all six. `Validate()` is untouched.
+- `cmd/synapse/main.go` — twelve added lines: one comment block, one guard.
+  Nothing else in the file was modified.
+- `synapse.yaml.example` — the new keys, each with the environment variable that
+  supplies it, one comment line per key.
+- `PROGRESS.md` — this entry.
+
+The full key set, including the key that already existed:
+
+| yaml key | Field | Default | Notes |
+| --- | --- | --- | --- |
+| `control-plane-url` | `ControlPlaneURL` | `""` | already present since Phase 5 |
+| `control-plane-api-key` | `ControlPlaneAPIKey` | env `SYNAPSE_PLANE_KEY` | secret: never logged |
+| `agent-id` | `AgentID` | `""` | required once the URL is set |
+| `team-id` | `TeamID` | `""` | optional; empty means tenant-wide |
+| `default-visibility` | `DefaultVisibility` | `"org"` | |
+| `sync-batch-size` | `SyncBatchSize` | `20` | |
+| `sync-interval-seconds` | `SyncIntervalSeconds` | `30` | |
+
+Because `loadConfig` copies `DefaultConfig()` and unmarshals the file over it, a
+config that omits the last three keys still gets `"org"` / `20` / `30` — no loader
+change was needed to make the defaults reachable from a partial file.
+
+Decisions made in this phase:
+
+- **The guard is in `main.go`, not in `Validate()`.** Right after `loadConfig`, so
+  it is the earliest failure the process can have: before the tiktoken warm-up,
+  the flag overrides, `store.NewStore`, embedder init, and the port bind. A node
+  that is pointed at a plane but never names itself therefore cannot write a local
+  row that would later need re-attributing. Keeping it out of `Validate()` also
+  keeps the standalone validation contract exactly as it was, and gives the
+  precondition a single enforcement point and a single message.
+- **`slog.Error` + `os.Exit(1)`, not stdlib `log.Fatal`.** Every other fatal
+  startup path in this file already uses that idiom, and `log/slog` is the file's
+  logger with charmbracelet/log installed as the default handler. Importing
+  `log` would print this one line in a second, unprefixed format. The message
+  string itself is verbatim as specified.
+- **Item 4 needed no work.** `MemoryEntry.SyncStatus` (`store.go:30`), the
+  `SyncStatusLocalOnly` / `SyncStatusSyncPending` / `SyncStatusSynced` constants
+  (`pgstore.go:26-28`), the SQLite migration (`store.go:154`), and
+  `sync_status_test.go` all landed in Phase 5. `internal/store` was left
+  byte-identical, confirmed by `git status`.
+- **`ADD COLUMN IF NOT EXISTS` is not SQLite.** The task's SQL is not accepted by
+  any SQLite version — verified on this machine (transcript below). Phase 5's
+  unconditional `ALTER TABLE memories ADD COLUMN sync_status TEXT NOT NULL DEFAULT
+  'local_only'` that swallows only "duplicate column name" is the equivalent, it
+  is strictly stronger than the requested nullable form, and
+  `TestSyncStatusMigrationAndRoundTrip` covers the migrate-in-place path.
+- **Zero-deletion diff.** The new struct fields and the new `DefaultConfig()`
+  values are appended past the existing alignment groups with a comment separating
+  them, so `gofmt` realigns none of the lines that were already there: +66 / -0.
+  `gofmt -l` is dirty repo-wide and was dirty before this phase (e.g.
+  `path/filepath` import order in `cmd/synapse/main.go`), so `gofmt -w` was
+  deliberately *not* run; `gofmt -d` was used instead to confirm it wants to change
+  none of the added lines.
+- **`bin/synapse` was left alone.** It is a tracked 16.5 MB v1 build artifact
+  (`371186d`), while this project's build convention is
+  `go build -o synapse ./cmd/synapse` into the gitignored `/synapse`
+  (README.md:157, setup.sh:181, ci.yml:117) — Phase 1 already recorded the wart.
+  So the DoD run used `./synapse`, and `bin/synapse` is byte-identical to HEAD
+  (md5 matched against `git cat-file blob`). Recommended follow-up, as its own
+  `chore:` commit: add `/bin/synapse` to `.gitignore` and `git rm --cached` it.
+- **No dependency was added.** The `.clinerules` confirmation rule does not apply
+  here; the six fields need nothing beyond stdlib and the go-yaml already in use.
+
+Verification (real output, this phase):
+
+```text
+$ go build ./cmd/synapse && go build ./... && go vet ./internal/config/... ./cmd/synapse/...
+BUILD OK
+VET OK
+
+$ go test ./internal/config/... ./internal/store/... -count=1
+ok  	synapse/internal/config	0.004s
+ok  	synapse/internal/store	0.875s
+
+$ ./synapse --config /tmp/synapse-phase7/no-agent.yaml
+# control-plane-url set, agent-id absent
+1:04PM ERRO synapse: agent-id is required when control-plane-url is set
+exit=1
+
+$ env -u OPENAI_API_KEY ./synapse --config /tmp/synapse-phase7/with-agent.yaml
+# identical config plus agent-id: "edge-01"
+1:04PM ERRO synapse: Invalid configuration error="openai-api-key is required when using OpenAI embedder"
+exit=1
+```
+
+The second run is the negative control, and it is what makes the first one
+evidence: with `agent-id` supplied, the guard does not fire and the process moves
+on to the next check, so the first failure came from the guard rather than from
+something incidental. That config deliberately pairs `embedder-type: "openai"` with
+no key, so the next check is a cheap validation error — the control opens no
+database, loads no model, and binds no port.
+
+The new yaml tags, defaults, and env seeding, checked by a throwaway test that was
+deleted immediately after this run so the committed diff stays at the requested
+items (a typo'd yaml tag fails silently — the key simply never maps):
+
+```text
+$ go test ./internal/config/ -run TestPhase7SyncFieldsTemporary -v -count=1
+=== RUN   TestPhase7SyncFieldsTemporary
+    phase7_verify_test.go:31: defaults OK: default-visibility="org" sync-batch-size=20 sync-interval-seconds=30
+    phase7_verify_test.go:33: env seeding OK: SYNAPSE_PLANE_KEY -> ControlPlaneAPIKey="env-key"
+    phase7_verify_test.go:71: yaml tags OK: agent-id="edge-01" team-id="team-blue" default-visibility="team" sync-batch-size=7 sync-interval-seconds=90 control-plane-api-key="file-key"
+--- PASS: TestPhase7SyncFieldsTemporary (0.00s)
+ok  	synapse/internal/config	0.004s
+```
+
+SQLite's refusal of the SQL spelled in the task, on this machine:
+
+```text
+$ sqlite3 :memory: "CREATE TABLE t(a); ALTER TABLE t ADD COLUMN IF NOT EXISTS b TEXT DEFAULT 'x';"
+Error: in prepare, near "EXISTS": syntax error
+  ALTER TABLE t ADD COLUMN IF NOT EXISTS b TEXT DEFAULT 'x';
+                    error here ---^
+```
+
+Final tree state:
+
+```text
+$ git status --short
+ M cmd/synapse/main.go
+ M internal/config/config.go
+ M synapse.yaml.example
+
+$ git diff --stat
+ cmd/synapse/main.go       | 12 ++++++++++++
+ internal/config/config.go | 37 +++++++++++++++++++++++++++++++++++++
+ synapse.yaml.example      | 17 +++++++++++++++++
+ 3 files changed, 66 insertions(+)
+
+$ md5sum bin/synapse; git cat-file blob HEAD:bin/synapse | md5sum
+36a53be7c56dae45979707be7397fa67  bin/synapse
+36a53be7c56dae45979707be7397fa67  -
+```
+
+Next phase: the sync protocol itself. These fields are inert until something reads
+them — nothing in this phase dials a control plane, and `ControlPlaneURL` still
+does exactly what it did in Phase 5: it selects the store backend in
+`internal/store/factory.go` and nothing else. Do not add sync, conflict, ledger,
+mcp, metering, or billing surface here.
+

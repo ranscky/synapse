@@ -31,6 +31,23 @@ db-path: ""
 # control-plane-url: "http://127.0.0.1:9090"
 # database-dsn: ""
 
+# v2 sync protocol (optional, Phase 7). These only matter once
+# control-plane-url is set above; leave them at their defaults and the
+# standalone behavior above is unchanged.
+
+# Secret API key this agent presents to the control plane; seeded from SYNAPSE_PLANE_KEY, never logged, never commit one.
+# control-plane-api-key: ""
+# Stable identifier for this node; required as soon as control-plane-url is set.
+# agent-id: ""
+# Optional team this agent's memories belong to; blank means tenant-wide.
+# team-id: ""
+# Visibility applied to memories this node writes: "org", "team", or "private".
+default-visibility: "org"
+# How many memories a single sync push carries.
+sync-batch-size: 20
+# Seconds between sync attempts.
+sync-interval-seconds: 30
+
 # OpenAI API key (can also be set via OPENAI_API_KEY environment variable)
 openai-api-key: ""
 

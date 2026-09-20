@@ -16,6 +16,12 @@ import (
 // mistyping it somewhere it matters.
 const EnvDatabaseDSN = "SYNAPSE_DB_DSN"
 
+// EnvPlaneKey is the environment variable that supplies the control plane API
+// key this edge node presents when it syncs. Read at config-load time exactly
+// like EnvDatabaseDSN; a control-plane-api-key in the config file still wins.
+// It is a secret: never log the value, only whether it is set.
+const EnvPlaneKey = "SYNAPSE_PLANE_KEY"
+
 // Config represents the application configuration
 type Config struct {
 	UpstreamURL              string   `yaml:"upstream-url"`
@@ -44,6 +50,23 @@ type Config struct {
 	RetrievalCandidateK      int      `yaml:"retrieval-candidate-k"`
 	SupersessionSimilarityMin float64 `yaml:"supersession-similarity-min"`
 	SupersessionSimilarityMax float64 `yaml:"supersession-similarity-max"`
+
+	// v2 sync protocol (Phase 7). Added ahead of the sync work itself: the
+	// push loop in a later phase reads these, this phase only defines them.
+	// ControlPlaneAPIKey is the credential this node presents to the plane
+	// (secret, seeded from SYNAPSE_PLANE_KEY, never logged); AgentID names
+	// this node and is required whenever ControlPlaneURL is set --
+	// cmd/synapse refuses to boot without it, since a plane cannot attribute
+	// a push to an agent that never named itself; TeamID optionally scopes
+	// writes to a team; DefaultVisibility is applied to memories written
+	// with no visibility of their own; SyncBatchSize is memories per push;
+	// SyncIntervalSeconds is the delay between pushes.
+	ControlPlaneAPIKey  string `yaml:"control-plane-api-key"`
+	AgentID             string `yaml:"agent-id"`
+	TeamID              string `yaml:"team-id"`
+	DefaultVisibility   string `yaml:"default-visibility"`
+	SyncBatchSize       int    `yaml:"sync-batch-size"`
+	SyncIntervalSeconds int    `yaml:"sync-interval-seconds"`
 }
 
 // defaultDataDir resolves the stable, per-OS data directory used as the
@@ -166,6 +189,20 @@ func DefaultConfig() *Config {
 		// "related but different" from "unrelated" and "duplicate" well.
 		SupersessionSimilarityMin: 0.5,
 		SupersessionSimilarityMax: 0.90,
+		// v2 sync protocol (Phase 7). Placed last so the alignment of the
+		// groups above is untouched. The API key is seeded from the
+		// environment exactly like DatabaseDSN, so a deployment can inject
+		// it without a config file; a control-plane-api-key in the file
+		// still wins, since the loader unmarshals the file over these
+		// defaults. AgentID is deliberately blank: it is the operator's
+		// name for this node, and startup fails on a blank one as soon as
+		// ControlPlaneURL is set.
+		ControlPlaneAPIKey:  os.Getenv(EnvPlaneKey),
+		AgentID:             "",
+		TeamID:              "",
+		DefaultVisibility:   "org",
+		SyncBatchSize:       20,
+		SyncIntervalSeconds: 30,
 	}
 }
 

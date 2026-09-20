@@ -99,6 +99,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Sync precondition: control-plane-url turns this node into a syncing
+	// edge node, and the plane has to be able to attribute whatever it
+	// receives. An agent that never names itself can't be attributed, so
+	// this fails before any store, embedder, or network work happens --
+	// nothing gets written that would later need re-attributing. Enforced
+	// here rather than in Config.Validate so the standalone path's
+	// validation contract stays exactly as it was.
+	if cfg.ControlPlaneURL != "" && cfg.AgentID == "" {
+		slog.Error("agent-id is required when control-plane-url is set")
+		os.Exit(1)
+	}
+
 	// Pre-warm the tiktoken encoder now, during startup, so the first real
 	// request doesn't pay the one-time BPE table load cost (~180ms observed
 	// locally) inside live request latency.
