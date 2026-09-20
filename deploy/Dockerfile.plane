@@ -8,9 +8,13 @@ COPY . .
 # Alpine-based images"), and ./cmd/plane pulls cgo-requiring standard packages
 # when cgo is on (net, via net/http). Building with CGO_ENABLED=1 there fails
 # with: cgo: C compiler "gcc" not found, reported against package runtime/cgo.
-# The plane itself has no cgo dependency -- sqlite and onnxruntime live in
-# internal/store and internal/embedder, which ./cmd/plane never imports -- so
-# the result is a static binary.
+# The plane itself has no cgo dependency. Since Phase 8 its import graph reaches
+# internal/store (the sync endpoint writes through the tenant-scoped PostgreSQL
+# store and its sanitization pipeline), and go-sqlite3 ships a !cgo stub that
+# compiles under this flag; no SQLite database is ever opened by this binary --
+# the control plane talks to PostgreSQL only -- and onnxruntime still lives in
+# internal/embedder, which ./cmd/plane never imports. The result is a static
+# binary.
 ENV CGO_ENABLED=0
 RUN go build -o /bin/plane ./cmd/plane
 

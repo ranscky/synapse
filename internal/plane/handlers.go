@@ -55,30 +55,49 @@ type Database interface {
 // Server is the control plane's HTTP surface.
 //
 // Every external dependency arrives through the constructor -- a database probe,
-// the tenant provisioner, the config holding the secrets, and the logger -- so
-// there is no global state and no route reaches for one.
+// the tenant provisioner, the tenant memory writer, the token middleware, the
+// config holding the secrets, and the logger -- so there is no global state and
+// no route reaches for one.
+//
+// auth is a plain constructor-injected func rather than an import of
+// internal/tenant for a concrete reason: internal/tenant already imports this
+// package (it needs PlaneConfig to sign and verify tokens), so the reverse
+// import would be a cycle. The middleware itself is chi-compatible and knows
+// nothing about this package, which is why the dependency can point this way.
 type Server struct {
-	cfg     *PlaneConfig
-	db      Database
-	tenants TenantProvisioner
-	logger  *charmlog.Logger
+	cfg      *PlaneConfig
+	db       Database
+	tenants  TenantProvisioner
+	memories MemoryWriter
+	auth     func(http.Handler) http.Handler
+	logger   *charmlog.Logger
 }
 
-// NewServer returns a Server serving the control plane routes. db and tenants may
-// be nil: the health endpoint then reports a disconnected database, and the
-// provisioning endpoint answers 500 instead of panicking.
+// NewServer returns a Server serving the control plane routes. db, tenants,
+// memories, and auth may be nil: the health endpoint then reports a
+// disconnected database, the provisioning endpoint answers 500, and the sync
+// endpoint refuses every request instead of panicking or trusting an
+// unverified tenant.
 //
 // logger may be nil, in which case this package logs nothing.
-func NewServer(cfg *PlaneConfig, db Database, tenants TenantProvisioner, logger *charmlog.Logger) *Server {
-	return &Server{cfg: cfg, db: db, tenants: tenants, logger: logger}
+func NewServer(
+	cfg *PlaneConfig,
+	db Database,
+	tenants TenantProvisioner,
+	memories MemoryWriter,
+	auth func(http.Handler) http.Handler,
+	logger *charmlog.Logger,
+) *Server {
+	return &Server{cfg: cfg, db: db, tenants: tenants, memories: memories, auth: auth, logger: logger}
 }
 
 // Routes returns the plane's router: GET /health is open, POST /v2/tenants is
-// behind the admin token.
+// behind the admin token, and POST /v2/sync/memories is behind a tenant token.
 func (s *Server) Routes() http.Handler {
 	router := chi.NewRouter()
 	router.Get("/health", s.handleHealth)
 	router.With(s.requireAdmin).Post("/v2/tenants", s.handleCreateTenant)
+	router.With(s.requireJWT).Post(syncRoute, s.handleSyncMemories)
 
 	return router
 }
@@ -198,7 +217,16 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 // returns false on any malformed input -- unknown fields and trailing values
 // included, so a client cannot smuggle extra keys past validation.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	body := http.MaxBytesReader(w, r.Body, maxTenantBodyBytes)
+	return decodeJSONLimit(w, r, dst, maxTenantBodyBytes)
+}
+
+// decodeJSONLimit is decodeJSON with the body ceiling made explicit, because
+// the two JSON endpoints this package serves do not carry comparable payloads:
+// a provisioning body is two short strings, while one sync batch carries whole
+// memories -- embeddings included. One shared limit would either reject a
+// legitimate batch or let a provisioning request allocate megabytes.
+func decodeJSONLimit(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) bool {
+	body := http.MaxBytesReader(w, r.Body, maxBytes)
 
 	dec := json.NewDecoder(body)
 	dec.DisallowUnknownFields()

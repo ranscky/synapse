@@ -128,7 +128,18 @@ func main() {
 		logger.Warn("No admin token configured -- POST /v2/tenants rejects every request until one is set")
 	}
 
-	srv := plane.NewServer(cfg, pool, tenant.NewProvisioner(cfg, tenant.NewStore(pool)), logger)
+	// The sync endpoint's two v2 dependencies are wired from the tenant layer:
+	// the store-backed memory writer (schema-per-tenant, reusing the store's
+	// sanitization) and the tenant JWT middleware, which the plane cannot import
+	// directly (internal/tenant imports this package).
+	srv := plane.NewServer(
+		cfg,
+		pool,
+		tenant.NewProvisioner(cfg, tenant.NewStore(pool)),
+		tenant.NewMemoryWriter(pool),
+		tenant.JWTMiddleware(cfg),
+		logger,
+	)
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,

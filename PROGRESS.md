@@ -1319,3 +1319,246 @@ does exactly what it did in Phase 5: it selects the store backend in
 `internal/store/factory.go` and nothing else. Do not add sync, conflict, ledger,
 mcp, metering, or billing surface here.
 
+## Phase 8 — syncer Push and background flush (complete)
+
+Commit `feat: Phase 8 - syncer Push and background flush`
+
+The edge node can now send memories to a control plane, and the control plane can
+store them: `Syncer.Push` posts one batch to `POST /v2/sync/memories`, a
+background flusher drains the local `sync_pending` queue every
+`sync-interval-seconds` in batches of `sync-batch-size`, and the plane
+acknowledges a batch it has stored into the token's own tenant schema. Nothing in
+the compilation hot path calls any of it (Phase 9 marks the rows).
+
+New files:
+
+| File | Contents |
+| --- | --- |
+| `internal/sync/syncer.go` | `Syncer` (`cfg`, 5s `*http.Client`, interval, batch size, backlog thresholds), `NewSyncer`, `Push`, `pushRequest`, `endpoint`, `sharedSessionID`, `logStart` |
+| `internal/sync/background.go` | `PendingStore` interface, `RunBackground`, `flush`, `syncMaxBatchesPerFlush` |
+| `internal/sync/syncer_test.go` | 13 tests: envelope/header assertions, non-2xx and transport errors, credential never leaked, batch draining, mark-synced round trip, keep-pending on refusal, backlog warn/abandon, acknowledgement failure, run-and-cancel |
+| `internal/store/syncqueue.go` | `Sanitize` (exported wrapper), `PendingSync`, `MarkSynced`, `CountPendingSync`, `DropOldestPendingSync` |
+| `internal/store/syncqueue_test.go` | 4 tests against a real SQLite file store |
+| `internal/plane/sync.go` | `MemoryWriter` interface, `syncRequest`/`syncResponse`, `handleSyncMemories`, `requireJWT`, `WithTenantSlug`/`TenantSlugFromCtx`, `maxSyncBodyBytes` |
+| `internal/plane/sync_test.go` | 6 tests (one with 9 subtests) through the real router and the real tenant JWT verifier |
+| `internal/tenant/memorywriter.go` | `MemoryWriter.WriteBatch`, per-tenant `PGStore` cache, `memoryUUID` (UUIDv5), `embeddingWithinColumnWidth` |
+| `internal/tenant/memorywriter_test.go` | 3 database-free tests for the id/embedding mapping and the constructor contract |
+
+Changed:
+
+- `internal/plane/handlers.go` — `Server` gains `memories MemoryWriter` and
+  `auth func(http.Handler) http.Handler`; `NewServer` takes both (2 new
+  parameters); `Routes()` registers the sync route behind `requireJWT`;
+  `decodeJSON` is split into a body-limited `decodeJSONLimit` plus the original
+  4 KiB wrapper, because a sync batch carries whole memories and a provisioning
+  body is two strings.
+- `internal/plane/handlers_test.go` — one line (`newRouter` passes `nil, nil`).
+- `internal/tenant/auth.go` — `withClaims` also publishes the verified slug
+  through `plane.WithTenantSlug` (one line plus a comment). Same value, second
+  accessor, no claim re-derivation.
+- `cmd/plane/main.go` — wires `tenant.NewMemoryWriter(pool)` and
+  `tenant.JWTMiddleware(cfg)` into `plane.NewServer`.
+- `cmd/synapse/main.go` — 17 added lines: when `control-plane-url` is set, a
+  process-owned context plus `go syncer.RunBackground(syncCtx, storeInstance)`.
+  The hot path is untouched.
+- `deploy/Dockerfile.plane` — corrected comment: the plane's import graph now
+  reaches `internal/store`, whose `go-sqlite3` dependency compiles under
+  `CGO_ENABLED=0` through its `!cgo` stub. No SQLite database is ever opened by
+  that binary. Verified below.
+- `synapse.yaml.example` — the `control-plane-api-key` comment now says what the
+  sync route actually verifies today (a tenant JWT).
+- `PROGRESS.md` — this entry.
+
+Interface changes (`Push`, `RunBackground` signature, route, response body) match
+the phase specification. Nothing in v1 was modified: `git status` lists only the
+two new `internal/store/syncqueue*.go` files for that package.
+
+
+
+Decisions made in this phase:
+
+- **Backlog overflow is abandoned, never deleted.** Over 10000 pending rows, the
+  oldest beyond the limit are marked `local_only` — they stay readable locally,
+  stop being retried, and the flusher logs an ERROR naming how many. Deleting
+  rows would mean an unreachable plane quietly destroying memories. (`keep` rows
+  survive; the SQL enumerates the queue newest-first and skips exactly those,
+  which is why the order inside the subquery is `DESC` — the ascending version
+  abandons the *newest* rows instead. A unit test caught that before the commit.)
+- **`internal/store` gained a new file, not an edit.** The four accessors are
+  additive; `store.go`, `pgstore.go`, and the v1 read/write paths are
+  byte-identical. The alternative — SQL in `internal/sync` — is impossible: the
+  store's `db` handle is unexported.
+- **`RunBackground(ctx, PendingStore)` instead of the concrete `*store.Store`.**
+  The declared interface is satisfied structurally by `*store.Store`, so the
+  specified call site (`go syncer.RunBackground(ctx, store)`) is unchanged, and
+  the flusher is testable without a database.
+- **No index on `sync_status`.** Adding one means editing the v1 schema
+  initialiser; a scan of a local memory table at these sizes is cheap, and it is
+  noted in the code for a later phase.
+- **The queue read orders by `timestamp, id`.** `time.Now()` collides, and two
+  flushes must not disagree about which row is oldest.
+- **One batch is one request, and a batch is all-or-nothing on the plane.** The
+  edge marks exactly what it pushed as synced on a 2xx; a 200 that quietly
+  skipped a memory would turn it into a permanent loss. Write failures answer
+  500, the rows stay pending, and the WARN says so.
+- **Idempotency is what makes retries safe.** The plane maps a non-uuid edge id
+  (the local path names memories `req-<nanos>`) through a fixed UUIDv5 namespace,
+  so a re-pushed batch lands on the same rows (`ON CONFLICT (id) DO NOTHING`); a
+  push that succeeds but fails to be acknowledged locally costs redundant
+  traffic, not duplicate memories. `superseded_by` is mapped the same way.
+- **A wrong-width embedding is dropped, not fatal.** The tenant column is
+  `vector(384)`; one bad vector would fail the insert and make the batch
+  un-pushable forever. The memory is stored without an embedding and a WARN names
+  the id and width.
+- **Sanitization and storage stay single-sourced.** The plane handler delegates
+  to `MemoryWriter.WriteBatch`, whose store-backed implementation calls
+  `store.Sanitize` and `store.PGStore.Write`; `sanitized` counts memories whose
+  content the sanitizer rewrote. No second pattern list exists anywhere.
+- **The sync route fails closed without a middleware.** `requireJWT` answers 401
+  for every request when `auth` is nil, the same shape `requireAdmin` uses for an
+  unset admin token.
+- **The tenant comes from the token only.** The body has no field that could name
+  a tenant, and the handler rejects a request whose context carries no slug, so
+  schema-per-tenant isolation does not depend on request content.
+- **`agent_id` is required (400 `invalid_agent`).** The edge refuses to boot
+  without one, so an unattributed push is a contract violation, not a normal path.
+- **Backlog thresholds and batch shape are `Syncer` fields,** set from config and
+  the package constants in `NewSyncer`, so tests can shrink them without package
+  level mutable state. A zero `sync-interval-seconds` falls back to 30s rather
+  than panicking `time.NewTicker` inside a goroutine.
+- **The first flush happens immediately, then on each tick.** A memory written
+  just before startup should not wait out an interval, and a failed batch is
+  retried next tick rather than in a loop.
+- **A missing `control-plane-api-key` is a local error**, not an unauthenticated
+  request every interval.
+
+Limitations this phase deliberately did not close:
+
+- **Nothing marks a memory `sync_pending` yet.** `store.Write` already accepts
+  and round-trips the status (Phase 5, `sync_status_test.go`), but the write path
+  does not set it — that is Phase 9's work. On a fresh node the flusher therefore
+  finds an empty queue; the tests seed the queue directly.
+- **The edge's `control-plane-api-key` must be the tenant JWT today.** Phase 3
+  issues an opaque API key *and* a JWT; only the JWT is verifiable by a middleware
+  that exists, and the specification for this phase said "requires JWT auth
+  middleware". Opaque-key verification on the plane is a later phase.
+- **Pushed memories are stored with the tenant table's defaults for
+  attribution.** `PGStore.Write` predates the sync path and sets neither
+  `agent_id` (`'default'`), `team_id`, nor `visibility` (`'org'`); the wire body
+  for this phase carries only `session_id`, `agent_id`, and `memories`, and the
+  `agent_id` sent is used for logging and validation. Persisting it needs an
+  additive write path, which is not this phase's scope.
+- **`control-plane-url` is still not format-validated** in `Config.Validate`
+  (unchanged from Phase 7). `Push` trims a trailing slash and reports an
+  unbuildable URL as a wrapped transport error.
+
+Verification (real output, this phase):
+
+```text
+$ gofmt -l internal/sync internal/plane/sync.go internal/plane/sync_test.go \
+    internal/tenant/memorywriter.go internal/tenant/memorywriter_test.go \
+    internal/store/syncqueue.go internal/store/syncqueue_test.go cmd/plane/main.go
+(no output -- every new or touched file is gofmt-clean; the pre-existing
+ unformatted v1 files were left alone, confirmed by comparing against HEAD)
+
+$ go vet ./...
+(no output)
+
+$ CGO_ENABLED=0 go build -o /dev/null ./cmd/plane && echo 'CGO_ENABLED=0 PLANE BUILD OK'
+CGO_ENABLED=0 PLANE BUILD OK
+
+$ go test ./internal/sync/... -count=1 -v
+=== RUN   TestNewSyncerUsesConfiguredValuesAndGuardsZeroes
+--- PASS: TestNewSyncerUsesConfiguredValuesAndGuardsZeroes (0.00s)
+=== RUN   TestPushSendsOneRequestWithEveryMemory
+--- PASS: TestPushSendsOneRequestWithEveryMemory (0.00s)
+=== RUN   TestPushMixedSessionsSendsAnEmptyEnvelopeSession
+--- PASS: TestPushMixedSessionsSendsAnEmptyEnvelopeSession (0.00s)
+=== RUN   TestPushRejectsNon2xxWithoutLeakingTheCredential
+--- PASS: TestPushRejectsNon2xxWithoutLeakingTheCredential (0.00s)
+=== RUN   TestPushWrapsATransportError
+--- PASS: TestPushWrapsATransportError (0.00s)
+=== RUN   TestPushWithoutCredentialOrEntries
+--- PASS: TestPushWithoutCredentialOrEntries (0.00s)
+=== RUN   TestFlushMarksEverythingThePlaneAccepted
+--- PASS: TestFlushMarksEverythingThePlaneAccepted (0.34s)
+=== RUN   TestFlushLeavesMemoriesPendingWhenThePlaneRefuses
+--- PASS: TestFlushLeavesMemoriesPendingWhenThePlaneRefuses (0.27s)
+=== RUN   TestFlushDrainsInBatchesOfTheConfiguredBatchSize
+--- PASS: TestFlushDrainsInBatchesOfTheConfiguredBatchSize (0.30s)
+=== RUN   TestFlushAbandonsTheOldestWhenTheBacklogIsOverTheHardLimit
+--- PASS: TestFlushAbandonsTheOldestWhenTheBacklogIsOverTheHardLimit (0.35s)
+=== RUN   TestFlushWarnsOnALargeBacklogBelowTheHardLimit
+--- PASS: TestFlushWarnsOnALargeBacklogBelowTheHardLimit (0.26s)
+=== RUN   TestFlushReportsAnAcknowledgementFailure
+--- PASS: TestFlushReportsAnAcknowledgementFailure (0.00s)
+=== RUN   TestRunBackgroundFlushesUntilTheContextIsCancelled
+--- PASS: TestRunBackgroundFlushesUntilTheContextIsCancelled (0.40s)
+PASS
+ok  	synapse/internal/sync	1.928s
+
+$ go test ./... -count=1
+ok  	synapse/internal/api	3.403s
+ok  	synapse/internal/budget	0.262s
+ok  	synapse/internal/classifier	0.009s
+ok  	synapse/internal/compiler	0.248s
+ok  	synapse/internal/config	0.006s
+ok  	synapse/internal/dedup	0.010s
+ok  	synapse/internal/embedder	2.973s
+ok  	synapse/internal/integration	5.383s
+ok  	synapse/internal/plane	0.051s
+ok  	synapse/internal/proxy	0.338s
+ok  	synapse/internal/scorer	0.009s
+ok  	synapse/internal/store	9.421s
+ok  	synapse/internal/supersession	0.005s
+ok  	synapse/internal/sync	8.880s
+ok  	synapse/internal/tenant	0.798s
+ok  	synapse/internal/trace	0.161s
+
+$ go test -race ./internal/sync/... -run 'TestFlush|TestRunBackground' -count=1
+ok  	synapse/internal/sync	3.904s
+```
+
+The Postgres-backed tests (`internal/store`, `internal/tenant`) skip without
+`SYNAPSE_TEST_DB_DSN`, as before: the new plane-side writer is covered by its
+database-free mapping tests plus the endpoint tests against a fake writer, so no
+database was required for this phase's evidence.
+
+Live end-to-end smoke test — the real `synapse` binary, a real SQLite store with
+three rows marked `sync_pending`, and a stub plane on 127.0.0.1:19099:
+
+```text
+$ ./synapse-phase8 --config /tmp/phase8.yaml      # control-plane-url: "http://127.0.0.1:19099/"
+INFO synapse: sync: background flusher started control_plane_url=http://127.0.0.1:19099/v2/sync/memories agent_id=edge-smoke-1 interval_seconds=2 batch_size=5
+WARN synapse: sync: push failed, memories stay pending for the next attempt pending=3 error="sync: push request: Post \"http://127.0.0.1:19099/v2/sync/memories\": dial tcp 127.0.0.1:19099: connect: connection refused"
+
+$ # what the stub plane recorded on the next interval:
+path=/v2/sync/memories bearer_scheme=True agent_id=edge-smoke-1 session_id=smoke-session memories=3
+
+$ sqlite3 /tmp/phase8.db "SELECT id, sync_status FROM memories ORDER BY id;"
+req-1|synced
+req-2|synced
+req-3|synced
+
+$ grep -c 'smoke-plane-key-must-not-be-logged' /tmp/phase8-run.log
+0
+
+$ # a second run with two more pending memories and log-level debug:
+DEBU synapse: sync: pushed memories count=2
+
+$ sqlite3 /tmp/phase8.db "SELECT id, sync_status FROM memories ORDER BY id;"
+req-1|synced  req-2|synced  req-3|synced  req-4|synced  req-5|synced
+```
+
+That transcript is the retry contract working: the first flush could not reach
+the plane, the rows stayed pending, the next interval pushed them once, the stub
+saw exactly one batch of three, and the rows read back `synced`. The configured
+`control-plane-url` ended in a slash and the request still went to
+`/v2/sync/memories` — not `//v2/sync/memories` — and the API key appears nowhere
+in the log.
+
+Next phase: Phase 9 marks memories `sync_pending` on the write path. Until it
+does, this phase's flusher runs, finds nothing, and sleeps — which is why the
+endpoint and the queue are tested by seeding the queue directly.
+
+

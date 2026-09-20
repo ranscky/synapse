@@ -24,6 +24,7 @@ import (
 	"synapse/internal/proxy"
 	"synapse/internal/session"
 	"synapse/internal/store"
+	"synapse/internal/sync"
 
 	charmlog "github.com/charmbracelet/log"
 	"github.com/go-chi/chi/v5"
@@ -164,6 +165,24 @@ func main() {
 		os.Exit(1)
 	}
 	defer storeInstance.Close()
+
+	// v2 edge sync (Phase 8). When a control plane is configured, a background
+	// goroutine drains memories the local write path marks sync_pending and
+	// pushes them in batches. It is the only thing in the process that talks to
+	// the control plane: nothing in the request path calls the syncer, so a slow
+	// or unreachable plane cannot add latency to a compile (Phase 9 is what
+	// marks a memory pending in the first place).
+	//
+	// The context is this process's own, cancelled by the deferred cancel on the
+	// shutdown path below; a failed push simply leaves rows pending for the next
+	// interval, so there is no error to handle here.
+	if cfg.ControlPlaneURL != "" {
+		syncCtx, cancelSync := context.WithCancel(context.Background())
+		defer cancelSync()
+
+		syncer := sync.NewSyncer(*cfg)
+		go syncer.RunBackground(syncCtx, storeInstance)
+	}
 
 	// If the configured model path isn't found relative to the current
 	// directory (the standalone-archive layout), try package-manager and

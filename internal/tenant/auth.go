@@ -187,8 +187,14 @@ func withClaims(ctx context.Context, c *claims) context.Context {
 	ctx = context.WithValue(ctx, tenantSlugKey, c.TenantSlug)
 	ctx = context.WithValue(ctx, planKey, c.Plan)
 	ctx = context.WithValue(ctx, complianceTierKey, c.ComplianceTier)
+	ctx = context.WithValue(ctx, adminKey, c.Admin)
 
-	return context.WithValue(ctx, adminKey, c.Admin)
+	// The slug is also published through internal/plane's own accessor, because
+	// the keys above are unexported here and the plane's sync endpoint -- which
+	// cannot import this package -- needs the slug to pick the tenant's schema.
+	// Both accessors carry the same verified value; nothing is re-derived and
+	// the claim is never taken from anywhere but this signed token.
+	return plane.WithTenantSlug(ctx, c.TenantSlug)
 }
 
 // stringFromCtx reads a string claim, returning "" when the key is absent or
