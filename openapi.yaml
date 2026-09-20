@@ -286,8 +286,6 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/TraceMemory'
-        trace_truncated:
-          type: boolean
 
     TraceMemory:
       type: object

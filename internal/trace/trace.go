@@ -25,7 +25,6 @@ type TraceManifest struct {
 	ReductionPct          float64       `json:"reduction_pct"`
 	CompileDurationMs     int64         `json:"compile_duration_ms"`
 	Memories              []TraceMemory `json:"memories"`
-	TraceTruncated        bool          `json:"trace_truncated,omitempty"`
 }
 
 // TraceMemory represents a memory entry in the trace manifest

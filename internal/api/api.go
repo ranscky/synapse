@@ -492,7 +492,6 @@ func (a *APIServer) handleGetMemories(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	// Get memories from store
-	// Get memories from store
 	ctx := r.Context()
 	memories, err := a.store.GetRecent(ctx, sessionID, limitInt)
 	if err != nil {
