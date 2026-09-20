@@ -27,6 +27,7 @@ type MemoryEntry struct {
 	Importance float64   `json:"importance,omitempty"`  // Importance score
 	Embedding  []float32 `json:"embedding,omitempty"`   // 384-dim embedding vector
 	SupersededBy string    `json:"superseded_by,omitempty"`  // ID of the memory that superseded this one, if any. Empty means still active/current. Populated by a later write, never set at the same time a memory is first created.
+	SyncStatus   string    `json:"sync_status,omitempty"`    // Where this memory currently lives, relative to a control plane: "local_only" | "sync_pending" | "synced". A memory written by the standalone v1 binary has never left the machine, so its zero value is normalized to "local_only" on write; a memory written through a tenant's Postgres schema is already on the plane, so its zero value is normalized to "synced". See the SyncStatus* constants.
 }
 
 // embeddingToBytes serializes a []float32 embedding into a byte slice for
@@ -144,6 +145,18 @@ func (s *Store) initSchema() error {
 		}
 	}
 
+	// Same migration shape as superseded_by above: run unconditionally, swallow
+	// only the "already applied" error. DEFAULT 'local_only' backfills rows
+	// written before this column existed, which is accurate -- every one of them
+	// predates any control plane this binary could sync with -- and it matches
+	// the value Write() normalizes a blank SyncStatus to, so a row reads back
+	// identically whether it was migrated or inserted.
+	if _, err := s.db.Exec(`ALTER TABLE memories ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'local_only'`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("failed to migrate sync_status column: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -171,10 +184,19 @@ func (s *Store) Write(ctx context.Context, entry MemoryEntry) error {
 		entry.Content = truncated
 	}
 
+	// A blank SyncStatus is normalized to this backend's own default: a memory
+	// written to the local SQLite file has never been sent anywhere, which is
+	// exactly what the column's DEFAULT 'local_only' says. Normalizing here
+	// (rather than passing "" through) keeps the value a reader gets identical
+	// to the value a migrated pre-existing row gets.
+	if entry.SyncStatus == "" {
+		entry.SyncStatus = SyncStatusLocalOnly
+	}
+
 		// Insert memory entry
 	insertQuery := `
-	INSERT OR REPLACE INTO memories (id, session_id, content, memory_type, timestamp, importance, embedding, superseded_by)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	INSERT OR REPLACE INTO memories (id, session_id, content, memory_type, timestamp, importance, embedding, superseded_by, sync_status)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	var embeddingBytes []byte
@@ -182,7 +204,7 @@ func (s *Store) Write(ctx context.Context, entry MemoryEntry) error {
 		embeddingBytes = embeddingToBytes(entry.Embedding)
 	}
 
-	_, err := s.db.ExecContext(ctx, insertQuery, entry.ID, entry.SessionID, entry.Content, entry.MemoryType, entry.Timestamp, entry.Importance, embeddingBytes, entry.SupersededBy)
+	_, err := s.db.ExecContext(ctx, insertQuery, entry.ID, entry.SessionID, entry.Content, entry.MemoryType, entry.Timestamp, entry.Importance, embeddingBytes, entry.SupersededBy, entry.SyncStatus)
 	if err != nil {
 		return fmt.Errorf("failed to insert memory: %w", err)
 	}
@@ -211,7 +233,7 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, sessionID 
 	// different things; limiting here before ranking would silently throw
 	// away the most semantically relevant older entries).
 		searchQuery := `
-	SELECT id, session_id, content, memory_type, timestamp, importance, embedding, superseded_by
+	SELECT id, session_id, content, memory_type, timestamp, importance, embedding, superseded_by, sync_status
 	FROM memories
 	WHERE session_id = ?
 	`
@@ -226,7 +248,7 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, sessionID 
 	for rows.Next() {
 		var entry MemoryEntry
 		var embeddingBytes []byte
-		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance, &embeddingBytes, &entry.SupersededBy)
+		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance, &embeddingBytes, &entry.SupersededBy, &entry.SyncStatus)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan memory entry: %w", err)
 		}
@@ -317,7 +339,7 @@ func (s *Store) GetRecent(ctx context.Context, sessionID string, limit int) ([]M
 
 	
 query := `
-	SELECT id, session_id, content, memory_type, timestamp, importance, embedding, superseded_by
+	SELECT id, session_id, content, memory_type, timestamp, importance, embedding, superseded_by, sync_status
 	FROM memories
 	WHERE session_id = ?
 	ORDER BY timestamp DESC
@@ -334,7 +356,7 @@ query := `
 	for rows.Next() {
 		var entry MemoryEntry
 		var embeddingBytes []byte
-		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance, &embeddingBytes, &entry.SupersededBy)
+		err := rows.Scan(&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType, &entry.Timestamp, &entry.Importance, &embeddingBytes, &entry.SupersededBy, &entry.SyncStatus)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan memory entry: %w", err)
 		}

@@ -22,6 +22,15 @@ model-path: "models/all-MiniLM-L6-v2/model.onnx"
 # ephemeral, non-persistent store.
 db-path: ""
 
+# v2 control plane (optional). Leave control-plane-url blank -- the default --
+# and nothing about the standalone behavior above changes. Set it and the
+# process stores memories in the named tenant's Postgres schema instead of the
+# local SQLite file, using database-dsn (or the SYNAPSE_DB_DSN environment
+# variable, which supplies it when no key is present here). A DSN carries the
+# database password: never commit one and never log it.
+# control-plane-url: "http://127.0.0.1:9090"
+# database-dsn: ""
+
 # OpenAI API key (can also be set via OPENAI_API_KEY environment variable)
 openai-api-key: ""
 

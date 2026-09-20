@@ -9,6 +9,13 @@ import (
 	"strings"
 )
 
+// EnvDatabaseDSN is the environment variable that supplies the Postgres
+// connection string. The same variable is read by the v2 control plane
+// (internal/plane); this constant exists so the standalone binary can be
+// pointed at a control plane without duplicating the key name or, worse,
+// mistyping it somewhere it matters.
+const EnvDatabaseDSN = "SYNAPSE_DB_DSN"
+
 // Config represents the application configuration
 type Config struct {
 	UpstreamURL              string   `yaml:"upstream-url"`
@@ -19,6 +26,15 @@ type Config struct {
 	ModelPath                string   `yaml:"model-path"`
 	DBPath                   string   `yaml:"db-path"`
 	OpenAIAPIKey             string   `yaml:"openai-api-key"`
+	// ControlPlaneURL is the address of a Synapse v2 control plane. Empty --
+	// the default -- preserves the standalone SQLite behavior exactly. When it
+	// is set, the store factory in internal/store builds a tenant-scoped
+	// Postgres backend instead of the local SQLite file.
+	ControlPlaneURL string `yaml:"control-plane-url"`
+	// DatabaseDSN is the Postgres connection string used when ControlPlaneURL
+	// is set; SYNAPSE_DB_DSN supplies it from the environment. It is a secret
+	// (it carries the database password) and must never be logged.
+	DatabaseDSN string `yaml:"database-dsn"`
 	WeightSemanticSimilarity float64  `yaml:"weight-semantic-similarity"`
 	WeightRecency            float64  `yaml:"weight-recency"`
 	WeightImportance         float64  `yaml:"weight-importance"`
@@ -126,6 +142,14 @@ func DefaultConfig() *Config {
 		ModelPath:                "models/all-MiniLM-L6-v2/model.onnx",
 		DBPath:                   defaultDBPath(),
 		OpenAIAPIKey:             openAIAPIKey,
+		// No control plane by default: this is what keeps the standalone
+		// binary's storage behavior identical to v1.
+		ControlPlaneURL: "",
+		// Seeded from the environment so container/deployment shapes that
+		// inject the DSN (the same variable the control plane reads) work
+		// without a config file. A database-dsn key in synapse.yaml still
+		// wins, since the loader unmarshals the file over these defaults.
+		DatabaseDSN:              os.Getenv(EnvDatabaseDSN),
 		WeightSemanticSimilarity: 0.4,
 		WeightRecency:            0.1,
 		WeightImportance:         0.3,

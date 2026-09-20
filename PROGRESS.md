@@ -712,3 +712,220 @@ Decisions made in this phase:
   non-loopback bind (which the plane rejects by design today) or a relay
   container sharing the plane's network namespace.
 
+
+## Phase 5 — PGStore Write and Search (complete)
+
+Commit `feat: Phase 5 - PGStore Write and Search`
+
+`internal/store` now holds a second backend: `PGStore` talks to one tenant's
+Postgres schema through pgvector, and a factory decides which backend a process
+gets. `internal/scorer`, `internal/compiler`, `internal/retrieval`,
+`internal/dedup`, `internal/proxy`, and `internal/api` are byte-for-byte
+unchanged -- the first two because they only ever handled `MemoryEntry` values,
+the last two because they already depended on their own narrow interfaces
+(`proxy.MemoryStore`, `retrieval.Store`), which `*PGStore` satisfies as-is.
+
+New files:
+
+- `internal/store/pgstore.go` (274 lines) -- `PGStore`, `NewPGStore`, the four
+  `Backend` methods, `Close`, plus the `SyncStatus*` / `EmbeddingDimensions`
+  constants. Split into four files by concern to stay under the 300-line cap.
+- `internal/store/pgmigrate.go` (85 lines) -- the tenant DDL: extension, schema,
+  table, HNSW index, `(session_id, created_at DESC)` index, all idempotent and
+  run in one transaction.
+- `internal/store/pgread.go` (68 lines) -- the shared projection, row iterator,
+  and scanner behind `Search`/`GetRecent`.
+- `internal/store/factory.go` (116 lines) -- the `Backend` interface,
+  `OpenPGPool`, and `NewStoreFromConfig`, the single place that picks a backend.
+- `internal/store/pgstore_test.go` (261 lines) -- `TestPGStore` and
+  `TestPGStoreRejectsInvalidSlug`, skipped unless `SYNAPSE_TEST_DB_DSN` is set.
+- `internal/store/sync_status_test.go` (70 lines) -- the SQLite-side
+  `sync_status` migration and round-trip, which needs no database.
+- `go.mod` / `go.sum` -- `github.com/pgvector/pgvector-go v0.2.3`.
+
+Changed:
+
+- `internal/store/store.go` -- `MemoryEntry.SyncStatus`, the `sync_status`
+  column migration, and `sync_status` added to the Write/Search/GetRecent
+  statements so the field actually round-trips on the SQLite side too.
+- `internal/config/config.go` -- `ControlPlaneURL` (`control-plane-url`),
+  `DatabaseDSN` (`database-dsn`), and the `EnvDatabaseDSN` constant, seeded from
+  `SYNAPSE_DB_DSN` in `DefaultConfig`.
+- `synapse.yaml.example` -- both new keys, commented out.
+
+Decisions made in this phase:
+
+- **The requested `store.Store` interface did not exist, and could not.** `Store`
+  was already a struct wrapping `*sql.DB`, and Go has no overloading, so
+  `NewStore(cfg, tenantSlug)` could not coexist with the existing
+  `NewStore(dbPath string)`. Resolved as `store.Backend` (exactly the four
+  methods the pipeline calls) plus `NewStoreFromConfig`, which touches no v1
+  file. The alternative -- renaming the v1 struct to `SQLiteStore` and updating
+  eight v1 files plus five of their tests -- was rejected as a v1 change a v2
+  feature does not require.
+- **The dependency is pinned to `pgvector-go v0.2.3`.** Unpinned, `go get`
+  resolves `v0.4.1`, whose `go.mod` says `go 1.25.0`: that would rewrite this
+  module's `go 1.22.5` directive and push CI's pinned `go-version: [1.22]`
+  matrix onto a downloaded toolchain. `v0.2.3` is the newest release that keeps
+  the module at Go 1.22, ships the `pgvector-go/pgx` subpackage
+  (`pgxvec.RegisterTypes`), and requires only pgx v5.6.0, so the existing
+  v5.7.4 is kept rather than downgraded.
+- **A real ordering bug was found by running the test, not by reading.**
+  `pgxvec.RegisterTypes` fails the connection outright with
+  `vector type not found in the database` when the extension does not exist yet,
+  and the extension can only be created by something that already has a
+  connection -- so a pool whose `AfterConnect` registers the vector type can
+  never be the thing that enables it. `OpenPGPool` now enables the extension on
+  a bare, unregistered connection first (`ensureVectorExtension`) and only then
+  installs the hook. Confirmed against the live database: `installed_version`
+  was NULL before the first run and `vector 0.8.6` after.
+- **`Search` keeps the session filter the spec dropped.** Without it, Postgres
+  returns other sessions' memories, which contradicts both the SQLite backend
+  (`WHERE session_id = ?`) and what `retrieval.Candidates` passes in. An empty
+  `sessionID` deliberately means "the whole tenant", so a plane caller can still
+  search org-wide. `GetRecent` is always session-scoped.
+- **Superseded rows are excluded in SQL.** Not a behavior change for any caller:
+  proxy, api, and supersession already skip `SupersededBy != ""`. It means less
+  data crosses the wire, and `MarkSuperseded` is immediately visible to reads.
+- **An empty query embedding falls back to recency; a wrong-width one errors.**
+  `<->` cannot compare against nothing, and retrieval passes an empty embedding
+  whenever there is no embedder or no query text, so the fallback is required
+  rather than defensive. A wrong width is a caller bug and is reported.
+- **PGStore requires uuid ids.** The column is `uuid` and the v1 callers generate
+  `req-<nano>` strings, so `Write` reports that plainly instead of inventing an
+  id the caller could not later use for supersession.
+- **Sanitization is shared, not copied.** `PGStore.Write` calls the same
+  `Sanitize` the SQLite backend calls (through a zero-value `Store`, which reads
+  no fields), so the two backends cannot drift into two policies -- the
+  `[SANITIZED]` assertion in the test is what proves it on the PG path.
+- **`SyncStatus` defaults differ per backend on purpose.** A blank status is
+  normalized to `local_only` by the SQLite store (a local file has never left
+  the machine) and to `synced` by PGStore (a tenant schema is already on the
+  plane). Both match their own column defaults, and the migration backfills
+  pre-existing SQLite rows as `local_only`.
+- **`store.go` was already 504 lines, over the cap before this phase.** Rather
+  than grow it further, the v2 work is four new files of at most 274 lines.
+  Formatting was left alone: `gofmt -l` flagged `store.go`, `store_test.go`,
+  `config.go`, and `config_test.go` at HEAD as well (verified with
+  `git show HEAD:<file> | gofmt -l`), so no v1 file was reformatted wholesale;
+  the new files are gofmt-clean.
+- **The literal `^[a-z0-9_]{3,32}$` slug rule would have rejected every real
+  tenant.** The plane issues `^[a-z0-9-]{3,32}$` slugs (hyphens, never
+  underscores). PGStore accepts both and folds hyphens to underscores for the
+  schema name (`acme-prod` -> `tenant_acme_prod`), which cannot collide.
+- **Postgres truncates timestamps to microseconds.** The test compares
+  `created_at` at microsecond precision, because that is the column's actual
+  resolution; a nanosecond-exact assertion failed against the real database.
+
+
+Verification (real output, this phase):
+
+The compose stack from Phase 4 was started for this phase (`cd deploy && docker
+compose up -d db`: Postgres 16.15 / pgvector 0.8.6, healthy, published on
+127.0.0.1:5432). Only the `db` service is needed here; the plane binary is
+untouched by this phase.
+
+```text
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+    go test ./internal/store/... -run TestPGStore -v
+=== RUN   TestPGStore
+=== RUN   TestPGStore/search_ranks_the_nearest_memory_first
+=== RUN   TestPGStore/search_round-trips_the_stored_fields
+=== RUN   TestPGStore/search_is_scoped_to_the_named_session
+=== RUN   TestPGStore/search_with_no_session_searches_the_whole_tenant
+=== RUN   TestPGStore/search_without_a_query_embedding_falls_back_to_recency
+=== RUN   TestPGStore/search_rejects_a_wrong-width_embedding
+=== RUN   TestPGStore/get_recent_returns_the_session_newest_first
+=== RUN   TestPGStore/a_memory_without_an_embedding_round-trips_as_nil
+=== RUN   TestPGStore/content_is_sanitized_before_storage
+2026/09/20 12:42:46 WARN Prompt injection detected and neutralized pattern="ignore previous"
+2026/09/20 12:42:46 WARN Memory content sanitized due to prompt injection memory_id=0a00f9b0-...
+=== RUN   TestPGStore/an_explicit_sync_status_is_stored
+=== RUN   TestPGStore/write_rejects_an_id_that_is_not_a_uuid
+=== RUN   TestPGStore/tenants_are_isolated_from_each_other
+=== RUN   TestPGStore/superseded_memories_drop_out_of_search_and_recent
+=== RUN   TestPGStore/mark_superseded_reports_an_unknown_id
+--- PASS: TestPGStore (1.82s)
+    --- PASS: TestPGStore/search_ranks_the_nearest_memory_first (0.00s)
+    --- PASS: TestPGStore/search_round-trips_the_stored_fields (0.00s)
+    --- PASS: TestPGStore/search_is_scoped_to_the_named_session (0.01s)
+    --- PASS: TestPGStore/search_with_no_session_searches_the_whole_tenant (0.00s)
+    --- PASS: TestPGStore/search_without_a_query_embedding_falls_back_to_recency (0.00s)
+    --- PASS: TestPGStore/search_rejects_a_wrong-width_embedding (0.00s)
+    --- PASS: TestPGStore/get_recent_returns_the_session_newest_first (0.00s)
+    --- PASS: TestPGStore/a_memory_without_an_embedding_round-trips_as_nil (0.01s)
+    --- PASS: TestPGStore/content_is_sanitized_before_storage (0.01s)
+    --- PASS: TestPGStore/an_explicit_sync_status_is_stored (0.01s)
+    --- PASS: TestPGStore/write_rejects_an_id_that_is_not_a_uuid (0.00s)
+    --- PASS: TestPGStore/tenants_are_isolated_from_each_other (0.18s)
+    --- PASS: TestPGStore/superseded_memories_drop_out_of_search_and_recent (0.01s)
+    --- PASS: TestPGStore/mark_superseded_reports_an_unknown_id (0.00s)
+=== RUN   TestPGStoreRejectsInvalidSlug
+--- PASS: TestPGStoreRejectsInvalidSlug (0.02s)
+PASS
+ok  	synapse/internal/store	1.850s
+```
+
+The DoD assertion is the first subtest: five entries written with hardcoded
+384-dimension embeddings (entry *i* is a unit vector on axis *i*), a query of
+`0.9 * axis3 + 0.1 * axis1`, and entry 3 -- squared L2 distance 0.02, against
+1.62 for entry 1 and 1.82 for the rest -- comes back first.
+
+Two failures were hit and fixed before that run, both worth recording:
+
+```text
+# 1. extension/reporting order (first run of the test, real output)
+store: postgres pool is unreachable: vector type not found in the database
+# -> OpenPGPool now enables the extension on a bare connection before the
+#    AfterConnect hook registers the vector type. Re-run: pool opens.
+
+# 2. timestamp precision (second run)
+expected: ... 12, 42, 36, 38070187 (nanoseconds)
+actual  : ... 12, 42, 36, 38070000 (microseconds, the column's resolution)
+# -> the assertion compares at microsecond precision, which is what timestamptz
+#    actually stores.
+```
+
+The objects the migration creates were checked directly in the database rather
+than assumed from the DDL text:
+
+```text
+$ docker exec deploy-db-1 psql -U synapse -d synapse -tAc \
+    "select extname||' '||extversion from pg_extension where extname='vector';"
+vector 0.8.6
+
+$ docker exec deploy-db-1 psql -U synapse -d synapse -tAc \
+    "select indexdef from pg_indexes where schemaname like 'tenant_%' and tablename='memories';" | head -2
+CREATE INDEX idx_memories_embedding_hnsw ON tenant_pgs1789908165340163861.memories
+  USING hnsw (embedding vector_l2_ops) WITH (m='16', ef_construction='64')
+CREATE INDEX idx_memories_session_created ON tenant_pgs1789908165340163861.memories
+  USING btree (session_id, created_at DESC)
+
+# information_schema confirms id uuid DEFAULT gen_random_uuid(), agent_id DEFAULT
+# 'default', sync_status DEFAULT 'synced', visibility DEFAULT 'org',
+# conflict_status DEFAULT 'none', created_at timestamptz DEFAULT now(),
+# embedding vector, and the four nullable text/uuid columns.
+```
+
+Both full-suite runs stay green, with and without a database:
+
+```text
+$ go test ./...                                     # PG tests skip
+ok  synapse/internal/api   ok  synapse/internal/budget   ok  synapse/internal/classifier
+ok  synapse/internal/compiler   ok  synapse/internal/config   ok  synapse/internal/dedup
+ok  synapse/internal/embedder   ok  synapse/internal/integration   ok  synapse/internal/plane
+ok  synapse/internal/proxy   ok  synapse/internal/scorer   ok  synapse/internal/store (5.953s)
+ok  synapse/internal/supersession   ok  synapse/internal/tenant   ok  synapse/internal/trace
+
+$ SYNAPSE_TEST_DB_DSN=... go test ./...             # PG tests run
+ok  synapse/internal/store (7.147s)
+ok  synapse/internal/tenant (3.476s)
+... every other package unchanged
+```
+
+`gofmt -l` lists no new file, `go vet ./internal/store/... ./internal/config/...`
+is clean, and `go build ./...` compiles the whole module -- including
+`cmd/synapse`, which still calls `store.NewStore(cfg.DBPath)` directly and is
+unchanged, because `control-plane-url` defaults to empty.
+
+Next phase: not started. Do not add Phase 6 surface here.
