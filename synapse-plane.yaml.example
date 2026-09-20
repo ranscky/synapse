@@ -27,10 +27,12 @@ database-dsn: "postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable
 # DEV PLACEHOLDER -- generate a real one with: openssl rand -hex 32
 jwt-secret: "dev-only-placeholder-secret-not-for-any-real-deployment"
 
-# Token guarding the plane's admin endpoints. Overridden by
-# SYNAPSE_ADMIN_TOKEN. Not enforced yet: Phase 1 registers no authenticated
-# route, so it becomes required in the phase that adds admin auth.
-# Secret: never logged.
+# Token guarding the plane's admin endpoints, which today means
+# POST /v2/tenants. Overridden by SYNAPSE_ADMIN_TOKEN. Enforced: the route is
+# checked against this value on every request, and a blank value makes the route
+# answer 401 to everyone (the plane warns at startup but still boots).
+# The header is the token itself -- an exact match, no "Bearer " prefix.
+# Secret: never logged, never echoed in error messages.
 # DEV PLACEHOLDER -- replace or blank it in any real deployment.
 admin-token: "dev-only-placeholder-admin-token"
 

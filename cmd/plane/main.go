@@ -1,13 +1,13 @@
 // Command plane is the Synapse v2 control plane binary.
 //
-// Phase 1 scope: boot, load and validate configuration, and serve GET /health.
-// There is deliberately no database connection, no auth, and no feature
-// surface beyond that.
+// Phase 3 scope: boot, load and validate configuration, connect to PostgreSQL,
+// run the synapse_global migrations, and serve GET /health plus the
+// admin-guarded POST /v2/tenants. Tenant-scoped APIs, metering, and billing are
+// later phases.
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -20,23 +20,19 @@ import (
 	"time"
 
 	"synapse/internal/plane"
+	"synapse/internal/tenant"
 
 	charmlog "github.com/charmbracelet/log"
-	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-// version is reported by GET /health and in the startup log line. Both read
-// this one constant so they can never disagree.
-const version = "2.0.0"
 
 // defaultConfigPath is the file consulted when --config is not given.
 const defaultConfigPath = "synapse-plane.yaml"
 
-// healthResponse is the GET /health body, in wire order.
-type healthResponse struct {
-	Status  string `json:"status"`
-	Version string `json:"version"`
-}
+// connectTimeout bounds the startup database connection and migrations. A plane
+// that cannot reach its database exits rather than serving requests it cannot
+// fulfil.
+const connectTimeout = 60 * time.Second
 
 var (
 	configPath = flag.String("config", "", "Path to the control plane YAML config (default: ./synapse-plane.yaml)")
@@ -92,16 +88,55 @@ func main() {
 	// which config is ever logged by this binary.
 	logger.Info("Control plane config loaded", cfg.RedactedFields()...)
 
-	router := chi.NewRouter()
-	router.Get("/health", handleHealth)
+	// PostgreSQL is opened, pinged, and migrated before anything is served: a
+	// control plane that cannot reach its database has no useful answer for any
+	// route, so failing here is cheaper than failing per request later.
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseDSN)
+	if err != nil {
+		// pgx wraps the raw DSN in its parse error and the DSN carries the
+		// password, so the error text is deliberately never logged.
+		logger.Error("Failed to parse the database DSN")
+		os.Exit(1)
+	}
+
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancelStartup()
+
+	pool, err := pgxpool.NewWithConfig(startupCtx, poolCfg)
+	if err != nil {
+		logger.Error("Failed to open the database pool", "db_host", plane.DBHost(cfg.DatabaseDSN))
+		os.Exit(1)
+	}
+	// pgxpool.Close is idempotent, so the explicit close on the shutdown path
+	// and this deferred safety net cannot conflict.
+	defer pool.Close()
+
+	// db_host only, never the DSN: the fatal line still names the target without
+	// echoing the credential that lives in the connection string.
+	if err := pool.Ping(startupCtx); err != nil {
+		logger.Error("Failed to connect to the database", "db_host", plane.DBHost(cfg.DatabaseDSN))
+		os.Exit(1)
+	}
+
+	if err := tenant.RunMigrations(startupCtx, pool); err != nil {
+		logger.Error("Failed to run the database migrations", "db_host", plane.DBHost(cfg.DatabaseDSN), "error", err)
+		os.Exit(1)
+	}
+	logger.Info("migrations complete", "schema", tenant.SchemaName)
+
+	if cfg.AdminToken == "" {
+		logger.Warn("No admin token configured -- POST /v2/tenants rejects every request until one is set")
+	}
+
+	srv := plane.NewServer(cfg, pool, tenant.NewProvisioner(cfg, tenant.NewStore(pool)), logger)
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           router,
+		Handler:           srv.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	logger.Info(fmt.Sprintf("Synapse Control Plane v%s listening", version), "addr", cfg.ListenAddr)
+	logger.Info(fmt.Sprintf("Synapse Control Plane v%s listening", plane.Version), "addr", cfg.ListenAddr)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -129,23 +164,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	pool.Close()
+
 	logger.Info("Control plane stopped")
-}
-
-// handleHealth serves GET /health -- the only route Phase 1 registers: no
-// database probe, no auth, no feature surface.
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	body, err := json.Marshal(healthResponse{Status: "ok", Version: version})
-	if err != nil {
-		http.Error(w, `{"status":"error"}`, http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	// A failed write means the client went away; there is nothing useful to
-	// do about it on the health path.
-	_, _ = w.Write(body)
 }
 
 // applyPortOverride replaces the port in cfg.ListenAddr with port, preserving

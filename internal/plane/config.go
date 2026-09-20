@@ -1,8 +1,12 @@
 // Package plane holds the Synapse v2 control plane's internals.
 //
-// Phase 1 scope is deliberately narrow: configuration loading, validation,
-// and secret-safe helpers. There is no database access, no auth, and no
-// feature surface in this package yet.
+// Phase 3 scope: configuration loading, validation, secret-safe helpers, the
+// tenant provisioning HTTP contract, the admin-token middleware, and the
+// /health and /v2/tenants handlers. The package depends on interfaces it
+// declares itself (Database, TenantProvisioner) rather than on a database
+// handle, so every route is testable without PostgreSQL. The tenant
+// implementation lives in internal/tenant, which depends on this package for
+// PlaneConfig -- the reverse import would be a cycle.
 package plane
 
 import (
