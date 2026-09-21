@@ -3258,6 +3258,286 @@ the edge's trace — which is the shape `.clinerules` already requires of MCP re
 from the plane. The two unreachable config knobs
 (`conflict-jaccard-threshold`, `conflict-score-penalty`) are the other half of that work.
 
+## Phase 15 — ledger table and INSERT-only role (complete)
+
+Scope was deliberately two things: create `synapse_global.ledger`, and make
+"never update, never delete" a database privilege rather than a code convention.
+No signing, no hash chain, no reader, and no wiring into the request path — the
+table exists, the writer role exists, and the server refuses everything else.
+
+Commit `feat: Phase 15 - ledger table and INSERT-only role`
+
+New files:
+
+- `internal/ledger/doc.go` — package comment only, 24 lines. It states the
+  contract (rows in `synapse_global.ledger`, DDL owned by `internal/tenant`'s
+  migration, one writer role holding INSERT and nothing else, no signing yet) and
+  why an otherwise empty file exists at all: everything else in that directory
+  carries `//go:build integration`, and a directory whose only files are all
+  excluded by build constraints makes `go test ./...` fail outright with
+  `NoGoError: build constraints exclude all Go files` instead of skipping — and
+  that is exactly what CI runs (`ci.yml` → `go test -v ./...`, no build tags, no
+  database), so the package would have broken CI the moment it was added.
+- `internal/ledger/ledger_table_test.go` — 262 lines, `//go:build integration`:
+  `TestLedgerTablePermissions` plus four helpers (`ledgerPool`, `hasPrivilege`,
+  `runAsLedgerWriter`, `requirePermissionDenied`).
+
+Changed files:
+
+- `internal/tenant/migrations.go` — the exported `LedgerWriterRole` constant and
+  seven new migration entries (`ledger`, `ledger_tenant_created_idx`,
+  `ledger_writer_role`, `ledger_revoke_public`, `ledger_writer_schema_usage`,
+  `ledger_writer_insert`, `ledger_writer_membership`), all inside the existing
+  single transaction, all re-runnable. 206 lines, still under the 300-line cap.
+- `internal/tenant/migrations_test.go` — `ledger` added to the table list of
+  `TestRunMigrationsIsIdempotentAndCreatesEveryDocumentedTable`, which claims to
+  check *every* documented table.
+
+No new dependencies: `go.mod` is untouched, and nothing in the v1 internals was
+touched either — `internal/tenant` and `internal/ledger` are both v2 packages.
+
+Decisions made in this phase:
+
+- **The index had to be named.** `CREATE INDEX` has no unnamed form: `CREATE
+  INDEX IF NOT EXISTS ON synapse_global.ledger (tenant_id, created_at)` is a
+  syntax error (`ERROR: syntax error at or near "ON"`), so the SQL as written in
+  the phase brief would have aborted the plane's boot rather than creating
+  anything. It is now `CREATE INDEX IF NOT EXISTS ledger_tenant_created_idx ON
+  synapse_global.ledger (tenant_id, created_at)`, which is genuinely idempotent
+  (`NOTICE: relation "ledger_tenant_created_idx" already exists, skipping`).
+- **`GRANT USAGE ON SCHEMA synapse_global TO ledger_writer` was added** — one
+  grant beyond what the brief listed. Without it `GRANT INSERT` reaches nothing:
+  access to any object requires USAGE on its schema, and `synapse_global`'s ACL
+  is empty, so PUBLIC holds none (unlike `public`). Verified both ways:
+  `INSERT ... → ERROR: permission denied for schema synapse_global`, and with the
+  grant → `INSERT 0 1`.
+- **The role is granted to `CURRENT_USER`, not to a literal `synapse`.** The
+  database user is deployment configuration (`SYNAPSE_DB_DSN`); a hardcoded name
+  would abort the boot of any deployment that names its user differently, which is
+  the opposite of what a control plane is for. `GRANT <role> TO CURRENT_USER` is
+  valid syntax and resolves to exactly the role the brief calls "the application
+  user", whoever that is.
+- **The permission assertions run as `ledger_writer`, via `SET LOCAL ROLE`.** This
+  is the phase's most important caveat rather than a test detail: `synapse` is a
+  Postgres **superuser** and owns the ledger table, and a superuser bypasses every
+  privilege check while an owner holds all of them — so no GRANT can bind the DSN
+  the plane actually uses. The grants bind only an identity whose `current_user`
+  is `ledger_writer`, which is precisely why the brief's `GRANT ledger_writer TO
+  synapse` matters: that membership is what makes `SET LOCAL ROLE ledger_writer`
+  possible, and it is the shape production has to adopt (finding 1). `SET LOCAL`
+  rather than `SET ROLE`, inside an explicit transaction, so a pooled connection is
+  never handed back still wearing the writer's identity.
+- **`INSERT ... RETURNING` is not available to the writer.** `RETURNING` requires
+  `SELECT` on the returned columns, so it fails with `permission denied for table`
+  even though the INSERT itself is allowed (verified). Success is therefore judged
+  by `RowsAffected() == 1` and confirmed by a read-back through the application
+  connection — the only identity that can SELECT, because no SELECT was granted to
+  the writer on purpose.
+- **The probe INSERT is committed; the UPDATE and DELETE probes never are.** A
+  rolled-back INSERT would only prove the statement was not refused, so the row is
+  committed and then read back. The two refused statements run in transactions that
+  are always rolled back, which means an *unexpected* success leaves the
+  append-only ledger untouched and still fails the test.
+
+Verification (real output, this phase):
+
+```text
+$ gofmt -l internal/ledger internal/tenant          # empty
+$ wc -l internal/ledger/*.go internal/tenant/migrations.go
+   24 internal/ledger/doc.go
+  262 internal/ledger/ledger_table_test.go
+  206 internal/tenant/migrations.go
+$ go build ./...                                     # clean
+$ go vet ./internal/ledger/... ./internal/tenant/...
+$ go vet -tags integration ./internal/ledger/...
+VET_OK
+```
+
+The definition of done, the command exactly as specified:
+
+```text
+$ go test ./internal/ledger/... -run TestLedgerTablePermissions -v -tags integration
+=== RUN   TestLedgerTablePermissions
+--- PASS: TestLedgerTablePermissions (0.10s)
+PASS
+ok  	synapse/internal/ledger	0.106s
+```
+
+UPDATE returns an error, DELETE returns an error, INSERT succeeds — and the test
+asserts more than "an error came back". Both refusals are checked for SQLSTATE
+`42501` (`insufficient_privilege`) *and* for the words `permission denied`, so a
+syntax error, a missing table, or a failed role switch cannot be mistaken for
+enforcement; the probes assert `current_user = ledger_writer` before running, so
+they cannot be measuring the superuser; and after both refusals the row is
+counted again to prove neither statement touched it.
+
+The test was verified to fail when the guarantee is broken, the same way the
+Phase 6 isolation test was. `GRANT UPDATE ON synapse_global.ledger TO
+ledger_writer`, then re-run:
+
+```text
+$ docker exec deploy-db-1 psql -U synapse -d synapse -c \
+    'GRANT UPDATE ON synapse_global.ledger TO ledger_writer'
+GRANT
+$ go test ./internal/ledger/... -run TestLedgerTablePermissions -v -tags integration
+=== RUN   TestLedgerTablePermissions
+    ledger_table_test.go:225:
+        	Error:      	Should be false
+        	Messages:   	ledger_writer must never hold UPDATE on synapse_global.ledger
+--- FAIL: TestLedgerTablePermissions (0.07s)
+FAIL	synapse/internal/ledger	0.078s
+```
+
+`REVOKE UPDATE ON synapse_global.ledger FROM ledger_writer` and it passes again,
+with the ACL back to `{synapse=arwdDxt/synapse,ledger_writer=a/synapse}`. The ACL
+assertions are the first line of defence by construction — an over-granted table
+trips `has_table_privilege` before the probes run — while the probes cover the
+behavioural half that no ACL text check can reach.
+
+A real plane boot, against the Phase 4 compose database, applies the new
+migrations through the production path (`cmd/plane/main.go:122` calls
+`tenant.RunMigrations` at startup):
+
+```text
+$ SYNAPSE_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+  SYNAPSE_JWT_SECRET=... SYNAPSE_ADMIN_TOKEN=... SYNAPSE_MASTER_KEY=... \
+  /tmp/phase15/bin/plane --port 9198
+12:08PM WARN plane: Control plane config file not found, using defaults and environment path=synapse-plane.yaml
+12:08PM INFO plane: Control plane config loaded listen_addr=127.0.0.1:9198 database_dsn=set jwt_secret=set admin_token=set master_key=set log_level=info ledger_retention_days=365
+12:08PM INFO plane: migrations complete schema=synapse_global
+12:08PM INFO plane: Synapse Control Plane v2.0.0 listening addr=127.0.0.1:9198
+
+$ curl -sS -i http://127.0.0.1:9198/health
+HTTP/1.1 200 OK
+Content-Length: 50
+
+{"status":"ok","version":"2.0.0","db":"connected"}
+```
+
+The untagged suite still runs everywhere CI does, which is the check `doc.go`
+exists for:
+
+```text
+$ go test ./... -count=1
+ok  	synapse/internal/integration	1.792s
+?   	synapse/internal/ledger	[no test files]
+ok  	synapse/internal/plane	0.048s
+ok  	synapse/internal/proxy	0.398s
+ok  	synapse/internal/retrieval	0.009s
+ok  	synapse/internal/scorer	0.011s
+?   	synapse/internal/session	[no test files]
+ok  	synapse/internal/store	4.228s
+ok  	synapse/internal/supersession	0.008s
+ok  	synapse/internal/sync	4.390s
+ok  	synapse/internal/tenant	0.788s
+ok  	synapse/internal/trace	0.169s
+
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+    go test ./internal/tenant/... -count=1
+ok  	synapse/internal/tenant	1.205s
+```
+
+And the database's own answer, independent of the test:
+
+```text
+$ docker exec deploy-db-1 psql -U synapse -d synapse -c '\du'
+   Role name   |                         Attributes
+---------------+------------------------------------------------------------
+ ledger_writer | Cannot login
+ synapse       | Superuser, Create role, Create DB, Replication, Bypass RLS
+
+$ docker exec deploy-db-1 psql -U synapse -d synapse -c '\d synapse_global.ledger'
+   Column   |           Type           | Nullable |      Default
+------------+--------------------------+----------+-------------------
+ id         | uuid                     | not null | gen_random_uuid()
+ tenant_id  | uuid                     | not null |
+ request_id | uuid                     | not null |
+ trace_json | text                     | not null |
+ prev_hash  | text                     | not null |
+ hash_value | text                     | not null |
+ deleted_at | timestamp with time zone |          |
+ created_at | timestamp with time zone | not null | now()
+Indexes:
+    "ledger_pkey" PRIMARY KEY, btree (id)
+    "ledger_tenant_created_idx" btree (tenant_id, created_at)
+
+$ select relacl from pg_class where relname = 'ledger';
+{synapse=arwdDxt/synapse,ledger_writer=a/synapse}    # a = INSERT; no w (UPDATE), no d (DELETE)
+
+$ select has_schema_privilege('ledger_writer','synapse_global','USAGE'),
+         has_table_privilege('ledger_writer','synapse_global.ledger','INSERT'),
+         has_table_privilege('ledger_writer','synapse_global.ledger','UPDATE'),
+         has_table_privilege('ledger_writer','synapse_global.ledger','DELETE');
+ t | t | f | f
+
+$ select request_id, trace_json, hash_value from synapse_global.ledger order by created_at;
+              request_id              |                   trace_json                    |       hash_value
+--------------------------------------+-------------------------------------------------+------------------------
+ 2196a41e-9418-44c8-b627-1c6c3040e84d | {"phase":15,"probe":"ledger-table-permissions"} | phase15-unsigned-probe
+ 93d7d5c1-9b13-4ade-8f50-5a69137e3b60 | {"phase":15,"probe":"ledger-table-permissions"} | phase15-unsigned-probe
+ 38ea0a7f-54db-4519-be7b-12f61c81b9d7 | {"phase":15,"probe":"ledger-table-permissions"} | phase15-unsigned-probe
+ f1567dd5-4344-484c-b874-98c0f160fad9 | {"phase":15,"probe":"ledger-table-permissions"} | phase15-unsigned-probe
+```
+
+Cleanup: the plane was built into `/tmp/phase15/bin/` (never into `bin/`, where
+`bin/synapse` is tracked and already dirty from an earlier local build) and
+stopped — port 9198 closed, no process left. The four rows above are this phase's
+committed probe writes; append-only means they stay, which is why they are
+labelled `{"phase":15,...}` / `phase15-unsigned-probe` instead of looking like real
+ledger entries.
+
+### Findings this phase surfaced (not fixed here — this phase creates a table and a role)
+
+1. **The guarantee binds nobody in production yet.** The plane connects with the
+   DSN's user, and on the compose stack that user is `synapse`: a Postgres
+   superuser *and* the ledger table's owner. A superuser bypasses every privilege
+   check and an owner holds every privilege by default, so `GRANT INSERT` on that
+   identity is decorative — the enforcement is real only for a connection whose
+   `current_user` is `ledger_writer`. What the migration does provide is the
+   missing half: `synapse` is now a member of `ledger_writer`, so the writer can
+   `SET LOCAL ROLE ledger_writer` per transaction with no new credentials, and
+   that is the shape the first real ledger write has to adopt. The alternative — a
+   dedicated `LOGIN` role with its own password and a second DSN — is a
+   deployment change, not a migration change.
+2. **The writer cannot read `prev_hash`, so the hash chain cannot be built on this
+   role as it stands.** No `SELECT` was granted (the strongest reading of "no
+   UPDATE, no DELETE"), which means `INSERT ... RETURNING` fails too — that is
+   precisely what forced the test to judge its INSERT by row count. Phase 16's
+   chaining writer needs one of: `GRANT SELECT` (still no UPDATE, no DELETE), a
+   read of the previous hash through the application connection, or a
+   `SECURITY DEFINER` function that returns the chain head. Deciding that is the
+   signing phase's job; granting it now would have been scope creep.
+3. **`REVOKE ALL ... FROM PUBLIC` is documentation, not a closure.** A newly
+   created table's default ACL grants PUBLIC nothing (confirmed: the ACL text
+   before the revoke listed only the owner), so the statement cannot be observed
+   changing anything. It stays because the intent — this table is not public —
+   ought to be readable in the DDL rather than inferred from a default.
+4. **Concurrent boots now have a role-shaped race.** The `DO` block is
+   check-then-create, so two planes starting in the same instant could both see
+   the role missing and one could fail with `duplicate_object`. The single-plane
+   assumption in `RunMigrations`' doc comment already excludes that topology, so
+   nothing regressed — but the failure mode moved from "two `CREATE TABLE IF NOT
+   EXISTS`" (harmless) to "one boot aborts". An advisory lock, or an `EXCEPTION
+   WHEN duplicate_object` arm in the block, is the fix when a second plane becomes
+   supported.
+5. **The committed probe row is deliberately undeletable.** One row per test run
+   lands in the ledger and, by this phase's own rule, can never be removed — four
+   are there now. That is the honest cost of asserting a *committed* INSERT rather
+   than a rolled-back one, and the rows are labelled so a future chain reader can
+   recognise pre-chain entries instead of failing on them. A database-level
+   alternative does not exist: `deleted_at` is the tenant-facing soft delete for
+   chain integrity, not a licence for the role to delete anything.
+
+### Next phase
+
+Give the ledger writer the identity the grants actually bind — a write path that
+runs as `ledger_writer` (via `SET LOCAL ROLE` through the membership this phase
+granted) — and only then add signing and the `prev_hash` chain it depends on,
+which needs finding 2 resolved first. Wiring the table up without the role switch
+would produce a ledger whose append-only guarantee is real in the ACL and
+imaginary in the process.
+
+
 
 
 

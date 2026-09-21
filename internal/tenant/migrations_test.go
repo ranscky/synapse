@@ -68,7 +68,7 @@ func TestRunMigrationsIsIdempotentAndCreatesEveryDocumentedTable(t *testing.T) {
 	require.NoError(t, RunMigrations(ctx, pool))
 	require.NoError(t, RunMigrations(ctx, pool), "a second boot must be a no-op")
 
-	tables := []string{"tenants", "tenant_keys", "tenant_secrets", "compliance_access_log", "usage_events"}
+	tables := []string{"tenants", "tenant_keys", "tenant_secrets", "compliance_access_log", "usage_events", "ledger"}
 
 	for _, table := range tables {
 		var exists bool

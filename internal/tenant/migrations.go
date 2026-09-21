@@ -13,6 +13,18 @@ import (
 // row-level filter is explicitly not one.
 const SchemaName = "synapse_global"
 
+// LedgerWriterRole is the Postgres role the audit ledger accepts INSERTs from.
+// It owns nothing, cannot log in, and holds exactly one privilege on exactly one
+// table: INSERT on synapse_global.ledger. UPDATE and DELETE are deliberately
+// never granted, which is what makes the ledger append-only in the database
+// rather than by convention.
+//
+// The migration also grants the role to the application's own role, so the
+// writer can assume it per transaction (SET LOCAL ROLE). That membership is the
+// only thing that makes the guarantee reachable: the compose application user is
+// a Postgres superuser and owns the table, and no grant can bind either.
+const LedgerWriterRole = "ledger_writer"
+
 // migration is one idempotent DDL statement. The name travels into error
 // wrapping so a failed migration can be reported without echoing the SQL.
 type migration struct {
@@ -85,6 +97,75 @@ var migrations = []migration{
 	model text,
 	created_at timestamptz NOT NULL DEFAULT now()
 )`,
+	},
+	{
+		// The audit ledger: one row per compiled request, append-only. tenant_id
+		// and request_id carry no foreign key on purpose -- the ledger has to be
+		// able to record a request for a tenant row that has since been frozen or
+		// removed, and a constraint that could refuse a write would make the
+		// record incomplete exactly when it matters most.
+		name: "ledger",
+		sql: `CREATE TABLE IF NOT EXISTS ` + SchemaName + `.ledger (
+	id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+	tenant_id uuid NOT NULL,
+	request_id uuid NOT NULL,
+	trace_json text NOT NULL,
+	prev_hash text NOT NULL,
+	hash_value text NOT NULL,
+	deleted_at timestamptz,
+	created_at timestamptz NOT NULL DEFAULT now()
+)`,
+	},
+	{
+		// The index the audit read path (per-tenant history, newest first) will
+		// use. Named explicitly because CREATE INDEX has no unnamed form: unlike
+		// CREATE TABLE, an index without a name is a syntax error, so the name is
+		// what makes IF NOT EXISTS possible.
+		name: "ledger_tenant_created_idx",
+		sql:  `CREATE INDEX IF NOT EXISTS ledger_tenant_created_idx ON ` + SchemaName + `.ledger (tenant_id, created_at)`,
+	},
+	{
+		// NOLOGIN, owns nothing, no password: this role exists only to be granted
+		// INSERT below. CREATE ROLE has no IF NOT EXISTS, hence the DO block --
+		// and a role created inside this migration's transaction is rolled back
+		// with the rest of it if any later statement fails.
+		name: "ledger_writer_role",
+		sql: `DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '` + LedgerWriterRole + `') THEN
+    CREATE ROLE ` + LedgerWriterRole + `;
+  END IF;
+END $$`,
+	},
+	{
+		// Defensive rather than load-bearing: a new table's default ACL already
+		// grants PUBLIC nothing. Stated explicitly so the intent survives any
+		// future default-privilege change.
+		name: "ledger_revoke_public",
+		sql:  `REVOKE ALL ON ` + SchemaName + `.ledger FROM PUBLIC`,
+	},
+	{
+		// Without this the writer cannot reach the table at all: access to any
+		// object in a schema requires USAGE on that schema, and synapse_global has
+		// an empty ACL, so PUBLIC holds none and only the owner can get in.
+		name: "ledger_writer_schema_usage",
+		sql:  `GRANT USAGE ON SCHEMA ` + SchemaName + ` TO ` + LedgerWriterRole,
+	},
+	{
+		// INSERT and nothing else: no UPDATE, no DELETE, and no SELECT either --
+		// the strongest available form of "never update and never delete", which
+		// is this project's ledger hard rule expressed as a privilege.
+		name: "ledger_writer_insert",
+		sql:  `GRANT INSERT ON ` + SchemaName + `.ledger TO ` + LedgerWriterRole,
+	},
+	{
+		// Granted to whoever runs the migration -- the application's own role --
+		// not to a hardcoded name, because the database user is deployment
+		// configuration (SYNAPSE_DB_DSN) and a literal 'synapse' would abort the
+		// boot of any deployment that names its user differently. Membership is
+		// what lets the writer SET LOCAL ROLE ledger_writer per transaction, and
+		// it is the reason the ledger's INSERT-only guarantee is reachable at all.
+		name: "ledger_writer_membership",
+		sql:  `GRANT ` + LedgerWriterRole + ` TO CURRENT_USER`,
 	},
 }
 
