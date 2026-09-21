@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"synapse/internal/conflict"
+	"synapse/internal/ledger"
 	"synapse/internal/plane"
 	"synapse/internal/tenant"
 
@@ -154,6 +155,13 @@ func main() {
 	// and internal/plane.
 	ledgerVerifier := newLedgerVerifier(pool)
 
+	// Phase 19: the compliance endpoint's dependency. GET /v2/compliance/audit
+	// pages one tenant's signed chain and records every read in
+	// synapse_global.compliance_access_log; the implementation is the ledger
+	// package's own read path, which is also the only place that could not be
+	// replaced by a fake in that endpoint's integration test.
+	complianceAuditor := ledger.NewAuditor(pool)
+
 	srv := plane.NewServer(
 		cfg,
 		pool,
@@ -161,6 +169,7 @@ func main() {
 		memoryStore,
 		memoryStore,
 		ledgerVerifier,
+		complianceAuditor,
 		tenant.JWTMiddleware(cfg),
 		logger,
 	)

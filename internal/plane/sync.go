@@ -186,6 +186,13 @@ const (
 	agentIDKey
 	teamIDKey
 	tenantIDKey
+	// complianceTierKey is the verified compliance_tier claim, appended for the
+	// same reason tenantIDKey was: the keys above it are already in use by
+	// running binaries, and a key's value is not what makes it unguessable --
+	// its type is. Its accessors live in compliance_types.go, beside the wire
+	// shapes of the one endpoint that reads it, rather than here, because this
+	// file is at the length ceiling every file in this project is held to.
+	complianceTierKey
 )
 
 // WithTenantSlug returns a copy of ctx carrying a verified tenant slug.

@@ -4584,3 +4584,280 @@ files, so it should be decided explicitly rather than absorbed. The S/R/I/T brea
 and `trace_id` on the plane's own memory-search surface is still queued from Phase 14,
 and is also the shape `.clinerules` already requires of MCP responses.
 
+## Phase 19 — compliance audit query endpoint (complete)
+
+Phase 16 wrote the ledger, Phase 17 taught it to verify itself, Phase 18 gave it a
+producer. This phase adds the first reader: `GET /v2/compliance/audit`, one paginated
+page of a tenant's own signed entries — newest first, inside a caller-chosen window,
+with each stored `trace_json` handed back as a JSON object rather than as a string —
+gated on the caller's verified `compliance_tier` claim, and recorded in
+`synapse_global.compliance_access_log` before the answer is written.
+
+No v1 internal package was touched, and no file that this phase did not have to touch:
+`internal/tenant/migrations.go` already created both tables and the `(tenant_id,
+created_at)` index in Phases 5/15, so the schema work was a read, not a change.
+`openapi.yaml` documents `/v1/*` and `/health` only, so it was left alone rather than
+made asymmetric.
+
+Commit `feat: Phase 19 - compliance audit query endpoint`
+
+New files:
+
+- `internal/plane/compliance.go` — 296 lines: `complianceAuditRoute`, the tier, upsell,
+  page-size, and access-log-timeout constants, `handleComplianceAudit` (identity →
+  dependency → tier → parameters → read → record → answer), `parseAuditTrace`,
+  `requireAccessRecord`, and `recordAccess`. Split from the two files below at the
+  300-line ceiling this project holds every file to, along the line that is real: this
+  is the file that decides what happens to a request.
+- `internal/plane/compliance_types.go` — 187 lines: `ComplianceAuditor` (the contract
+  its implementation satisfies), `AuditFilter`, `AuditRow`, `AuditPage`,
+  `AccessRecord`, the 200/403 wire shapes, and `WithComplianceTier` /
+  `ComplianceTierFromCtx`.
+- `internal/plane/compliance_params.go` — 136 lines: `auditParams`, `parseAuditParams`
+  (the four accepted parameters, their validation, and the redaction string), and
+  `ipHash`.
+- `internal/ledger/compliance.go` — 199 lines: `auditPageQuery`, `auditTotalQuery`,
+  `insertAccessLog`, `Auditor`, `NewAuditor`, `AuditPage`, `RecordAccess`, and the
+  compile-time assertion that the contract `internal/plane` declares is still satisfied
+  here, in the package that owns the SQL.
+- `internal/plane/compliance_test.go` — 182 lines: `TestComplianceAudit`, the phase's
+  definition of done against a real PostgreSQL (the file the brief named; the setup it
+  shares is one file over).
+- `internal/plane/compliance_setup_test.go` — 242 lines: the DSN/pool helpers, the two
+  provisioned tenants, the five signed appends, the router built exactly as `cmd/plane`
+  builds it, the request helper, and the access-log reader.
+- `internal/plane/compliance_unit_test.go` — 274 lines and
+  `internal/plane/compliance_gate_test.go` — 225 lines: the untagged suite, 13 test
+  functions plus two tables over a fake auditor — the response contract, the window
+  round trip, the redaction rule, the tier/identity/parameter gates, and the four ways
+  this endpoint refuses to serve.
+
+Changed:
+
+- `internal/plane/handlers.go` — `Server.auditor`, the ninth `NewServer` parameter and
+  its doc paragraph, and the route registration behind `requireJWT`.
+- `internal/plane/sync.go` — `complianceTierKey` appended to the existing `ctxKey`
+  block (the accessors themselves live in `compliance_types.go`, beside the wire shapes
+  of their only reader, because `sync.go` is at the ceiling).
+- `internal/plane/handlers_test.go`, `ledger_test.go`, `search_test.go`, `sync_test.go`
+  — the seven `NewServer` call sites, each gaining the new argument.
+- `internal/tenant/auth.go` — `withClaims` now publishes the tier:
+  `plane.WithComplianceTier(ctx, c.ComplianceTier)`.
+- `cmd/plane/main.go` — `complianceAuditor := ledger.NewAuditor(pool)`, passed as the
+  new argument; the comment says why the implementation is the ledger package's own read
+  path and not an adapter in `main`.
+
+### Decisions made in this phase
+
+1. **The SQL lives in `internal/ledger`, behind a `plane`-declared interface, not in
+   `internal/plane`.** The brief's step 1 reads as though the handler queries the table
+   itself, and that is the one thing this codebase's structure does not allow: every
+   endpoint in `internal/plane` is testable without PostgreSQL because the package holds
+   interfaces rather than a database handle (`Database` has exactly one method, `Ping`).
+   The implementation also could not live in `cmd/plane`, where Phase 17's
+   `ledgerVerifier` adapter does: this endpoint's integration test wires the *real*
+   implementation, and a test binary cannot import `package main`. So the package that
+   already owns `ledgerTable`, `canonicalID`, and the table's read path (`verify.go`)
+   implements a contract the HTTP package declares — the arrangement `MemoryWriter`,
+   `MemorySearcher`, and `LedgerVerifier` already use.
+2. **`NewServer` gained a ninth parameter rather than a setter.** The alternative — a
+   `WithComplianceAuditor` method — would have avoided touching seven test call sites and
+   was rejected because constructor injection is this project's documented style, and a
+   server whose dependencies can be replaced after construction is a different thing from
+   the one every other endpoint was written against. The mechanical cost was seven `nil`s
+   and one value.
+3. **The tier gate reads the verified claim, and the middleware now publishes it.**
+   `compliance_tier` was already in the JWT payload and already parsed, but nothing
+   exposed it to `internal/plane` (which cannot import `internal/tenant`, where the claims
+   live), so `plane.WithComplianceTier`/`ComplianceTierFromCtx` were added and
+   `withClaims` now calls them. Reading `synapse_global.tenants` instead would have made
+   the endpoint depend on a second source of truth that can disagree with the token the
+   caller is holding; the freshness cost of the claim is finding 2 below.
+4. **The tier is checked before the window is validated.** A `team` tenant sending
+   `limit=all` gets 403, not 400: authorization precedes validation, and the ordering also
+   keeps the route from being a probe for what a valid query looks like when the caller
+   may not read anything.
+5. **The access record is written before the answer, fail-closed.** If the INSERT fails,
+   the caller gets `500 {"error":"internal"}` and the audit data is withheld; the failure
+   is logged with the tenant id and the code, and the page never leaves the process. This
+   was the one behavioural question the brief left open, and the alternative (answer, log
+   the failed record server-side) was rejected because it makes "log every call" a best
+   effort that no auditor can rely on and no test can assert. The unit suite pins exactly
+   that case: a fake whose `RecordAccess` fails gets a 500 whose body carries no entry id.
+6. **`query_params_redacted` is rebuilt from parsed values, never echoed.**
+   `r.URL.RawQuery` would have been one line and is a content-smuggling channel: an
+   unknown parameter would land verbatim in the tenant's own audit table. The recorded
+   string is `url.Values` over at most four keys (`since`, `until`, `limit`, `offset`),
+   rendered from the parsed values — times in UTC as RFC 3339 Nano, integers in decimal,
+   the rest dropped. The integration test sends `?content=must-not-be-recorded` and then
+   asserts that string appears in no access-log row.
+7. **`total` is a second `count(*)` query, not a window function.** `COUNT(*) OVER ()`
+   would be one round trip, and its value disappears exactly when the derived table is
+   empty — the case a client most wants a count for. The cost is stated in the code: the
+   count and the page are not in one transaction, so a row appended between them makes
+   `total` stale by one, and holding a transaction open to prevent that would put this
+   read in front of the tenant's own appends.
+8. **Every call that reaches a verified tenant is recorded — 200, 400, 403, and 500
+   alike.** A denied attempt is an audit fact (it is how a run of `limit=all` probes
+   becomes visible), so the 403 and 400 paths record before they answer as well. The one
+   exception is the 401: with no verified tenant the row would have no one to name.
+9. **The response carries the parsed trace and both chain fields.**
+   `prev_hash`/`hash_value` travel with each entry so an audit reader can check an entry
+   against the chain's own evidence without a second call, and the parsed `trace` replaces
+   the stored string so a client is not made to decode a JSON document inside a JSON
+   document.
+10. **The window is parsed with `time.Parse(time.RFC3339, …)` on purpose.** Go's parser
+    accepts a fractional second even though the layout does not require one, so a caller
+    can send an entry's own `created_at` (RFC 3339 Nano, microsecond-exact) as an inclusive
+    bound and get exactly that entry and everything after it. The integration test's
+    "exactly two entries" assertion rests on this: a boundary floored to whole seconds
+    would land in the *previous* entry and the test would read three.
+11. **The page is capped at 200, with a default of 50.** A page carries whole traces;
+    `maxSearchTopK` exists on the search endpoint for the same reason. `offset` is
+    validated only for being non-negative — deep paging is a performance question the
+    index answers, not an authorization one — and an inverted window (`until` before
+    `since`) is an empty page rather than a 400, because it is a valid question with an
+    empty answer.
+
+### Verification (real output, this phase)
+
+Formatting, build, and the untagged suites (what CI runs):
+
+```text
+$ gofmt -l internal/plane internal/ledger internal/tenant cmd/plane
+                                     # no output: every file this phase touched is formatted
+$ go build ./...                     # clean
+$ go vet ./internal/plane/... ./internal/ledger/... ./internal/tenant/... ./cmd/...   # clean
+$ go vet -tags integration ./internal/plane/...                                       # clean too
+$ go test -count=1 ./...             # 19 packages ok, 0 failures
+```
+
+The phase's definition of done, against the compose database
+(`postgres://synapse:synapse@127.0.0.1:5432/synapse`), fresh rather than cached:
+
+```text
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+    go test -count=1 ./internal/plane/... -run TestComplianceAudit -v -tags integration
+--- PASS: TestComplianceAuditDeniesANonEnterpriseTier (0.00s)
+    --- PASS: .../team_tier   .../no_tier   .../other_tier   .../capitalized
+--- PASS: TestComplianceAuditRequiresAVerifiedTenant (0.00s)
+--- PASS: TestComplianceAuditRejectsBadQueryParameters (0.00s)
+    --- PASS: .../limit_is_not_a_number  .../offset_is_not_a_number  .../since_is_a_date_only
+    --- PASS: .../limit_is_zero          .../limit_exceeds_the_cap   .../offset_is_negative
+    --- PASS: .../since_is_not_a_time    .../until_is_not_a_time     .../limit_is_negative
+--- PASS: TestComplianceAuditRefusesToAnswerWhenTheAccessRecordFails (0.00s)
+--- PASS: TestComplianceAuditReportsAReadFailureAsInternal (0.00s)
+--- PASS: TestComplianceAuditRefusesAnUnreadableTrace (0.00s)
+--- PASS: TestComplianceAuditFailsClosedWithoutAnAuditor (0.00s)
+--- PASS: TestComplianceAuditRefusesAnUnverifiedRequestWithoutAnAuditor (0.00s)
+--- PASS: TestComplianceAudit (0.43s)
+--- PASS: TestComplianceAuditReturnsStoredTracesAsObjects (0.00s)
+--- PASS: TestComplianceAuditRendersAnEmptyHistoryAsAnArray (0.00s)
+--- PASS: TestComplianceAuditPassesTheWindowThrough (0.00s)
+PASS
+ok  synapse/internal/plane  0.520s
+```
+
+`TestComplianceAudit` is the one that needs the database, and what it did rather than
+merely did-not-fail: provisioned two tenants through `tenant.Provisioner` (so the
+tokens are the ones production issues, `compliance_tier` included), appended five
+HMAC-signed entries to the enterprise tenant's chain through
+`ledger.NewLedger(pool).Append`, then read them back over HTTP with the real
+`ledger.Auditor` and the real middleware. It asserted five rows newest-first with
+matching ids, request ids, `prev_hash`, and `hash_value`; that each `trace` is a JSON
+**object** (`entry["trace"].(map[string]any)`) carrying the appended
+`detected_intent` and one memory, which is the brief's "parsed, not a string"
+requirement stated as an observation rather than by construction; that the team
+tenant's token gets `403 {"error":"compliance_tier_required","upgrade_url":
+"https://synapse.ai/enterprise"}` with a body naming nothing from the other tenant;
+that `since` set to the second-newest entry's own `created_at`, sent to the
+microsecond, returns exactly two rows with `total: 2`; that `limit=2&offset=1` returns
+two rows with `total: 5`; and that the three enterprise calls plus the refused one left
+four rows in `synapse_global.compliance_access_log` with the right endpoint, the right
+response codes, a 64-character `ip_hash` that is not the raw address, the window and
+paging recorded, and `?content=must-not-be-recorded` nowhere. It also asserts that no
+token, no signing secret, and no trace content reached the process log.
+
+Regression, unchanged by this phase but now running beside it:
+
+```text
+$ go test -count=1 -tags integration ./internal/ledger/... ./internal/tenant/...
+ok  synapse/internal/ledger  1.742s
+ok  synapse/internal/tenant  0.799s
+```
+
+### Findings this phase surfaced (not fixed here — this phase is one read endpoint)
+
+1. **`compliance_access_log` is not append-only, and the ledger's machinery does not
+   protect it.** Phase 15 made the ledger's immutability a database fact: the writer
+   role holds INSERT and nothing else, not even SELECT. This phase writes the access log
+   as the pool's own identity instead — the identity that, in the compose deployment,
+   owns the table and is a Postgres superuser — so the rows recording who read a
+   tenant's audit history can be rewritten or deleted by the credentials that write
+   them. That is weaker evidence than the chain those rows describe, and it is the one
+   asymmetry this phase introduces. A `compliance_log_writer` role (INSERT only, no
+   SELECT/UPDATE/DELETE, granted to the app role) is the obvious fix and is deliberately
+   not smuggled into a read-endpoint phase.
+2. **The tier is as fresh as the token.** The gate reads the verified claim, so a tenant
+   whose tier is lowered keeps reading until a new token is issued — and
+   `tenant.TokenTTL` is 365 days, so that can be a year. Reading
+   `synapse_global.tenants.compliance_tier` instead would bound the staleness at one
+   query and hand the endpoint a second source of truth that can disagree with the token
+   the caller holds; a short-lived tier claim or an explicit revocation check is the
+   design that fixes this without that cost, and it belongs to a phase that owns token
+   lifetimes.
+3. **`ip_hash` is a pseudonym, not anonymization.** `hex(sha256("host:port"))` with no
+   salt: the IPv4 space is small enough to brute-force, and the same address always
+   hashes to the same value (which is the property the column needs — "did one client
+   read this twenty times"). A per-deployment salt would raise the brute-force cost and
+   make the column unjoinable across deployments; if that trade is ever taken it must be
+   taken before the first production row, because existing rows would stop matching new
+   ones.
+4. **There is no rate limit, and each call is three database round trips.** One
+   `count(*)`, one page query, one INSERT — with up to 200 whole traces per page. Every
+   other plane endpoint has the same gap, so this is a known absence rather than a new
+   one, but a compliance endpoint is an attractive place to hammer precisely because it
+   reads history. The access log does at least make such a run visible, code included,
+   which is one of the reasons the table exists.
+5. **The traces this endpoint hands back carry Phase 18's fidelity gap.** `tokens_used`
+   and `reduction_pct` are `0` in every ledgered trace (Phase 18 decision 3), and this is
+   the second surface where a user can see it — the first being a `GET /v2/ledger/verify`
+   that reports a chain verifying while the traces inside it under-report. Closing it
+   still means editing two frozen v1 call sites.
+6. **A page read verifies nothing, and the two audit endpoints are not joined.**
+   `AuditPage` returns rows as stored; nothing here recomputes a signature. A caller who
+   wants to know whether the entries they are reading are intact still needs
+   `GET /v2/ledger/verify`, and a client that showed only this page would be showing rows
+   it has no reason to trust. Embedding a verification verdict per page is possible and
+   was not done: it would multiply the cost of a read by the length of the chain and pull
+   the walk's secret handling into the page endpoint.
+7. **The read runs as the table owner, so nothing in the database stops the plane from
+   writing the ledger itself.** `AuditPage`'s SELECT needs the owner's identity (the
+   writer role holds no SELECT), which means the running process holds every privilege on
+   `synapse_global.ledger`. The append-only guarantee binds the writer role, not the
+   process that can assume it. This is Phase 16's caveat restated from the read side, and
+   it remains the structural limit of the design: the ledger is tamper-evident, not
+   tamper-proof, against the plane's own credentials.
+8. **CI still cannot run the half of this phase that matters most for the SQL.** The
+   integration file needs a real database, so it runs on a developer machine (output
+   above) while CI runs the 13 untagged tests. That is a better position than Phase 18's
+   — which had no untagged coverage of its own wiring at all — and it is not yet the
+   whole claim: the query, the redaction string as stored, and the access-log writes are
+   verified where a database exists and nowhere else.
+
+### Next phase
+
+Finding 1 is the smallest and the most valuable: the compliance access table is the first
+audit artifact this project writes that nothing in the database protects, and a role that
+holds INSERT on it and nothing more is the same shape Phase 15 already applied to the
+ledger. After that, the items Phases 17 and 18 queued are still open and still larger:
+the external anchor for each tenant's chain head (Phase 17 finding 2 — without it, "the
+whole chain was deleted" and "nothing was ever appended" are still the same answer); key
+versioning, which is also what makes the secret-reissue repair path safe to offer; and
+returning the signing secret to the tenant once at provisioning, the only way a tenant
+verifies its own chain without trusting the plane. Finding 2's tier freshness belongs to
+whichever phase picks up token lifetimes, and the S/R/I/T breakdown plus `trace_id` on
+the plane's memory-search surface is still queued from Phase 14 — the same fields this
+endpoint's `trace` object already carries verbatim out of the stored manifest, and the
+shape `.clinerules` requires of MCP responses.
+

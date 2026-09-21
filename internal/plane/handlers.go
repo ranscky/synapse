@@ -48,15 +48,16 @@ type Server struct {
 	memories MemoryWriter
 	searcher MemorySearcher
 	ledger   LedgerVerifier
+	auditor  ComplianceAuditor
 	auth     func(http.Handler) http.Handler
 	logger   *charmlog.Logger
 }
 
 // NewServer returns a Server serving the control plane routes. db, tenants,
-// memories, searcher, ledger, and auth may be nil: the health endpoint then
-// reports a disconnected database, the provisioning endpoint answers 500, and
-// the sync, search, and ledger endpoints refuse every request instead of
-// panicking or trusting an unverified tenant.
+// memories, searcher, ledger, auditor, and auth may be nil: the health endpoint
+// then reports a disconnected database, the provisioning endpoint answers 500,
+// and the sync, search, ledger, and compliance endpoints refuse every request
+// instead of panicking or trusting an unverified tenant.
 //
 // memories and searcher are separate parameters rather than one wider interface
 // because they are two different capabilities: a plane can be wired to accept
@@ -69,6 +70,15 @@ type Server struct {
 // and the ledger's read path needs a database identity the tenant data layer
 // does not (the writer role holds no SELECT on that table).
 //
+// auditor is the fourth, and it is the audit ledger's read half: one page of a
+// tenant's chain, plus the access-log row that records the read. It is separate
+// from ledger rather than folded into it because the two answer different
+// questions with different privileges -- verification recomputes signatures under
+// the tenant's own secret, while a page read hands back the rows as stored -- and
+// because an operator may reasonably want one wired without the other. What it
+// shares with ledger is that a plane started without it refuses the route
+// outright rather than answering from a dependency it does not have.
+//
 // logger may be nil, in which case this package logs nothing.
 func NewServer(
 	cfg *PlaneConfig,
@@ -77,6 +87,7 @@ func NewServer(
 	memories MemoryWriter,
 	searcher MemorySearcher,
 	ledger LedgerVerifier,
+	auditor ComplianceAuditor,
 	auth func(http.Handler) http.Handler,
 	logger *charmlog.Logger,
 ) *Server {
@@ -87,6 +98,7 @@ func NewServer(
 		memories: memories,
 		searcher: searcher,
 		ledger:   ledger,
+		auditor:  auditor,
 		auth:     auth,
 		logger:   logger,
 	}
@@ -94,12 +106,15 @@ func NewServer(
 
 // Routes returns the plane's router: GET /health is open, POST /v2/tenants is
 // behind the admin token, and POST /v2/sync/memories, GET /v2/memories/search,
-// and GET /v2/ledger/verify are behind a tenant token.
+// GET /v2/ledger/verify, and GET /v2/compliance/audit are behind a tenant token.
 //
 // The ledger route is tenant-scoped rather than admin-guarded on purpose: the
 // chain it verifies is the caller's own (the tenant id comes from the verified
 // token), so verification is the tenant's own audit of its own records rather
-// than an operator reading someone else's.
+// than an operator reading someone else's. The compliance route is tenant-scoped
+// for the same reason and adds one gate of its own -- the token's compliance tier
+// -- which the handler applies, because it is a property of the caller rather
+// than of the route.
 func (s *Server) Routes() http.Handler {
 	router := chi.NewRouter()
 	router.Get("/health", s.handleHealth)
@@ -107,6 +122,7 @@ func (s *Server) Routes() http.Handler {
 	router.With(s.requireJWT).Post(syncRoute, s.handleSyncMemories)
 	router.With(s.requireJWT).Get(searchRoute, s.handleSearchMemories)
 	router.With(s.requireJWT).Get(ledgerVerifyRoute, s.handleVerifyLedger)
+	router.With(s.requireJWT).Get(complianceAuditRoute, s.handleComplianceAudit)
 
 	return router
 }
