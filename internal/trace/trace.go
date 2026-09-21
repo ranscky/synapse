@@ -8,6 +8,7 @@ import (
 	"time"
 	"synapse/internal/budget"
 	"synapse/internal/scorer"
+	"synapse/internal/store"
 )
 
 // TraceManifest represents the memory trace output for a compilation request
@@ -29,13 +30,22 @@ type TraceManifest struct {
 
 // TraceMemory represents a memory entry in the trace manifest.
 //
-// The two provenance fields at the end answer a different question from the
-// four scores: not "how well did this memory rank" but "whose memory is this".
-// AgentID echoes the memory's own agent as its backend returned it, and
-// CrossAgent says whether that agent is a different one from the node that
-// assembled this context -- which is the one thing a node cannot tell from the
-// scores alone, because a memory pulled from a shared plane and a memory of its
-// own look identical once they are scored.
+// The two provenance fields answer a different question from the four scores:
+// not "how well did this memory rank" but "whose memory is this". AgentID
+// echoes the memory's own agent as its backend returned it, and CrossAgent says
+// whether that agent is a different one from the node that assembled this
+// context -- which is the one thing a node cannot tell from the scores alone,
+// because a memory pulled from a shared plane and a memory of its own look
+// identical once they are scored.
+//
+// The conflict pair answers a third question: not "whose memory is this" but
+// "has someone contradicted it". ConflictStatus reports what the store's write
+// path recorded for this memory, normalized so that every entry says something
+// ("none" when nothing was recorded) rather than leaving the key out, and
+// ConflictWithID names the memory it disagrees with on either side of the pair.
+// Together they are why a demoted score_total is legible instead of mysterious:
+// the scorer's conflict penalty lands on Total alone, so a caller sees both the
+// smaller number and -- here -- the reason for it.
 type TraceMemory struct {
 	ID                 string  `json:"id"`
 	MemoryType         string  `json:"memory_type"`
@@ -50,6 +60,8 @@ type TraceMemory struct {
 	SupersededBy       string  `json:"superseded_by,omitempty"`
 	AgentID            string  `json:"agent_id"`    // The agent that wrote this memory: the node that pushed it to a control plane, or this node on a locally written row. Empty for a backend that records no agent at all (the local SQLite store: one file is one agent), which is also the value a standalone node sees for every memory it wrote itself. Marshaled unconditionally, so every entry says where it stands rather than leaving the reader to guess.
 	CrossAgent         bool    `json:"cross_agent"` // True when AgentID names an agent other than the node that assembled this context. A blank AgentID is unattributed, not someone else, so it never sets this: a standalone node's own memories are not cross-agent. Marshaled unconditionally for the same reason as AgentID.
+	ConflictStatus     string  `json:"conflict_status"` // What the write path recorded for this memory: "none", "conflict", or "superseded_candidate" (see store's ConflictStatus* constants). Always present on every entry, normalized to "none" when the memory carries nothing -- an absent key could not be told apart from a node too old to report conflicts. "superseded_candidate" is the memory a newer one contradicts: it stays in the pool and keeps its content, and the scorer is what demotes it (see weights.conflictPenalty).
+	ConflictWithID     string  `json:"conflict_with_id"` // The id of the memory this one disagrees with, or "" when ConflictStatus is "none". Always present, so a reader can tell "no counterpart recorded" from "this node does not report the field". Which side names which is the store's rule and mirrors superseded_by: the older memory names the newer one and vice versa.
 }
 
 // NewTraceManifest creates a new trace manifest from pipeline data.
@@ -119,6 +131,20 @@ func NewTraceManifest(
 			contentPreview = contentPreview[:100]
 		}
 
+		// Conflict marking. Only the Postgres write path ever sets these on a
+		// memory -- its table is the only one with the columns -- so a plane row
+		// no one has contradicted, a local SQLite row, and a memory from a
+		// backend with no conflict concept at all all arrive here empty and are
+		// reported as "none". That normalization is the contract, not a
+		// convenience: "none" states that nobody has contradicted this memory,
+		// while an absent key could not be told apart from a node too old to
+		// report conflicts. ConflictWithID is passed through verbatim, because
+		// the store is the only thing that knows which side names which.
+		conflictStatus := memory.ConflictStatus
+		if conflictStatus == "" {
+			conflictStatus = store.ConflictStatusNone
+		}
+
 		traceMemories[i] = TraceMemory{
 			ID:                 memory.ID,
 			MemoryType:         memory.MemoryType,
@@ -138,6 +164,10 @@ func NewTraceManifest(
 			// carries no agent at all -- unattributed is not another agent's.
 			AgentID:    memory.AgentID,
 			CrossAgent: memory.AgentID != "" && memory.AgentID != localAgentID,
+			// Conflict marking, normalized above. Both are marshaled
+			// unconditionally in the trace JSON -- see TraceMemory.
+			ConflictStatus: conflictStatus,
+			ConflictWithID: memory.ConflictWithID,
 		}
 	}
 

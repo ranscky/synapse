@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -203,10 +204,110 @@ func TestMemoryHeaders(t *testing.T) {
 	}
 }
 
+// TestCompile_TraceCarriesConflictFields is Phase 14's proof that the store's
+// conflict marking survives the whole compile path -- candidate list, dedup,
+// scoring, budget, trace -- rather than only trace.NewTraceManifest in
+// isolation. Both memories arrive from the plane exactly as PGStore.Search and
+// pgread.scanEntry return them after a Phase 13 detection: the older one a
+// superseded candidate naming the newer, the newer one conflicting and naming
+// the older. Compile decides nothing about either field and has no code of its
+// own for them; it only has to carry both through unchanged, which is what the
+// JSON assertions below pin down.
+func TestCompile_TraceCarriesConflictFields(t *testing.T) {
+	older := scorer.ScoredMemory{
+		MemoryEntry: store.MemoryEntry{
+			ID:             "pg-1",
+			SessionID:      "session-a",
+			Content:        "We decided to use Postgres",
+			MemoryType:     "decision",
+			Timestamp:      time.Now().Add(-30 * time.Minute),
+			AgentID:        "agent_a",
+			ConflictStatus: store.ConflictStatusSupersededCandidate,
+			ConflictWithID: "my-1",
+		},
+		// Already demoted by the scorer's conflict penalty, which is what a
+		// superseded candidate's Total looks like by the time a trace exists.
+		Total: 0.45,
+	}
+	newer := scorer.ScoredMemory{
+		MemoryEntry: store.MemoryEntry{
+			ID:             "my-1",
+			SessionID:      "session-b",
+			Content:        "We decided to use MySQL",
+			MemoryType:     "decision",
+			Timestamp:      time.Now().Add(-5 * time.Minute),
+			AgentID:        "agent_b",
+			ConflictStatus: store.ConflictStatusConflict,
+			ConflictWithID: "pg-1",
+		},
+		Total: 0.9,
+	}
+
+	result := Compile(
+		[]scorer.ScoredMemory{newer, older},
+		"what did we decide about the database?",
+		"req-conflict",
+		"generic",
+		0.5,
+		2,
+		2,
+		3000,
+		10,
+		[]scorer.ScoredMemory{newer, older},
+		[]scorer.ScoredMemory{newer, older},
+		"agent_b", // this node is agent_b, so agent_a's memory is cross-agent too
+	)
+
+	data, err := json.Marshal(result.Trace)
+	if err != nil {
+		t.Fatalf("failed to marshal trace: %v", err)
+	}
+
+	var decoded struct {
+		Memories []map[string]interface{} `json:"memories"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("failed to unmarshal trace: %v", err)
+	}
+
+	byID := make(map[string]map[string]interface{}, len(decoded.Memories))
+	for _, memory := range decoded.Memories {
+		id, _ := memory["id"].(string)
+		byID[id] = memory
+	}
+
+	for _, tc := range []struct {
+		id      string
+		status  string
+		withID  string
+		agentID string
+	}{
+		{"pg-1", store.ConflictStatusSupersededCandidate, "my-1", "agent_a"},
+		{"my-1", store.ConflictStatusConflict, "pg-1", "agent_b"},
+	} {
+		entry, ok := byID[tc.id]
+		if !ok {
+			t.Fatalf("%s is missing from the trace", tc.id)
+		}
+		if got := entry["conflict_status"]; got != tc.status {
+			t.Errorf("%s conflict_status = %v, want %q", tc.id, got, tc.status)
+		}
+		if got := entry["conflict_with_id"]; got != tc.withID {
+			t.Errorf("%s conflict_with_id = %v, want %q", tc.id, got, tc.withID)
+		}
+		// The conflict pair is additive: the Phase 11 provenance fields the
+		// same entry already carried are untouched by it.
+		if got := entry["agent_id"]; got != tc.agentID {
+			t.Errorf("%s agent_id = %v, want %q", tc.id, got, tc.agentID)
+		}
+	}
+}
+
 // Helper function to check if string contains substring
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
+
 
 // TestCompile_TraceAgentProvenance proves the Phase 11 provenance fields make it
 // all the way through the real compile path rather than only through

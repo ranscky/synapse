@@ -215,3 +215,96 @@ func TestTraceMemory_ProvenanceAlwaysMarshaled(t *testing.T) {
 		t.Errorf("local-1 cross_agent = %v, want false", got)
 	}
 }
+// TestTraceMemory_ConflictFieldsAlwaysMarshaled is Phase 14's contract: every
+// traced memory carries conflict_status and conflict_with_id, whatever backend
+// it came from. The local SQLite store has no conflict column at all, so its
+// rows -- and any plane row no detector has ever looked at -- arrive with an
+// empty ConflictStatus, and the trace reports them as "none" instead of leaving
+// the key out. That distinction is the point of the field: "none" says nobody
+// has contradicted this memory, while an absent key would say only that this
+// node does not report conflicts.
+func TestTraceMemory_ConflictFieldsAlwaysMarshaled(t *testing.T) {
+	// A memory no detector has looked at, which is the local backend's normal
+	// state rather than an edge case.
+	plain := scoredMemory("plain-1", "fact", "")
+
+	// Phase 13's pair, as the plane's read path returns it: the older memory is
+	// a candidate to be superseded and names the newer one, and the newer memory
+	// introduced the disagreement and names the older one.
+	flagged := scoredMemory("old-decision", "decision", "")
+	flagged.ConflictStatus = store.ConflictStatusSupersededCandidate
+	flagged.ConflictWithID = "new-decision"
+
+	conflicting := scoredMemory("new-decision", "decision", "")
+	conflicting.ConflictStatus = store.ConflictStatusConflict
+	conflicting.ConflictWithID = "old-decision"
+
+	all := []scorer.ScoredMemory{flagged, conflicting, plain}
+	manifest := NewTraceManifest(
+		"req-conflict", "generic", 0.9,
+		3, 3, 3,
+		0, 3000, 5,
+		all, all, all,
+		"",
+	)
+
+	// The normalization happens at the source, not only in the JSON, so the
+	// struct is checked here too.
+	byID := make(map[string]TraceMemory, len(manifest.Memories))
+	for _, memory := range manifest.Memories {
+		byID[memory.ID] = memory
+	}
+	if got, ok := byID["plain-1"]; !ok {
+		t.Fatal("plain-1 is missing from the trace")
+	} else if got.ConflictStatus != store.ConflictStatusNone || got.ConflictWithID != "" {
+		t.Errorf("plain-1: conflict_status=%q conflict_with_id=%q, want %q/\"\"",
+			got.ConflictStatus, got.ConflictWithID, store.ConflictStatusNone)
+	}
+
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("failed to marshal trace manifest: %v", err)
+	}
+
+	var decoded struct {
+		Memories []map[string]interface{} `json:"memories"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("failed to unmarshal trace manifest: %v", err)
+	}
+	if len(decoded.Memories) != 3 {
+		t.Fatalf("got %d memory entries in JSON, want 3", len(decoded.Memories))
+	}
+
+	// Both keys on every entry, included or not -- the DoD's "on every memory
+	// entry" asserted against the wire form.
+	jsonByID := make(map[string]map[string]interface{}, len(decoded.Memories))
+	for _, memory := range decoded.Memories {
+		id, _ := memory["id"].(string)
+		jsonByID[id] = memory
+		for _, key := range []string{"conflict_status", "conflict_with_id"} {
+			if _, ok := memory[key]; !ok {
+				t.Errorf("memory %s is missing %q in the trace JSON", id, key)
+			}
+		}
+	}
+
+	want := map[string][2]string{
+		"plain-1":      {store.ConflictStatusNone, ""},
+		"old-decision": {store.ConflictStatusSupersededCandidate, "new-decision"},
+		"new-decision": {store.ConflictStatusConflict, "old-decision"},
+	}
+	for id, pair := range want {
+		entry, ok := jsonByID[id]
+		if !ok {
+			t.Errorf("%s is missing from the trace JSON", id)
+			continue
+		}
+		if got := entry["conflict_status"]; got != pair[0] {
+			t.Errorf("%s conflict_status = %v, want %q", id, got, pair[0])
+		}
+		if got := entry["conflict_with_id"]; got != pair[1] {
+			t.Errorf("%s conflict_with_id = %v, want %q", id, got, pair[1])
+		}
+	}
+}

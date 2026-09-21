@@ -121,6 +121,15 @@
           "cross_agent": {
             "type": "boolean",
             "description": "True when agent_id names an agent other than the node that assembled this context, i.e. when this memory came from another agent. False when the memory belongs to the compiling node or carries no agent at all -- unattributed is not someone else's, so a standalone node never reports one of its own memories as cross-agent. Always present on every entry, included or not."
+          },
+          "conflict_status": {
+            "type": "string",
+            "enum": ["none", "conflict", "superseded_candidate"],
+            "description": "What the write path recorded for this memory. \"none\" is the normal state: no contradiction has been recorded, which is every memory of a backend with no conflict concept (the local SQLite store) and every plane memory no detector has looked at. \"superseded_candidate\" marks the older memory a newer one contradicts -- it is not superseded, keeps its content, stays in every read, and is only demoted by the scorer; the score_total below is therefore smaller than its own S/R/I/T breakdown implies, and this field is why. \"conflict\" marks the memory that introduced the contradiction. Always present on every entry, included or not, normalized to \"none\" rather than omitted, so a reader can tell 'nobody has contradicted this memory' from 'this node does not report conflicts'."
+          },
+          "conflict_with_id": {
+            "type": "string",
+            "description": "The id of the memory this one disagrees with, or an empty string when conflict_status is \"none\". Both sides of a contradiction name each other, mirroring superseded_by: the older memory names the newer one and vice versa. Deliberately not format: uuid -- the empty string is the ordinary value for every memory no contradiction has been recorded for. Always present on every entry, included or not."
           }
         },
         "required": [
@@ -134,7 +143,9 @@
           "score_total",
           "included",
           "agent_id",
-          "cross_agent"
+          "cross_agent",
+          "conflict_status",
+          "conflict_with_id"
         ]
       }
     }

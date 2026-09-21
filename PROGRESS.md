@@ -2907,4 +2907,362 @@ unreachable in production — the plane's conflict threshold, and a resolution p
 flagged contradiction — become worth wiring.
 
 
+## Phase 14 — conflict fields in Memory Trace (complete)
+
+Commit `feat: Phase 14 - conflict fields in Memory Trace`
+
+`conflict_status` and `conflict_with_id` now appear on **every** memory entry in the
+Memory Trace JSON, so the demotion Phase 13's scorer applies carries its reason with it.
+Phase 13 signed off by naming this exact gap — "the conflict reaches the stored row and
+the plane's JSON, but not the trace or a score breakdown ... a demoted score still cannot
+be explained to a user" — and this phase closes the trace half of it.
+
+```json
+{
+  "id": "bad88243-97b3-5b84-a4cc-15a0785025c4",
+  "memory_type": "decision",
+  "content_preview": "We decided to use Postgres",
+  "score_semantic": 0.4755730099875433,
+  "score_recency": 0.9996831933994552,
+  "score_importance": 1,
+  "score_task_alignment": 0.5,
+  "score_total": 0.3450987616674814,
+  "included": true,
+  "agent_id": "agent_a",
+  "cross_agent": true,
+  "conflict_status": "superseded_candidate",
+  "conflict_with_id": "d786bcc7-90aa-54a7-a074-328c315d43e7"
+}
+```
+
+That is a real entry from the live run below (nothing trimmed — this is the full JSON of
+the memory). It is the whole phase in one object: `agent_a`'s decision (Phase 11's
+provenance), a `score_total` that is exactly half its own S/R/I/T breakdown (Phase 13's
+penalty: 0.69021415 × 0.5 = 0.34510708), and now the two fields that say *why*.
+
+### One field addition, and the one place it happens
+
+`TraceMemory` is built in exactly one place — `internal/trace/trace.go`, inside
+`NewTraceManifest` — and every caller reaches it through that function:
+`compiler.Compile` (which `/v1/compile` and `/api/playground/compile` both call), the
+live proxy path, the `X-Synapse-Trace` header, and the manifest the session inspector is
+served. So the fill is one assignment there, and `internal/compiler` needed no production
+change at all: `Compile` only forwards `[]scorer.ScoredMemory`, and `ScoredMemory`
+**embeds** `store.MemoryEntry`, which has carried `ConflictStatus`/`ConflictWithID` since
+Phase 13 (`pgread.scanEntry` fills them from the two Postgres columns, and the plane's
+`/v2/memories/search` response serializes the same struct to the edge). Adding a second
+assignment in the compiler would have been dead code whose only possible future was to
+drift from the first. The phase's compiler-side proof is therefore a test
+(`TestCompile_TraceCarriesConflictFields`, below) rather than a no-op edit.
+
+Two decisions inside the field addition are worth naming:
+
+- **`"none"` is written, not omitted.** A memory whose backend records no conflict at all
+  (the local SQLite table has no such column) and a plane memory no detector has looked
+  at both arrive with an empty `ConflictStatus`, and the trace normalizes them to `"none"`
+  rather than dropping the key. `"none"` is a *statement* — nobody has contradicted this
+  memory — whereas an absent key would leave a reader unable to tell that from a node too
+  old to report conflicts at all. That is the same reasoning `agent_id`/`cross_agent`
+  carry, and for the same reason neither new field has `omitempty`.
+- **The status values are referenced, not re-typed.** `store.ConflictStatusNone` is used
+  rather than a local literal, because those constants are the SQL literals the write path
+  stores, and `internal/scorer` already imports `internal/store` for
+  `ConflictStatusSupersededCandidate`. There is no cycle: `store` imports only `config`,
+  and `trace` already depended on `store` transitively through `scorer`.
+  `conflict_with_id` is passed through verbatim — the store is the only thing that knows
+  which side names which — and stays an empty string when there is no counterpart.
+
+### Files
+
+| File | Change |
+| --- | --- |
+| `internal/trace/trace.go` | `TraceMemory.ConflictStatus` / `.ConflictWithID`, both marshaled unconditionally; the `"none"` normalization and the two assignments inside `NewTraceManifest`; `store` import |
+| `internal/trace/trace_test.go` | `TestTraceMemory_ConflictFieldsAlwaysMarshaled`: both keys on every entry, `"none"` when unset, the counterpart id when set |
+| `internal/compiler/compiler_test.go` | `TestCompile_TraceCarriesConflictFields`: the compiler → trace hop on a plane-shaped Postgres/MySQL pair, asserting the Phase 11 fields on the same entries are untouched |
+| `schemas/memory-trace.schema.json` | both properties (`conflict_status` with its three-value enum, `conflict_with_id` deliberately without `format: uuid`) added to `memories.items.properties` **and** to `items.required` |
+| `openapi.yaml` | the same two fields and the same two `required` entries on `TraceMemory` — the published contract for this payload, kept in step exactly as Phase 11 kept `agent_id`/`cross_agent` |
+| `ui/session.html` | `.conflict-badge` (amber) and the badge in `renderMemoryTrace` |
+| `ui/index.html` | the same badge and rule, written independently — the two inspectors are separate implementations |
+| `PROGRESS.md` | this section |
+
+The badge is amber, not the burn orange of the exclusion badge or the violet of
+cross-agent, because a flagged memory is neither rejected nor merely someone else's — it
+is a claim another memory disagrees with, and a `superseded_candidate` keeps its place in
+the pool. Its `title` names the counterpart id, so the tooltip answers "conflicts with
+what?" without a click; an entry whose status is `"none"` renders no badge, and the modal
+in both inspectors is a `JSON.stringify` dump, so both fields were already visible there
+with no change.
+
+### Verification
+
+The phase's two new tests first, then the whole suite:
+
+```text
+$ go test ./internal/trace/... ./internal/compiler/... -run Conflict -v
+=== RUN   TestTraceMemory_ConflictFieldsAlwaysMarshaled
+--- PASS: TestTraceMemory_ConflictFieldsAlwaysMarshaled (0.21s)
+PASS
+ok  	synapse/internal/trace	0.214s
+=== RUN   TestCompile_TraceCarriesConflictFields
+--- PASS: TestCompile_TraceCarriesConflictFields (0.19s)
+PASS
+ok  	synapse/internal/compiler	0.202s
+
+$ go build ./... && go vet ./... && go test ./...
+ok  	synapse/internal/api	1.042s
+ok  	synapse/internal/budget	(cached)
+ok  	synapse/internal/classifier	(cached)
+ok  	synapse/internal/compiler	0.260s
+ok  	synapse/internal/config	(cached)
+ok  	synapse/internal/conflict	(cached)
+ok  	synapse/internal/dedup	(cached)
+ok  	synapse/internal/embedder	(cached)
+ok  	synapse/internal/integration	1.333s
+ok  	synapse/internal/plane	(cached)
+ok  	synapse/internal/proxy	0.247s
+ok  	synapse/internal/retrieval	(cached)
+ok  	synapse/internal/scorer	(cached)
+ok  	synapse/internal/store	(cached)
+ok  	synapse/internal/supersession	(cached)
+ok  	synapse/internal/sync	(cached)
+ok  	synapse/internal/tenant	(cached)
+ok  	synapse/internal/trace	0.193s
+
+$ SYNAPSE_TEST_DB_DSN='postgres://...' go test ./internal/store/... ./internal/tenant/...
+ok  	synapse/internal/store	6.741s
+ok  	synapse/internal/tenant	1.245s
+```
+
+Three mutations, each reverted afterwards, run to confirm the new tests bite:
+
+```text
+# 1. normalize to the wrong status instead of "none"
+--- FAIL: TestTraceMemory_ConflictFieldsAlwaysMarshaled (0.20s)
+    trace_test.go:260: plain-1: conflict_status="conflict" conflict_with_id="", want "none"/""
+    trace_test.go:304: plain-1 conflict_status = conflict, want "none"
+
+# 2. stop passing conflict_with_id through
+--- FAIL: TestTraceMemory_ConflictFieldsAlwaysMarshaled (0.20s)
+    trace_test.go:307: old-decision conflict_with_id = , want "new-decision"
+    trace_test.go:307: new-decision conflict_with_id = , want "old-decision"
+
+# 3. the compiler test's fixture loses its superseded_candidate status
+--- FAIL: TestCompile_TraceCarriesConflictFields (0.33s)
+    compiler_test.go:293: pg-1 conflict_status = conflict, want "superseded_candidate"
+```
+
+One mutation is worth naming because it cannot be run: deleting the normalization
+outright (`conflictStatus = ""`) does not compile — `"synapse/internal/store" imported and
+not used` — which is why mutation 1 substitutes a different status value instead of
+removing the line. The assertion is still tested, because a version of the code that both
+kept the `store` import and stopped normalizing (mutation 1) fails.
+
+#### Live run: a two-agent contradiction, end to end
+
+Real binaries, real Postgres (the compose `db` service from Phase 4, already healthy on
+`127.0.0.1:5432`), real ONNX embeddings. The plane ran with its four secrets from the
+environment; two edge nodes (`agent_a` on `:8081`, `agent_b` on `:8082`) pointed at it, each
+with its own SQLite file, so the contradiction is between memories that arrived from
+different agents through the plane's own sync endpoint. The JWT-bearing `tenant.json` and
+both edge configs were written 0600, are never committed, and were shredded at the end.
+
+```text
+$ SYNAPSE_DB_DSN='postgres://...' SYNAPSE_JWT_SECRET='…' SYNAPSE_ADMIN_TOKEN='…' \
+  SYNAPSE_MASTER_KEY='…' /tmp/synapse-phase14/bin/plane &
+$ curl -s http://127.0.0.1:9090/health
+{"status":"ok","version":"2.0.0","db":"connected"}
+
+$ curl -s -X POST http://127.0.0.1:9090/v2/tenants -H 'Authorization: <admin token>' \
+      -H 'Content-Type: application/json' -d '{"slug":"phase14-edge"}' -o tenant.json
+$ jq '{tenant_id, jwt_len: (.jwt|length), api_key_len: (.api_key|length)}' tenant.json
+{ "tenant_id": "c2796f14-0e7b-4de8-8599-061d563c27db", "jwt_len": 387, "api_key_len": 64 }
+
+$ /tmp/synapse-phase14/bin/synapse --config /tmp/synapse-phase14/edge_a.yaml &   # agent_a, :8081
+INFO synapse: sync: background flusher started agent_id=agent_a interval_seconds=30
+INFO synapse: ONNX embedder initialized with real inference model=models/all-MiniLM-L6-v2/model.onnx
+$ /tmp/synapse-phase14/bin/synapse --config /tmp/synapse-phase14/edge_b.yaml &   # agent_b, :8082
+
+# --- each agent writes the phase-13 fixture through its own node --------------------
+$ curl -s -X POST http://127.0.0.1:8081/v1/compile -H 'Content-Type: application/json' \
+    -d '{"session_id":"sess-phase14-a","messages":[{"role":"user","content":"We decided to use Postgres"}]}'
+HTTP 200   # .trace.candidates_retrieved = 0: the tenant's schema is still empty
+$ curl -s -X POST http://127.0.0.1:8082/v1/compile -H 'Content-Type: application/json' \
+    -d '{"session_id":"sess-phase14-b","messages":[{"role":"user","content":"We decided to use MySQL"}]}'
+HTTP 200
+
+# each node's own row, with the real 384-float embedding the ONNX model produced:
+$ python3 -c "...select id, session_id, content, memory_type, sync_status, length(embedding)..."
+edge_a: ('req-1789991868659587109', 'sess-phase14-a', 'We decided to use Postgres', 'decision', 'local_only', 1536)
+edge_b: ('req-1789991868840546528', 'sess-phase14-b', 'We decided to use MySQL',    'decision', 'local_only', 1536)
+
+# --- both rows go to the plane through the documented push protocol -----------------
+# (postgres first, so the mysql write is the one that detects)
+$ curl -s -X POST http://127.0.0.1:9090/v2/sync/memories -H "Authorization: Bearer $JWT" \
+    -H 'Content-Type: application/json' -d @push_a.json          # envelope agent_id=agent_a
+{"written":1,"sanitized":0} HTTP 200
+$ curl -s -X POST http://127.0.0.1:9090/v2/sync/memories -H "Authorization: Bearer $JWT" \
+    -H 'Content-Type: application/json' -d @push_b.json          # envelope agent_id=agent_b
+{"written":1,"sanitized":0} HTTP 200
+plane.log: INFO plane: Memories synced tenant_slug=phase14-edge agent_id=agent_a written=1 sanitized=0
+plane.log: WARN conflict_detected new_id=d786bcc7-90aa-54a7-a074-328c315d43e7 \
+                                   conflicts_with=bad88243-97b3-5b84-a4cc-15a0785025c4
+plane.log: INFO plane: Memories synced tenant_slug=phase14-edge agent_id=agent_b written=1 sanitized=0
+
+# --- what the plane stored ----------------------------------------------------------
+$ docker exec deploy-db-1 psql -U synapse -d synapse -c \
+    "select agent_id, conflict_status, coalesce(conflict_with_id::text,'') as conflict_with_id, \
+     left(content, 26) as content from tenant_phase14_edge.memories order by created_at"
+ agent_id |   conflict_status    |           conflict_with_id           |          content
+----------+----------------------+--------------------------------------+----------------------------
+ agent_a  | superseded_candidate | d786bcc7-90aa-54a7-a074-328c315d43e7 | We decided to use Postgres
+ agent_b  | conflict             | bad88243-97b3-5b84-a4cc-15a0785025c4 | We decided to use MySQL
+```
+
+```text
+# --- the compile that has to show it: a third session, asked a question -------------
+$ curl -s -X POST http://127.0.0.1:8082/v1/compile -H 'Content-Type: application/json' \
+    -d '{"session_id":"sess-phase14-query","messages":[{"role":"user","content":"what did we decide about the database?"}]}' \
+    -o compile_conflict.json -w 'HTTP %{http_code} in %{time_total}s\n'
+HTTP 200 in 0.082711s
+plane.log: INFO plane: Memories searched tenant_slug=phase14-edge agent_id="" \
+           request_agent_id=agent_b memories=2
+
+# both keys on every entry -- asserted, not eyeballed (the DoD's own wording):
+$ jq 'all(.trace.memories[]; has("conflict_status") and has("conflict_with_id"))' compile_conflict.json
+true
+
+# the entries, exactly as the trace JSON carries them (ids elided only here):
+$ jq -c '.trace.memories[]' compile_conflict.json
+{"id":"d786bcc7-…","memory_type":"decision","content_preview":"We decided to use MySQL",
+ "score_semantic":0.565985208128604,"score_recency":0.9998509403569839,"score_importance":1,
+ "score_task_alignment":0.5,"score_total":0.72637917728714,"included":true,"agent_id":"agent_b",
+ "cross_agent":false,"conflict_status":"conflict","conflict_with_id":"bad88243-97b3-5b84-a4cc-15a0785025c4"}
+{"id":"bad88243-…","memory_type":"decision","content_preview":"We decided to use Postgres",
+ "score_semantic":0.4755730099875433,"score_recency":0.9998494888241959,"score_importance":1,
+ "score_task_alignment":0.5,"score_total":0.34510707643871846,"included":true,"agent_id":"agent_a",
+ "cross_agent":true,"conflict_status":"superseded_candidate","conflict_with_id":"d786bcc7-90aa-54a7-a074-328c315d43e7"}
+
+# and the demoted Total is the penalty times that entry's own S/R/I/T breakdown
+# (the edge's configured weights, 0.4/0.1/0.3/0.2):
+We decided to use MySQL     conflict_status=conflict             raw=0.72637918 trace_total=0.72637918 ratio=1.0000
+We decided to use Postgres  conflict_status=superseded_candidate raw=0.69021415 trace_total=0.34510708 ratio=0.5000
+```
+
+Both memories survive dedup (their cosine similarity stays under the 0.92 threshold) and
+both are `included`, which is the phase's contract: a flagged memory is demoted, never
+dropped. The flagged one is the *older* row and the one marked `conflict` is the *newer*
+row — Phase 13's settled direction, now legible in the output instead of only in the
+store.
+
+```text
+# --- the schema validates the real output -------------------------------------------
+$ python3 -c "jsonschema.validate(trace, schema)"
+valid against schemas/memory-trace.schema.json
+both keys present on all 2 entries
+```
+
+```text
+# --- the payload the session inspector itself polls ---------------------------------
+$ curl -s http://127.0.0.1:8082/api/sessions | jq -c '.[] | {id, message_count}'
+{"id":"0c73c7fc-788c-4d27-88f4-db29ed30b63c","message_count":1}
+$ curl -s http://127.0.0.1:8082/api/sessions/0c73c7fc-788c-4d27-88f4-db29ed30b63c/trace \
+    | jq 'all(.memories[]; has("conflict_status") and has("conflict_with_id"))'
+true
+# (that trace came from one request through the proxy path -- see the finding below about
+#  which path populates the inspector -- and its Postgres entry carries the same
+#  conflict_status/conflict_with_id pair, with score_total 0.3450987616674814)
+
+# --- both inspectors actually render it ---------------------------------------------
+$ curl -s http://127.0.0.1:8082/ui -o ui_index.html
+$ curl -s http://127.0.0.1:8082/ui/session -o ui_session.html
+$ grep -c 'conflict-badge' ui_index.html ui_session.html
+ui_index.html:2
+ui_session.html:2
+
+# Each UI's own renderMemoryTrace, extracted from the HTML the server is serving and run
+# against those entries in node, so this is the markup a browser inserts, not a
+# description of it:
+ui/session.html
+conflict              -> <span class="conflict-badge" title="This memory introduced a contradiction, conflicts with bad88243-97b3-5b84-a4cc-15a0785025c4">conflict</span>
+superseded_candidate  -> <span class="conflict-badge" title="A newer memory contradicts this one, so the scorer demotes it, conflicts with d786bcc7-90aa-54a7-a074-328c315d43e7">superseded candidate</span>
+none                  -> (no conflict badge rendered)
+ui/index.html
+conflict              -> <span class="conflict-badge" title="This memory introduced a contradiction, conflicts with bad88243-97b3-5b84-a4cc-15a0785025c4">conflict</span>
+superseded_candidate  -> <span class="conflict-badge" title="A newer memory contradicts this one, so the scorer demotes it, conflicts with d786bcc7-90aa-54a7-a074-328c315d43e7">superseded candidate</span>
+none                  -> (no conflict badge rendered)
+```
+
+```text
+# --- control: the plane is killed, so edge_b compiles from its own SQLite -------------
+$ kill <plane pid>; curl -s -m 2 http://127.0.0.1:9090/health
+connection refused
+$ curl -s -X POST http://127.0.0.1:8082/v1/compile -H 'Content-Type: application/json' \
+    -d '{"session_id":"sess-phase14-b","messages":[{"role":"user","content":"what did we decide about the database?"}]}'
+HTTP 200
+edge_b.log: WARN Control plane candidate pull failed, falling back to local search \
+            plane_unavailable=true fallback=local
+
+# the field is still on the entry -- a local SQLite row, whose table has no conflict
+# column at all, reports the normalized "none" rather than leaving the key out:
+$ jq 'all(.trace.memories[]; has("conflict_status") and has("conflict_with_id"))' compile_offline.json
+true
+$ jq -c '.trace.memories[] | {content_preview, agent_id, conflict_status, conflict_with_id}' compile_offline.json
+{"content_preview":"We decided to use MySQL","agent_id":"","conflict_status":"none","conflict_with_id":""}
+```
+
+Cleanup after the run: plane and both edges stopped, `tenant.json` and both edge configs
+shredded (all three were 0600 and never committed), and no build artifact was written into
+the repository — the two binaries for this run were built into
+`/tmp/synapse-phase14/bin/`, because `bin/synapse` is tracked by git and was already dirty
+from an earlier local build that this phase deliberately left untouched.
+
+### Findings this phase surfaced (not fixed here — this phase is one field addition)
+
+1. **Only the proxy path populates the session inspector.** `sessionMgr.SetTrace` is called
+   in exactly one place (`internal/proxy/proxy.go`), and `/v1/compile` never calls it, so a
+   session that only ever went through the API has no trace for
+   `GET /api/sessions/{id}/trace` to serve — which is why the inspector payload above came
+   from one request through the proxy route rather than from the `/v1/compile` that produced
+   the trace. Pre-existing v1 behaviour, and now a visible gap: the trace that finally
+   explains a demotion is the one the inspector cannot show an API-only caller.
+2. **`exclusion_reason`'s enum is stale in both schema files.** `schemas/memory-trace.schema.json`
+   and `openapi.yaml` both list `["deduped", "budget_exceeded", "null"]`, while the code emits
+   `"superseded"` (Phase 5's own trace test asserts it) and omits the key entirely when there
+   is no reason. The live trace in this phase happened to contain no superseded memory, which
+   is why `jsonschema.validate` passed; one would fail. Left alone deliberately — this phase
+   adds two fields and touches nothing else — but it is a one-line fix waiting for a phase
+   that owns the schema.
+3. **Dedup could have collapsed the pair, and the field would still have been there.** Both
+   fixture sentences survived the 0.92 cosine threshold, so both appear as `included`. Two
+   nearer-duplicate sentences would have left one labelled `duplicate` instead — and it would
+   still have carried its `conflict_status`, because the field is independent of inclusion.
+   That is the useful shape, but it means the "demoted and still included" pair above is a
+   property of this fixture, not a guarantee.
+4. **The plane still cannot explain a demotion to a caller.** The trace now carries the pair,
+   but `GET /v2/memories/search` returns `store.MemoryEntry` with no S/R/I/T breakdown and no
+   trace id, so the plane side of Phase 13's finding #6 is untouched, as are the two config
+   knobs (`conflict-jaccard-threshold` and `conflict-score-penalty`) that still reach nothing
+   in production.
+5. **`gofmt -l` flags this file exactly as it flagged it before.** The house convention keeps
+   the local `synapse/...` imports last inside a single import group, which gofmt wants
+   re-sorted, and the repository is uniformly in that state. Running gofmt on `trace.go` here
+   would have re-aligned `TraceManifest` as unrelated churn, so the new import was appended in
+   the existing style instead.
+
+### Next phase
+
+Give the plane's own surface the same "why": the S/R/I/T breakdown and a trace id on
+`GET /v2/memories/search`, so a demoted memory can be explained to a caller that never sees
+the edge's trace — which is the shape `.clinerules` already requires of MCP responses
+("score breakdown (S/R/I/T) and trace_id"), and therefore the shape the MCP phase will need
+from the plane. The two unreachable config knobs
+(`conflict-jaccard-threshold`, `conflict-score-penalty`) are the other half of that work.
+
+
+
+
+
+
+
+
 

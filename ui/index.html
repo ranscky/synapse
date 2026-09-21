@@ -582,6 +582,23 @@ input[type="number"] {
     border: 1px solid rgba(139, 92, 246, 0.35);
     flex-shrink: 0;
 }
+/* Phase 14: a contradiction the store recorded for this memory. Amber, not the
+   burn orange of the exclusion badge or the violet of cross-agent -- the memory
+   is neither rejected nor merely someone else's, it is a claim another memory
+   disagrees with. A superseded_candidate keeps its place in the pool and is only
+   demoted by the scorer, which is exactly what this badge exists to explain. */
+.conflict-badge {
+    font-family: var(--font-mono);
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    background: rgba(245, 158, 11, 0.12);
+    color: var(--amber);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    flex-shrink: 0;
+}
 
 .trace-mem-scores { padding: 8px 11px 10px; }
 .score-bar { height: 16px; background: #111; border: 1px solid var(--border); display: flex; overflow: hidden; margin-bottom: 6px; }
@@ -1145,6 +1162,7 @@ function renderMemoryTrace(memory) {
                 <div class="trace-mem-left">
                     <span class="type-badge type-${memory.memory_type}">${memory.memory_type}</span>
                     ${memory.cross_agent ? `<span class="cross-agent-badge" title="Written by agent ${memory.agent_id}">cross-agent: ${memory.agent_id}</span>` : ''}
+                    ${memory.conflict_status && memory.conflict_status !== 'none' ? `<span class="conflict-badge" title="${memory.conflict_status === 'superseded_candidate' ? 'A newer memory contradicts this one, so the scorer demotes it' : 'This memory introduced a contradiction'}${memory.conflict_with_id ? ', conflicts with ' + memory.conflict_with_id : ''}">${memory.conflict_status.replace(/_/g, ' ')}</span>` : ''}
                     <span class="trace-mem-preview">${memory.content_preview.substring(0, 40)}${memory.content_preview.length > 40 ? '…' : ''}</span>
                 </div>
                 ${!memory.included ? `<span class="excl-badge"${memory.superseded_by ? ` title="Superseded by ${memory.superseded_by}"` : ''}>${memory.exclusion_reason === 'superseded' && memory.superseded_by ? `superseded &rarr; ${memory.superseded_by.slice(0, 8)}` : (memory.exclusion_reason || 'excluded')}</span>` : ''}
