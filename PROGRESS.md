@@ -3546,3 +3546,324 @@ imaginary in the process.
 
 
 
+## Phase 16 — HMAC signing and ledger Append (complete)
+
+Scope was the ledger's write path, and only that: `Ledger.Append` signs one trace
+per call under the tenant's own secret and chains it to that tenant's previous
+entry, and `internal/tenant` mints and wraps the secret that signs it. No reader,
+no verification endpoint, no HTTP route, and no wiring into the request path — the
+plane still appends nothing, so every call in this phase comes from a test.
+
+Commit `feat: Phase 16 - HMAC signing and ledger Append`
+
+New files:
+
+- `internal/tenant/secrets.go` — 263 lines: `GenerateAndStoreSecret`, `GetSecret`,
+  `ErrSecretNotFound`, `ErrSecretExists`, and the four helpers they are built from
+  (`masterKeyFromEnv`, `sealSecret`, `openSecret`, `newGCM`, `canonicalTenantID`).
+  32 random bytes from `crypto/rand`, wrapped with AES-256-GCM under
+  `SYNAPSE_MASTER_KEY` (hex, exactly 32 bytes, read from the environment per call),
+  stored as `base64(nonce ‖ ciphertext)` in `tenant_secrets.secret_encrypted`, with
+  the tenant id authenticated as additional data.
+- `internal/tenant/secrets_test.go` — 184 lines, untagged and database-free, so
+  `go test ./...` in CI runs it: the master key's accepted shape (and that a
+  rejected value is never echoed), the seal/open round trip, a fresh nonce per
+  seal, and the four ways `openSecret` must refuse (another tenant, another master
+  key, an altered ciphertext, a truncated envelope).
+- `internal/ledger/ledger.go` — 289 lines: `Ledger`, `LedgerEntry`, `NewLedger`,
+  `Append`, and the transaction's reads (`chainHead`, `readCreatedAt`, `lockChain`,
+  `newEntry`, `canonicalID`).
+- `internal/ledger/chain.go` — 56 lines: the hashing primitives — `genesisHash`
+  (`hex(sha256("genesis"))`), `chainMessage`, `signature` (HMAC-SHA256), `hexDigest`.
+- `internal/ledger/ledger_test.go` — 281 lines, `//go:build integration`:
+  `TestAppend` and `TestConcurrentAppendStaysLinear`, plus `setMasterKey`,
+  `testChainTenant`, `appendTrace`, and two helpers that recompute the brief's
+  signature and the genesis hash *in the test*, independently of the package.
+
+Changed files:
+
+- `internal/ledger/doc.go` — 24 → 42 lines. Its Phase 15 text ("there is no signing
+  and no hash chain yet: prev_hash and hash_value are still supplied by the caller")
+  and its reason for existing (a directory whose only files carry `//go:build
+  integration` fails `go test ./...` outright) both stopped being true, so it now
+  states the chain contract, the file layout, and the verification commands.
+- `internal/ledger/ledger_table_test.go` — 262 → 264 lines, and nothing about its
+  assertions changed: the local `ledgerTable` constant was deleted because
+  `ledger.go` now defines that name in the same package, and the permission probes
+  use the write path's own constant. Phase 15's "holds INSERT and nothing else"
+  assertions are untouched and still pass.
+
+No new dependencies: `crypto/hmac`, `crypto/aes`, `crypto/cipher`, `encoding/base64`,
+and `encoding/hex` are stdlib, and `google/uuid` plus pgx v5 were already required.
+No v1 internal package was touched — `internal/tenant` and `internal/ledger` are both
+v2.
+
+Decisions made in this phase:
+
+- **The brief's step 1 could not run as the writer role, so an append uses two
+  identities in one transaction.** `SELECT` the chain head is impossible for
+  `ledger_writer` (Phase 15 grants it INSERT and nothing else — `ERROR: permission
+  denied for table ledger`, re-confirmed here), and `INSERT ... RETURNING` fails for
+  the same reason. So `Append` reads the head on the pool's own connection *first*,
+  then runs `SET LOCAL ROLE ledger_writer` and the `INSERT`, then commits. The
+  alternative — writing as the owner and leaving the grant decorative — is the trade
+  Phase 15's finding 2 said not to make, and granting the writer SELECT would have
+  rewritten that phase's own assertion. `SET LOCAL`, not `SET ROLE`, so a pooled
+  connection is never handed back still wearing the writer's identity.
+- **The advisory lock is necessary but not sufficient, and the difference is
+  `now()`.** `now()` is the transaction's *start* time, so two appends whose
+  transactions began in one order but acquired the tenant lock in the other would
+  store `created_at` in the opposite order to the chain — and the chain head is the
+  newest row by `created_at`, so the next append would chain from the wrong row.
+  `created_at` is stamped with `clock_timestamp()` inside the lock instead. This was
+  measured, not argued: with the lock kept and `created_at` coming from `now()`,
+  `TestConcurrentAppendStaysLinear` fails 3 of 5 runs (and with the lock removed
+  too, 1 of 1).
+- **`created_at` is stamped strictly after the head.** `GREATEST(clock_timestamp(),
+  head_created_at + interval '1 microsecond')`, with the head's `created_at` read
+  along with its hash and a NULL for a tenant's first entry. A *tie* in `created_at`
+  makes "newest" ambiguous, and a tie is not hypothetical: one of the deliberately
+  `now()`-stamped experiment tenants has two rows sharing a timestamp
+  (`distinct_created_at=9` for 10 rows), which is what two concurrent transactions
+  starting inside one clock tick look like. Under the lock the new row is therefore
+  always strictly newer than the head, whatever the system clock's granularity does —
+  a coarse clock or a backwards step cannot reorder or tie a chain.
+- **The secret is refused rather than overwritten.** `GenerateAndStoreSecret` uses
+  `ON CONFLICT (tenant_id) DO NOTHING` and answers a second call with
+  `ErrSecretExists`. An upsert would have been friendlier and wrong: every entry is
+  signed with the secret that existed when it was written, `ledger` has no
+  key-version column, so replacing the row makes every older signature in that
+  tenant's chain unverifiable. Rotation needs key versioning first.
+- **The tenant id is GCM additional data, and both ids are canonicalized before
+  hashing.** The first stops a ciphertext transplanted into another tenant's row
+  from silently becoming that tenant's signing key; the second makes an entry's
+  signature reproducible from the stored row, because Postgres renders the uuid the
+  same way `uuid.Parse().String()` does.
+- **`created_at` is read back after the COMMIT rather than predicted.** The writer
+  cannot use `RETURNING`, and the value is computed by the database, so `Append`
+  returns the row it wrote instead of a client-side guess. The cost is one extra
+  statement, and the failure it creates is recorded as a finding below.
+- **The ledger package holds no logger.** It deals in HMAC keys and whole traces, so
+  "never log a secret" is structural: there is nowhere in the type to log one. The
+  returned `LedgerEntry.ID` is the safe thing for a caller to log.
+- **`SYNAPSE_MASTER_KEY` comes from the environment only**, never from the plane
+  YAML the way `jwt-secret` and `admin-token` do: the key that unwraps every tenant's
+  signing secret should not sit on disk next to the database credentials. Errors name
+  the variable and never its value, and the raw secret, the ciphertext, and the key
+  appear in no log line, no error, and no return value other than the secret the
+  caller is handed once.
+
+### Verification
+
+Every command below was run from the repository root with the Phase 4 compose
+database up (`deploy/docker-compose.yml` → `pgvector/pgvector:pg16`, healthy on
+127.0.0.1:5432) and **nothing exported**: `SYNAPSE_TEST_DB_DSN` is unset (the tests
+fall back to the compose DSN, exactly as Phase 15's do) and `SYNAPSE_MASTER_KEY` is
+set by the tests themselves with `t.Setenv`, so the phase's definition-of-done
+command needs no exported secrets.
+
+```text
+$ gofmt -l internal/ledger internal/tenant      # prints nothing
+$ go build ./...                                # prints nothing
+$ go vet ./internal/tenant/... ./internal/ledger/...         # prints nothing
+$ go vet -tags integration ./internal/ledger/...             # prints nothing
+```
+
+The definition of done, with nothing exported:
+
+```text
+$ go test ./internal/ledger/... -run TestAppend -v -count=1 -tags integration
+=== RUN   TestAppend
+--- PASS: TestAppend (0.30s)
+PASS
+ok  	synapse/internal/ledger	0.306s
+```
+
+`TestAppend` asserts, over ten entries: the signature recomputed in the test from
+the raw secret and the entry's own fields equals both the returned `HashValue` and
+the stored `hash_value`; the row's `prev_hash`, `trace_json`, and `created_at` are
+the ones the returned entry reports; `entry[0].PrevHash == hex(sha256("genesis"))`;
+`entry[i].PrevHash == entry[i-1].HashValue`; every id is distinct; `created_at`
+advances; and a different key does not reproduce the signature — the negative
+control that keeps the rest evidence rather than a tautology.
+
+The whole package, including the Phase 15 permission test as a regression check:
+
+```text
+$ go test ./internal/ledger/... -count=1 -v -tags integration
+=== RUN   TestLedgerTablePermissions
+--- PASS: TestLedgerTablePermissions (0.07s)
+=== RUN   TestAppend
+--- PASS: TestAppend (0.17s)
+=== RUN   TestConcurrentAppendStaysLinear
+--- PASS: TestConcurrentAppendStaysLinear (0.20s)
+PASS
+ok  	synapse/internal/ledger	0.443s
+```
+
+The secrets path, including `internal/tenant`'s existing database-backed tests with
+the DSN set, and the new untagged crypto tests that CI does run:
+
+```text
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+    go test ./internal/tenant/... -count=1
+ok  	synapse/internal/tenant	1.198s
+
+$ go test ./internal/tenant/... -run 'TestMasterKey|TestSealSecret|TestOpenSecret|TestCanonicalTenantID' -count=1
+ok  	synapse/internal/tenant	0.007s
+
+$ go test ./internal/tenant/... -run 'TestMasterKey|TestSealSecret|TestOpenSecret|TestCanonicalTenantID' -v
+--- PASS: TestMasterKeyFromEnvAcceptsOnlyA32ByteHexValue (0.00s)
+    --- PASS: TestMasterKeyFromEnvAcceptsOnlyA32ByteHexValue/accepted (0.00s)
+    --- PASS: TestMasterKeyFromEnvAcceptsOnlyA32ByteHexValue/empty (0.00s)
+    --- PASS: TestMasterKeyFromEnvAcceptsOnlyA32ByteHexValue/not_hex (0.00s)
+    --- PASS: TestMasterKeyFromEnvAcceptsOnlyA32ByteHexValue/too_short (0.00s)
+    --- PASS: TestMasterKeyFromEnvAcceptsOnlyA32ByteHexValue/too_long (0.00s)
+--- PASS: TestSealSecretRoundTripsAndHidesThePlaintext (0.00s)
+--- PASS: TestSealSecretUsesAFreshNonce (0.00s)
+--- PASS: TestOpenSecretRejectsAnythingButTheOriginalCiphertext (0.00s)
+    --- PASS: .../another_tenant (0.00s)
+    --- PASS: .../another_master_key (0.00s)
+    --- PASS: .../altered_ciphertext (0.00s)
+    --- PASS: .../not_base64 (0.00s)
+    --- PASS: .../too_short_for_a_nonce (0.00s)
+--- PASS: TestCanonicalTenantIDMatchesWhatPostgresStores (0.00s)
+```
+
+What the tests wrote, walked back out of the database itself — run *after* the test
+process had exited, because a walk started while the tests were still writing sees a
+half-built chain (which cost one confusing reading here):
+
+```text
+$ psql -c "<per-tenant walk of the two newest test tenants>"
+1  ledger-5294a71b3fc1  rows=10  distinct_created_at=10  tied_rows=0  broken_links=0  first_link_is_genesis=1
+2  ledger-ba9264f19dee  rows=10  distinct_created_at=10  tied_rows=0  broken_links=0  first_link_is_genesis=1
+```
+
+`broken_links` is `lag(hash_value) OVER (PARTITION BY tenant_id ORDER BY created_at)
+<> prev_hash`, which is the same walk a verifier performs, and `first_link_is_genesis`
+checks `prev_hash = aeebad4a796fcc2e15dc4c6061b45ed9b373f26adfc798ca7d2d8cc58182718e`
+— `hex(sha256("genesis"))` computed outside the process (`printf genesis | sha256sum`).
+
+Three probes back the two ordering claims, each against the real server:
+
+```text
+# now() is frozen at the transaction's start; clock_timestamp() is not:
+$ psql -c "BEGIN; SELECT now(); SELECT pg_sleep(0.15); SELECT now(), clock_timestamp(); ROLLBACK;"
+at BEGIN: now()=2026-09-21 12:23:34.103374+00
+150ms later inside the same txn: now()=2026-09-21 12:23:34.103374+00  clock_timestamp()=2026-09-21 12:23:34.271141+00
+
+# GREATEST(..., head + 1 microsecond) is strictly later than the head even when the
+# head sits an hour in the future (what a backwards clock step looks like), and a
+# NULL head -- a tenant's first entry -- falls through to the clock:
+$ psql -c "WITH head AS (SELECT (now() + interval '1 hour') AS head_at) SELECT ..."
+head=2026-09-21 13:27:09.944475+00  new_stamp=2026-09-21 13:27:09.944476+00
+strictly_later_than_head=true  null_head_ignored=true
+```
+
+Both ordering safeguards were falsified before being kept. Each variant was patched
+into a copy of `ledger.go`, measured, and then restored — the checksum
+(`327a44573e0c4e75aeb7120554b703dab7801a091b711c334cabc7d1c7fefb0e`) was verified
+identical before and after every experiment, and `gofmt -l` was re-run afterwards:
+
+```text
+# lock kept, created_at from now() -- i.e. the brief as written:
+$ go test ./internal/ledger/... -run TestConcurrentAppendStaysLinear -count=5 -tags integration
+--- FAIL: TestConcurrentAppendStaysLinear (0.19s)
+        Messages:  	row 4 must chain from the row before it
+--- FAIL: TestConcurrentAppendStaysLinear (0.18s)
+        Messages:  	row 2 must chain from the row before it
+        Messages:  	row 3 must chain from the row before it
+--- FAIL: TestConcurrentAppendStaysLinear (0.17s)
+        Messages:  	row 1 must chain from the row before it
+        Messages:  	row 2 must chain from the row before it
+        Messages:  	row 3 must chain from the row before it
+FAIL
+
+# no lock, created_at from now():
+$ go test ./internal/ledger/... -run TestConcurrentAppendStaysLinear -count=1 -v -tags integration
+        Error:     	Not equal:
+        expected: "b76a24728d4267c24de9b1aee4a84966e925dfbc2e1dbeb50e28da7524ad362a"
+        actual  : "31bf3cd0251550b4b7a29e40dfb5e3924a5a77e3b3968e2de4ab3c486aefb2e3"
+        Messages:  	row 2 must chain from the row before it
+FAIL
+
+# restored, and the package green again:
+$ go test ./internal/ledger/... -run 'TestAppend|TestConcurrentAppendStaysLinear|TestLedgerTablePermissions' -tags integration
+ok  	synapse/internal/ledger	0.407s
+```
+
+Two rows in that second transcript share predecessor `31bf3cd0…`, and two entries
+chaining from one row is precisely what a forked chain is. The first transcript is
+the subtler result: the lock *was* held, so the appends were serialized, and the
+chain still forked — because `created_at` (transaction start) disagreed with the
+order the lock was acquired in.
+
+### Findings this phase surfaced (not fixed here — this phase is the write path)
+
+1. **Nothing in production calls either function yet.** `GenerateAndStoreSecret` is
+   called by the tests and by nothing else, and no code path constructs a `Ledger`.
+   The write path is complete and exercised, but until provisioning mints a secret
+   and the plane appends a trace, the ledger is still empty in a running deployment —
+   the same shape Phase 15 left the page in, one layer up.
+2. **There is no key versioning, so rotation is refused rather than implemented.**
+   Every entry is signed with the secret that existed when it was written and the
+   `ledger` table has no column naming that key, so replacing a tenant's secret makes
+   its earlier signatures unverifiable. `ErrSecretExists` is the honest answer until a
+   phase adds a key id to the row (or to the message).
+3. **The writer cannot read what it writes.** The chain head and the row's
+   `created_at` both have to be read through the application connection, which is why
+   an `Append` costs six round trips. A verification phase inherits the same
+   constraint: checking a chain requires the owner's connection, not the writer role.
+4. **An `Append` can fail after its row is committed.** If the post-COMMIT
+   `created_at` read-back fails, `Append` returns an error for a row that is already
+   in the ledger — so a caller must not blindly retry, because the retry would append
+   a *second* entry for the same trace. The alternative (returning a client-side
+   timestamp) was rejected as a lie about what was stored; the trade is recorded here
+   instead.
+5. **The falsification experiments are permanent.** Four test tenants now carry
+   deliberately forked chains in the development database, and the append-only rule
+   means they cannot be removed by anything short of dropping the table — the same
+   honest cost Phase 15 hit with its committed probe row. They are only distinguishable
+   by their `ledger-…` slugs, which is a reminder that this table is a poor place to
+   experiment in any deployment that matters.
+6. **Phase 15's five probe rows are still not chain material.** They carry
+   `hash_value = 'phase15-unsigned-probe'` and random `tenant_id`s that have no
+   `tenant_secrets` row, so they do not sit inside any tenant's chain and a per-tenant
+   walk never meets them. A walk over the whole table would, and would fail on them —
+   the label is the only thing that distinguishes them.
+7. **The membership grant is now load-bearing in production.** `Append`'s first
+   statement after the head read is `SET LOCAL ROLE ledger_writer`, so a deployment
+   whose `SYNAPSE_DB_DSN` user is not a member of that role fails every append with
+   `permission denied to set role`. The compose stack is fine because
+   `RunMigrations` grants the role to `CURRENT_USER`; a manually prepared database
+   that skipped the migration would not be.
+8. **CI does not exercise any of this.** Every test in `internal/ledger` carries
+   `//go:build integration`, so `go test ./...` (what `ci.yml` runs, with no database)
+   compiles the package and runs nothing in it. The parts that are not
+   database-bound — the AES-GCM wrapping, the master key's shape — were deliberately
+   put in `internal/tenant` with untagged tests so something in this phase is covered
+   where CI looks.
+9. **`created_at` now means "this tenant's insertion order", not "the wall clock".**
+   It is `clock_timestamp()` whenever the clock moves between two appends, and is
+   pushed one microsecond past the head only when the clock does not (a coarse tick,
+   or a step backwards). That is the right trade for a hash-chained ledger — order is
+   the property being protected — but a report that reads `created_at` as pure
+   wall-clock time should know the difference.
+10. **`hashtext` is a 32-bit tenant key.** Two tenants can share an advisory lock and
+    serialize against each other; the cost is throughput, never correctness, and the
+    fix (a lock table, or `pg_advisory_xact_lock` on two int4 keys derived from the
+    uuid) is not needed at this scale.
+
+### Next phase
+
+Wire the write path into the product, in the order the dependencies demand: mint a
+tenant secret when a tenant is provisioned (returning it to the caller once, the way
+the API key already is), then sign and append a ledger entry from the plane for each
+compiled request, and only then build the verification side — a path that reads a
+tenant's rows and recomputes every signature and link, which is the artifact the
+whole table exists for. Key versioning belongs with that work, because a verifier is
+what makes rotation safe to offer. The S/R/I/T breakdown and `trace_id` on the
+plane's own memory-search surface — the shape `.clinerules` already requires of MCP
+responses — is the other queued item, from Phase 14's findings.
+

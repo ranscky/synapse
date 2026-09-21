@@ -55,8 +55,10 @@ const (
 	// `cd deploy && docker compose up -d db` with nothing exported.
 	ledgerDefaultDSN = "postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable"
 
-	// ledgerTable is the table under test, schema-qualified.
-	ledgerTable = tenant.SchemaName + ".ledger"
+	// ledgerTable is the table under test, schema-qualified. It is no longer
+	// declared here: the write path (ledger.go) owns that constant now, so the
+	// permission probes and the writer cannot disagree about which table they
+	// mean. The value is unchanged -- tenant.SchemaName + ".ledger".
 
 	// ledgerIndex is the index the migration creates on (tenant_id, created_at).
 	ledgerIndex = "ledger_tenant_created_idx"
