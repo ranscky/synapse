@@ -170,3 +170,35 @@ func TestDefaultConfigSupersessionSimilarityBand(t *testing.T) {
 	}
 }
 
+// TestDefaultConfigConflictKnobs covers the Phase 12 conflict detection knobs.
+// The threshold is asserted against the literal 0.4 that
+// internal/conflict's DefaultJaccardThreshold also carries: config cannot
+// import that package (conflict -> store -> config would be a cycle), so this
+// test is the only place the two copies are checked against each other's
+// documented value.
+func TestDefaultConfigConflictKnobs(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.ConflictJaccardThreshold != 0.4 {
+		t.Errorf("Expected default ConflictJaccardThreshold of 0.4, got %v", cfg.ConflictJaccardThreshold)
+	}
+	if cfg.ConflictScorePenalty != 0.5 {
+		t.Errorf("Expected default ConflictScorePenalty of 0.5, got %v", cfg.ConflictScorePenalty)
+	}
+
+	// A hand-built config leaves the knobs at their zero value, which
+	// Validate must not treat as negative.
+	handBuilt := &Config{
+		UpstreamURL:  "http://localhost:11434",
+		ListenAddr:   "127.0.0.1:8080",
+		EmbedderType: "onnx",
+	}
+	if err := handBuilt.Validate(); err != nil {
+		t.Errorf("Expected a zero-valued ConflictJaccardThreshold to pass validation, got %v", err)
+	}
+
+	negative := *handBuilt
+	negative.ConflictJaccardThreshold = -0.1
+	if err := negative.Validate(); err == nil {
+		t.Errorf("Expected a negative ConflictJaccardThreshold to fail validation")
+	}
+}

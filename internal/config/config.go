@@ -51,6 +51,27 @@ type Config struct {
 	SupersessionSimilarityMin float64 `yaml:"supersession-similarity-min"`
 	SupersessionSimilarityMax float64 `yaml:"supersession-similarity-max"`
 
+	// Phase 12 conflict detection (internal/conflict). Both are defined here
+	// and read by nothing yet: the detector exists and is tested, but the write
+	// path that would call it has not been wired up.
+	//
+	// They are deliberately separate from the supersession band above, because
+	// they solve a different problem. Supersession resolves a contradiction
+	// within one session, by cosine similarity plus an explicit replacement
+	// phrase; these resolve cross-agent, cross-session ones, by token overlap
+	// over the memories' text.
+	//
+	// ConflictJaccardThreshold's default must stay in step with
+	// conflict.DefaultJaccardThreshold. It cannot be that constant: conflict
+	// imports store, store imports config, so importing conflict from here
+	// would be a cycle -- hence the literal 0.4 in DefaultConfig, and this
+	// note as the thing that keeps the two in step.
+	ConflictJaccardThreshold float64 `yaml:"conflict-jaccard-threshold"`
+	// ConflictScorePenalty is the multiplier a memory flagged as conflicting
+	// will take on its score once something consumes it -- 0.5 halves it.
+	// Unreferenced until then, like the detector itself.
+	ConflictScorePenalty float64 `yaml:"conflict-score-penalty"`
+
 	// v2 sync protocol (Phase 7). Added ahead of the sync work itself: the
 	// push loop in a later phase reads these, this phase only defines them.
 	// ControlPlaneAPIKey is the credential this node presents to the plane
@@ -189,6 +210,19 @@ func DefaultConfig() *Config {
 		// "related but different" from "unrelated" and "duplicate" well.
 		SupersessionSimilarityMin: 0.5,
 		SupersessionSimilarityMax: 0.90,
+		// Phase 12 conflict detection. 0.4 is the token overlap level at which
+		// two memories are treated as being about the same thing, and therefore
+		// worth checking for a contradiction; below it they are simply
+		// different subjects and nothing is compared. The detector's own
+		// fixture set lands at 0.667 (a swapped value), 0.333 (added detail),
+		// 0.000 (unrelated) and 0.250 (an explicit negation) -- which is why a
+		// second, threshold-independent signal exists for the last one. Must
+		// match conflict.DefaultJaccardThreshold (see the field's comment for
+		// why the literal is repeated rather than imported). The penalty is a
+		// starting guess like the supersession band: a rough knob to tune once
+		// something actually reads it.
+		ConflictJaccardThreshold: 0.4,
+		ConflictScorePenalty:     0.5,
 		// v2 sync protocol (Phase 7). Placed last so the alignment of the
 		// groups above is untouched. The API key is seeded from the
 		// environment exactly like DatabaseDSN, so a deployment can inject
@@ -246,6 +280,18 @@ func (c *Config) Validate() error {
 	// opposite embeddings, and this is a heuristic knob still being tuned.
 	if c.SupersessionSimilarityMin > c.SupersessionSimilarityMax {
 		return fmt.Errorf("supersession-similarity-min must not be greater than supersession-similarity-max")
+	}
+
+	// A negative overlap threshold can never be met by a ratio in [0,1], so it
+	// would silently turn conflict detection off entirely. Zero is left
+	// permissive (same treatment as RetrievalCandidateK) so hand-built Config
+	// structs in tests don't have to set every knob, and values above 1 are
+	// left alone too, matching the DeduplicationThreshold precedent -- this is
+	// a heuristic being tuned, not a hard invariant. ConflictScorePenalty is
+	// deliberately unvalidated: nothing reads it yet, and there is no single
+	// sensible range for a multiplier whose job is still being defined.
+	if c.ConflictJaccardThreshold < 0 {
+		return fmt.Errorf("conflict-jaccard-threshold must not be negative")
 	}
 
 	// Upstream URL is required

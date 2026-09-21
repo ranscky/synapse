@@ -2429,3 +2429,225 @@ tenant a way to mint per-agent tokens, so attributed memories reach the plane
 without a hand-driven push. Those are the two gaps left between "a trace can say
 this came from agent_a" and "a node's memories get there on their own".
 
+## Phase 12 — ContradictionDetector (Jaccard) (complete)
+
+Commit `feat: Phase 12 - ContradictionDetector (Jaccard)`
+
+A detector, its tests, and two config knobs. Nothing calls it: no v1 package was
+edited, and the only files touched outside the new package are
+`internal/config/config.go` (two fields, two defaults, one guard),
+`internal/config/config_test.go` (one test) and `synapse.yaml.example` (two
+commented keys). `ConflictScorePenalty` is defined and read by nothing yet, on
+purpose — wiring is a later phase.
+
+The problem it exists for: `v0.1.15` already resolves contradictions *inside* one
+session, and that machinery cannot see across a shared control plane. A plane pull
+returns memories another agent wrote, in another session, with an agent id and no
+comparable embedding on hand, and the newer version of a decision carries no
+replacement phrase at all — "We decided to use MySQL" is a complete sentence that
+never mentions Postgres. So this one works on the text:
+
+```go
+// internal/conflict/detector.go
+type ContradictionDetector struct { jaccardThreshold float64 }
+
+func NewContradictionDetector(jaccardThreshold float64) *ContradictionDetector
+func (d *ContradictionDetector) Threshold() float64
+func (d *ContradictionDetector) Detect(candidate store.MemoryEntry, existing []store.MemoryEntry) (bool, string)
+```
+
+Complementary, not redundant — the two gates are disjoint in what they can see:
+
+| | supersession (v0.1.15) | conflict (this phase) |
+| --- | --- | --- |
+| Scope | same session, same memory type | any session, any agent |
+| Compared with | cosine similarity in a tuned band (0.5–0.90) | Jaccard over token sets (≥ 0.4) |
+| Signal | explicit replacement phrase ("switched to") | negation with a target, or same predicate + different object |
+| Needs | an embedding on both sides | nothing but content |
+| Misses | anything cross-agent | narrow/paraphrased wording |
+
+### The numbers that shaped the design
+
+Four fixtures, tokenized exactly as specified (lowercase, split on whitespace and
+punctuation, deduplicate):
+
+| Pair | \|A\| | \|B\| | A∩B | Jaccard | At 0.4 |
+| --- | --- | --- | --- | --- | --- |
+| "We decided to use Postgres" / "We decided to use MySQL" | 5 | 5 | we, to, use, decided | **0.667** | same topic → value swap → contradiction |
+| "We decided to use Postgres" / "We will migrate to Postgres next sprint" | 5 | 7 | we, to, postgres | **0.333** | below gate → no contradiction |
+| "The sky is blue" / "We decided to use MySQL" | 4 | 5 | ∅ | **0.000** | below gate → no contradiction |
+| "We are not using Redis" / "We decided to use Redis" | 5 | 5 | we, redis | **0.250** | **below gate** |
+
+The last row is the phase's Test 4, and it is the one that forced a design
+decision rather than an implementation detail. The spec's step (b) skips any pair
+below the threshold, and step (c) is only reached above it — so read literally, at
+the specified default of 0.4, Test 4 returns `(false, "")` and fails. Strict
+adjacency on the negation rule fails on it too: `not` is followed by `using`, and
+`using ≠ use` without stemming, so the token the other memory actually contains is
+two positions away.
+
+**Decision (confirmed with the operator before implementation):** a negation aimed
+at a token the other memory contains is itself evidence that the two memories are
+about the same topic, so it satisfies the step-(b) gate instead of being skipped by
+it. "not … Redis" is only meaningful *because* the other memory is about Redis.
+Jaccard stays the primary gate; this is the single documented exception to it, and
+it is the deviation the test suite pins explicitly
+(`TestJaccardIndexOfTheDocumentedFixtures` asserts the 0.250 that makes it
+necessary, so if that number ever rises above the threshold the deviation becomes
+visible as an unused rule rather than staying silently load-bearing).
+
+### Files
+
+| File | Lines | Contents |
+| --- | --- | --- |
+| `internal/conflict/detector.go` | 151 | package doc, `DefaultJaccardThreshold`, `negationLookahead`, `negationTokens`, `ContradictionDetector`, `NewContradictionDetector`, `Threshold`, `Detect` |
+| `internal/conflict/signals.go` | 212 | the predicate/stopword vocabularies, `negatesTokenIn`, `swapsValueForPredicate`, `sharedPredicates`, `firstIndex`, `objectAfter` |
+| `internal/conflict/tokens.go` | 73 | `tokenize`, `tokenSet`, `intersectionSize`, `jaccardSimilarity` |
+| `internal/conflict/detector_test.go` | 281 | the four fixtures, the threshold table, the constructor and self/empty contracts |
+| `internal/conflict/tokens_test.go` | 77 | step-(a) tokenization, and the measure's boundaries |
+| `internal/config/config.go` | +46 | `ConflictJaccardThreshold` / `ConflictScorePenalty`, defaults 0.4 / 0.5, one negative-value guard |
+| `internal/config/config_test.go` | +32 | `TestDefaultConfigConflictKnobs` |
+| `synapse.yaml.example` | +21 | both keys, each commented |
+
+Three files in the package instead of one because the project caps a file at 300
+lines; the split is by concern (policy / vocabularies and signals / text handling),
+not by size alone. Same reason `tokens_test.go` exists separately.
+
+Two smaller deviations from the spec's letter, beyond the gate one above, both
+documented at their definitions:
+
+- **The negation window is 3 tokens, not strict adjacency.** "not" is followed by
+  "using", which does not equal the "use" in the other memory, because nothing here
+  stems. Within the window, any token that is a stopword or that the other memory
+  does not contain is ignored, so the rule still requires a real target.
+- **The value-swap rule is "same predicate, different *direct object*"** — the
+  first non-stopword token after the first occurrence of a shared predicate verb
+  from a curated list, in each memory. The spec's wording ("same predicate word,
+  different object noun") is implemented as written but needs a predicate list and
+  a position rule to be checkable at all; this is what keeps `We use Postgres for
+  billing` from contradicting `We use Postgres for analytics`, which the looser
+  "shared verb plus any differing noun" reading would have flagged.
+
+### Verification
+
+```text
+$ gofmt -l internal/conflict          # prints nothing
+$ go vet ./internal/conflict/... ./internal/config/...
+$ go test ./internal/conflict/... -v -count=1
+=== RUN   TestJaccardIndexOfTheDocumentedFixtures
+--- PASS: TestJaccardIndexOfTheDocumentedFixtures (0.00s)
+=== RUN   TestDetectSameTopicDifferentValue
+--- PASS: TestDetectSameTopicDifferentValue (0.00s)
+=== RUN   TestDetectSameTopicNoSignal
+--- PASS: TestDetectSameTopicNoSignal (0.00s)
+=== RUN   TestDetectDifferentTopic
+--- PASS: TestDetectDifferentTopic (0.00s)
+=== RUN   TestDetectNegationTargetsExistingToken
+--- PASS: TestDetectNegationTargetsExistingToken (0.00s)
+=== RUN   TestDetectNegationWithoutTarget
+--- PASS: TestDetectNegationWithoutTarget (0.00s)
+=== RUN   TestDetectValueSwapOnlyWhenTheObjectDiffers
+--- PASS: TestDetectValueSwapOnlyWhenTheObjectDiffers (0.00s)
+=== RUN   TestDetectSkipsSelfAndEmptyContent
+--- PASS: TestDetectSkipsSelfAndEmptyContent (0.00s)
+=== RUN   TestDetectReturnsFirstContradictionInSliceOrder
+--- PASS: TestDetectReturnsFirstContradictionInSliceOrder (0.00s)
+=== RUN   TestDetectAcrossThresholds
+--- PASS: TestDetectAcrossThresholds (0.00s)
+=== RUN   TestNewContradictionDetectorThreshold
+--- PASS: TestNewContradictionDetectorThreshold (0.00s)
+=== RUN   TestTokenizeSplitsOnWhitespaceAndPunctuation
+--- PASS: TestTokenizeSplitsOnWhitespaceAndPunctuation (0.00s)
+=== RUN   TestTokenizeKeepsOrderAndDuplicates
+--- PASS: TestTokenizeKeepsOrderAndDuplicates (0.00s)
+=== RUN   TestTokenizeNothingToSplit
+--- PASS: TestTokenizeNothingToSplit (0.00s)
+=== RUN   TestJaccardSimilarityEdges
+--- PASS: TestJaccardSimilarityEdges (0.00s)
+PASS
+ok  	synapse/internal/conflict	0.006s
+
+$ go test ./internal/config/... -v
+--- PASS: TestDefaultConfigConflictKnobs (0.00s)
+PASS
+ok  	synapse/internal/config	0.008s
+
+$ go test ./...
+ok  	synapse/internal/api	0.547s
+ok  	synapse/internal/budget	0.253s
+ok  	synapse/internal/classifier	(cached)
+ok  	synapse/internal/compiler	0.255s
+ok  	synapse/internal/config	0.005s
+ok  	synapse/internal/conflict	(cached)
+ok  	synapse/internal/dedup	0.014s
+ok  	synapse/internal/embedder	(cached)
+ok  	synapse/internal/integration	1.658s
+ok  	synapse/internal/plane	0.106s
+ok  	synapse/internal/proxy	0.560s
+ok  	synapse/internal/retrieval	0.017s
+ok  	synapse/internal/scorer	0.013s
+ok  	synapse/internal/store	3.429s
+ok  	synapse/internal/supersession	0.008s
+ok  	synapse/internal/sync	3.717s
+ok  	synapse/internal/tenant	0.789s
+ok  	synapse/internal/trace	0.173s
+```
+
+Two mutations were run to confirm the suite bites rather than passing for its own
+reasons. Each was reverted afterwards (files restored from a copy taken before the
+run, then the full suite re-run green to prove the restore):
+
+```text
+# 1. drop the "negation also satisfies the gate" clause from Detect
+--- FAIL: TestDetectNegationTargetsExistingToken
+    detector_test.go:139: expected "We are not using Redis" to contradict "We decided to use Redis"
+--- FAIL: TestDetectAcrossThresholds
+    detector_test.go:259: threshold 0.4, explicit negation: Detect(...) = false (id ""), want true
+    detector_test.go:259: threshold 0.7, explicit negation: Detect(...) = false (id ""), want true
+    detector_test.go:259: threshold 1, explicit negation: Detect(...) = false (id ""), want true
+# 0.2 is absent above on purpose: at 0.2 the Jaccard gate alone lets the pair
+# through, which is precisely the behaviour difference the deviation removes.
+
+# 2. make swapsValueForPredicate return false immediately
+    detector_test.go:180: expected "We use Postgres for billing" to contradict "We use MySQL for billing"
+    detector_test.go:180: expected "We decided to use a Postgres cluster" to contradict "We decided to use MySQL"
+--- FAIL: TestDetectSkipsSelfAndEmptyContent
+--- FAIL: TestDetectReturnsFirstContradictionInSliceOrder
+--- FAIL: TestDetectAcrossThresholds
+```
+
+`git diff --stat` for the phase is `internal/config/config.go +46`,
+`internal/config/config_test.go +32`, `synapse.yaml.example +21`, plus the new
+untracked `internal/conflict/`. No v1 package, no `bin/synapse` (it had been
+rebuilt locally before this phase and is unrelated to it, so it is left out of the
+commit), and no dependency change — `strings` and `unicode` from the stdlib.
+`internal/config/config.go` and `internal/config/config_test.go` were already not
+`gofmt`-clean before this phase; the added lines are clean, and the pre-existing
+regions were deliberately left unreformatted rather than pulled into this diff.
+
+### Known limitations (all deliberate, none silent)
+
+1. **No stemming and no synonyms.** `using`/`use` and `Postgres`/`PostgreSQL` do not
+   match; the negation window papers over the first case, nothing handles the second.
+2. **Negation is checked in the candidate only** — A negates B. A candidate that
+   affirms what an existing memory negates is not detected. Cheap to flip, but
+   flipping widens the false-positive blast radius, so it was left as specified.
+3. **The value-swap rule is positional.** `We store logs in S3` against `We store
+   metrics in S3` is flagged. Conservative in the missed-contradiction direction,
+   not in the false-positive one.
+4. **A contradiction with no listed verb and no negation is missed**, e.g.
+   `We run MySQL` against `We decided to use Postgres` — no shared predicate.
+5. **`Detect` returns the first contradiction in slice order**, not the strongest,
+   and exposes no score. Ranking stays the caller's job.
+6. **Nothing is wired.** No write-path caller, no consumer of
+   `ConflictScorePenalty`, no trace field, no API surface: a flagged contradiction
+   would currently change nothing a user sees.
+
+### Next phase
+
+Wire it where supersession already runs — on the candidate pool retrieval fetched
+for a turn — and settle the three things this phase deliberately left open: whether
+a flagged memory is dropped, penalised, or merely labelled; whether the penalty
+lands on the older memory or the newer one; and how the conflict reaches the trace,
+so a user can see *why* a memory was marked. That last one is the same
+differentiation requirement Phase 11 satisfied for agent attribution.

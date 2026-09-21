@@ -97,3 +97,24 @@ retrieval-candidate-k: 50
 # guess, not a value tuned against real conversations yet.
 supersession-similarity-min: 0.5
 supersession-similarity-max: 0.90
+
+# Cross-agent conflict detection (Phase 12, not yet wired to anything). A
+# separate mechanism from the supersession band above, for contradictions that
+# arrive from a different agent in a different session -- "we decided to use
+# Postgres" written on one node, "we decided to use MySQL" on another. There is
+# no embedding to compare in that case, so this compares the memories' own
+# words: token sets are built from each memory's content and the Jaccard index
+# |A∩B| / |A∪B| decides whether the two are about the same thing at all.
+# Below this threshold they are different subjects and nothing is compared.
+# Above it, a contradiction is reported only if the text carries a signal --
+# an explicit negation aimed at a word the other memory contains, or the same
+# predicate verb taking a different object. An explicit negation is treated as
+# evidence of the same topic, so it is still detected below this threshold.
+# 0.4 is a starting guess, not a tuned value; raising it makes detection
+# stricter and loses real contradictions whose wording differs more.
+conflict-jaccard-threshold: 0.4
+
+# The score multiplier a memory flagged as conflicting will take once the write
+# or retrieval path consumes it (0.5 halves its score). Defined here, read by
+# nothing yet.
+conflict-score-penalty: 0.5
