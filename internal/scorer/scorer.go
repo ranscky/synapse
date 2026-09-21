@@ -173,6 +173,17 @@ func (s *Scorer) scoreMemory(query []float32, memory store.MemoryEntry) ScoredMe
 		scoreI*s.weights.Importance +
 		scoreT*s.weights.TaskAlignment
 
+	// A memory a newer one contradicts is a candidate to be superseded, so it is
+	// demoted rather than dropped: both versions of the decision stay in the pool
+	// and in the ranking, and only the flagged, older one loses reach. The penalty
+	// lands on Total alone, so the S/R/I/T breakdown a caller sees stays the honest
+	// per-factor picture, and the reason for the demotion travels with the memory in
+	// its own conflict_status. See weights.conflictPenalty for the multiplier and
+	// the unset case.
+	if memory.ConflictStatus == store.ConflictStatusSupersededCandidate {
+		total *= s.weights.conflictPenalty()
+	}
+
 	return ScoredMemory{
 		MemoryEntry: memory,
 		ScoreS:      scoreS,

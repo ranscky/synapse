@@ -58,6 +58,11 @@ var tenantSlugPattern = regexp.MustCompile(`^[a-z0-9_-]{3,32}$`)
 type PGStore struct {
 	pool       *pgxpool.Pool
 	tenantSlug string
+	// detector is the cross-agent contradiction check Write runs before it
+	// inserts. A nil detector -- the zero state, and the state of every store
+	// nothing called SetConflictDetector on -- means no detection at all, which is
+	// exactly what this backend did before conflicts existed. See pgconflict.go.
+	detector ConflictDetector
 }
 
 // NewPGStore returns a store bound to tenantSlug, creating that tenant's schema
@@ -86,24 +91,19 @@ func NewPGStore(pool *pgxpool.Pool, tenantSlug string) (*PGStore, error) {
 	return s, nil
 }
 
-// sanitized applies the pre-storage pipeline the SQLite backend applies.
-//
-// A zero-value Store is enough to call Sanitize -- it reads no fields and only
-// logs -- and reusing it is what keeps the two backends from drifting into two
-// different sanitization policies. Sanitize already strips null bytes,
-// neutralizes prompt-injection patterns, and caps content at 2048 bytes on a
-// UTF-8 boundary, so no second truncation is needed here.
-func sanitized(content string) string {
-	var s Store
-	return s.Sanitize(content)
-}
-
 // Write inserts entry, or leaves the existing row untouched when its id is
 // already present.
 //
 // The id must be a uuid: the column is a uuid and the v1 callers generate
 // "req-<nano>" strings. Reporting that plainly is better than inventing an id
 // the caller cannot later use for supersession.
+//
+// When a conflict detector is installed (SetConflictDetector) and the memory
+// contradicts one of the tenant's recent org-scoped memories, two rows end up
+// marked instead of one: this one as conflicting, and the older one it disagrees
+// with as a superseded candidate. Both stay in every read -- a conflict is a label
+// and a score penalty, never a deletion. Without a detector, this method behaves
+// exactly as it did before conflicts existed.
 func (s *PGStore) Write(ctx context.Context, entry MemoryEntry) error {
 	if _, err := uuid.Parse(entry.ID); err != nil {
 		return fmt.Errorf("store: memory id %q is not a uuid", entry.ID)
@@ -161,17 +161,41 @@ func (s *PGStore) Write(ctx context.Context, entry MemoryEntry) error {
 		return err
 	}
 
+	// Conflict detection runs before the insert, and on the text the row will
+	// actually hold: a memory sanitization rewrote must not be compared against
+	// wording that never reached the database. Its verdict is a label on this row
+	// plus, after the insert, one on an existing row -- see pgconflict.go for why it
+	// is best effort and never fails the write.
+	candidate := entry
+	candidate.Content = content
+	conflictStatus, conflictWithID, conflictingID := s.detectConflict(ctx, candidate)
+
 	query := `INSERT INTO ` + s.table() + ` (
-	id, session_id, content, memory_type, importance, sync_status, superseded_by, embedding, created_at, agent_id, visibility, team_id
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	id, session_id, content, memory_type, importance, sync_status, superseded_by, embedding, created_at, agent_id, visibility, team_id, conflict_status, conflict_with_id
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 ON CONFLICT (id) DO NOTHING`
 
 	_, err = s.pool.Exec(ctx, query,
 		entry.ID, entry.SessionID, content, entry.MemoryType, entry.Importance,
 		syncStatus, supersededBy, embedding, createdAt, agentID, visibility, teamID,
+		conflictStatus, conflictWithID,
 	)
 	if err != nil {
 		return fmt.Errorf("store: insert memory: %w", err)
+	}
+
+	// The other half of a contradiction: the memory this one disagrees with becomes
+	// a candidate to be superseded. It is marked after the insert so that the id it
+	// names already exists, and it is left in the pool -- the scorer, not this
+	// store, is what demotes it. A failure here is reported rather than swallowed,
+	// and that is safe for the caller: the insert above is idempotent on the id, so
+	// a retry inserts nothing and marks again.
+	if conflictingID != "" {
+		if err := s.markSupersededCandidate(ctx, conflictingID, entry.ID); err != nil {
+			return err
+		}
+		// Ids only: a memory's content never reaches a log line.
+		slog.Warn("conflict_detected", "new_id", entry.ID, "conflicts_with", conflictingID)
 	}
 
 	return nil
@@ -258,32 +282,6 @@ ORDER BY created_at DESC
 LIMIT $2`
 
 	return s.queryEntries(ctx, query, sessionID, limit)
-}
-
-// MarkSuperseded records that oldID has been superseded by newID.
-//
-// Like the SQLite backend, a missing oldID is an error rather than a silent
-// no-op, so a caller holding a stale id finds out immediately.
-func (s *PGStore) MarkSuperseded(ctx context.Context, oldID, newID string) error {
-	if oldID == "" || newID == "" {
-		return fmt.Errorf("MarkSuperseded requires non-empty oldID and newID")
-	}
-	if _, err := uuid.Parse(oldID); err != nil {
-		return fmt.Errorf("store: memory id %q is not a uuid", oldID)
-	}
-	if _, err := uuid.Parse(newID); err != nil {
-		return fmt.Errorf("store: superseding memory id %q is not a uuid", newID)
-	}
-
-	tag, err := s.pool.Exec(ctx, `UPDATE `+s.table()+` SET superseded_by = $1 WHERE id = $2`, newID, oldID)
-	if err != nil {
-		return fmt.Errorf("store: mark memory superseded: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("no memory found with id %s to mark as superseded", oldID)
-	}
-
-	return nil
 }
 
 // Close releases the pool this store was handed. The caller that opened the pool

@@ -2651,3 +2651,260 @@ a flagged memory is dropped, penalised, or merely labelled; whether the penalty
 lands on the older memory or the newer one; and how the conflict reaches the trace,
 so a user can see *why* a memory was marked. That last one is the same
 differentiation requirement Phase 11 satisfied for agent attribution.
+
+## Phase 13 — conflict detection wired into Write and the scorer (complete)
+
+Commit `feat: Phase 13 - conflict detection wired into Write and scorer penalty`
+
+Phase 12's detector has a caller, `ConflictScorePenalty` has a consumer, and a
+contradiction is now recorded on **both** memories instead of either one being
+dropped:
+
+- `PGStore.Write` fetches the tenant's most recent org-scoped, not-yet-superseded
+  memories **once per write** (one query, limit 20), runs the installed detector over
+  that slice in memory, stores the new memory as `conflict` with `conflict_with_id`
+  naming the memory it disagrees with, and then marks the memory it contradicts as
+  `superseded_candidate` naming the new one. Both rows stay in every read; the scorer
+  is what demotes.
+- `scorer` multiplies `Total` by `Weights.ConflictScorePenalty` (default 0.5, fed
+  from `config.ConflictScorePenalty` by whoever builds the weights) for a memory whose
+  `ConflictStatus` is `superseded_candidate`. Nothing else about a score moves: S, R,
+  I and T stay the honest per-factor breakdown, so a caller sees the demotion *and*
+  the reason for it.
+
+### The one decision the spec left contradictory, and how it was settled
+
+The phase text said two different things, and they cannot both hold:
+
+- step 1c: the **new** memory becomes `conflict`, the memory it contradicts becomes
+  `superseded_candidate`;
+- step 3: MySQL (the second write) has `superseded_candidate` and Postgres has
+  `conflict`, with `MySQL.Total = Postgres.Total * 0.5`.
+
+Those are inverses of each other, because only `superseded_candidate` is penalised.
+Phase 12's PROGRESS notes had already flagged the open question ("whether the penalty
+lands on the older memory or the newer one"), so it was put to the user rather than
+guessed at. The answer taken is **step 1c literal**, on the grounds that:
+
+1. it matches the direction `superseded_by` already has in v1 — the field that means
+   "I am on my way out" is written on the *older* row and points at the newer one, and
+   `superseded_candidate` is the cautious version of exactly that statement;
+2. it makes the penalty break ties toward the freshest claim, which is what
+   supersession itself is for — otherwise writing a new decision would immediately
+   rank it below the decision it contradicts;
+3. `conflict_with_id` then points the same way as `superseded_by` on both rows.
+
+The cost is a documented deviation from step 3's literal text: the test asserts
+`Postgres (superseded_candidate).Total == MySQL (conflict).Total * 0.5`, i.e. the
+inverse of the line the phase wrote. Flipping it is a two-line change in
+`detectConflict` plus the equivalent test swap.
+
+### Wiring, and why the interface is declared in `store`
+
+`internal/conflict` imports `internal/store` (it takes a `MemoryEntry`), so `store`
+cannot import `conflict` back. `PGStore` therefore declares the one method it calls —
+`ConflictDetector.Detect(candidate, existing) (bool, string)` — which
+`*conflict.ContradictionDetector` satisfies structurally, and takes it through
+`PGStore.SetConflictDetector`. A consumer owning the interface it calls is the shape
+`plane.MemoryWriter` and `tenant.Provisioner` already use, and the setter (rather than
+a `NewPGStore` parameter) kept every existing construction path — the store factory,
+tenant provisioning, the tests — compiling unchanged.
+
+It is installed in production at `cmd/plane`, because the plane's sync endpoint is the
+only path into a tenant's schema: a contradiction is by definition between memories
+that arrived from different agents, so the plane is the only place it can be seen.
+`tenant.MemoryWriter.SetConflictDetector` forwards it to every store the writer opens,
+including the ones it has already opened, so a tenant's store is never briefly live
+without it.
+
+### Files
+
+| File | Change |
+| --- | --- |
+| `internal/store/pgconflict.go` | new: `ConflictStatus*` constants, the `ConflictDetector` interface, `SetConflictDetector`, `conflictCandidates` (one org-scoped live query, limit 20), `detectConflict`, `markSupersededCandidate`, `ConflictDetectionBudget` |
+| `internal/store/pgwrite.go` | new: `sanitized` and `MarkSuperseded` moved out of `pgstore.go` to keep it inside the 300-line ceiling |
+| `internal/store/pgstore.go` | `Write` runs the detection block before the insert, stores the two new columns, and marks the contradicted memory after it; `detector` field; `MarkSuperseded` moved out |
+| `internal/store/pgread.go` | `pgColumns` and `scanEntry` carry `conflict_status` and `conflict_with_id` |
+| `internal/store/store.go` | `MemoryEntry.ConflictStatus` / `.ConflictWithID`, documented as written by the Postgres write path |
+| `internal/scorer/weights.go` | `Weights.ConflictScorePenalty`, `DefaultConflictScorePenalty = 0.5`, `Weights.conflictPenalty()` |
+| `internal/scorer/scorer.go` | 3 lines: scale `Total` when the memory is a superseded candidate |
+| `internal/tenant/memorywriter.go` | `SetConflictDetector`, installed on every store `storeFor` opens |
+| `cmd/plane/main.go` | one line installing `conflict.NewContradictionDetector(conflict.DefaultJaccardThreshold)` |
+| `internal/store/conflict_test.go` | new, package `store_test`: the end-to-end behaviour |
+| `internal/store/pgconflict_test.go` | new, package `store`: what the block reads, how often, and what it costs |
+
+No v1 package was touched other than `internal/store` and `internal/scorer`, the two
+this phase was allowed to change. `MemoryEntry`'s new fields are additive and
+`omitempty`, and the SQLite backend has no column for them, so the standalone edge
+node's storage, its JSON, and the sync queue are unaffected.
+
+### Verification
+
+The phase's own definition of done, in full:
+
+```text
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+    go test ./internal/store/... -run TestConflict -v
+=== RUN   TestConflictCandidateFetch
+=== RUN   TestConflictCandidateFetch/it_is_the_newest_org-scoped_memories,_capped_at_the_limit
+=== RUN   TestConflictCandidateFetch/a_private,_team-scoped_or_superseded_memory_is_never_a_candidate
+=== RUN   TestConflictCandidateFetch/the_fetch_stays_inside_the_detection_budget
+    pgconflict_test.go:125: conflictCandidates over 20 memories: median 701.726µs, worst of 20 911.283µs (budget 20ms)
+--- PASS: TestConflictCandidateFetch (0.60s)
+    --- PASS: TestConflictCandidateFetch/it_is_the_newest_org-scoped_memories,_capped_at_the_limit (0.00s)
+    --- PASS: TestConflictCandidateFetch/a_private,_team-scoped_or_superseded_memory_is_never_a_candidate (0.00s)
+    --- PASS: TestConflictCandidateFetch/the_fetch_stays_inside_the_detection_budget (0.01s)
+=== RUN   TestConflictWriteConsultsTheDetectorOncePerWrite
+--- PASS: TestConflictWriteConsultsTheDetectorOncePerWrite (0.57s)
+=== RUN   TestConflictMarksBothMemories
+2026/09/21 11:48:13 WARN conflict_detected new_id=dc46c769-4d8e-4212-9217-903dc9a116aa conflicts_with=1345b3b4-ceae-45e1-a734-39f2e640dd7b
+    conflict_test.go:164: agent_a ("We decided to use Postgres"): conflict_status="superseded_candidate" conflict_with_id="dc46c769-4d8e-4212-9217-903dc9a116aa"
+    conflict_test.go:165: agent_b ("We decided to use MySQL"): conflict_status="conflict" conflict_with_id="1345b3b4-ceae-45e1-a734-39f2e640dd7b"
+    conflict_test.go:168: whole write that detects: 21.386468ms; the write before it: 11.243041ms
+=== RUN   TestConflictMarksBothMemories/the_older_memory_becomes_a_superseded_candidate
+=== RUN   TestConflictMarksBothMemories/the_newer_memory_is_marked_as_conflicting
+=== RUN   TestConflictMarksBothMemories/both_memories_stay_in_the_pool_and_keep_their_marker
+=== RUN   TestConflictMarksBothMemories/the_flagged_memory_scores_the_penalty_times_the_other
+    conflict_test.go:221: superseded candidate: Total=0.450000 (S=1.0000 R=1.0000 I=1.0000 T=0.5000)
+    conflict_test.go:223: conflicting memory:   Total=0.900000 (S=1.0000 R=1.0000 I=1.0000 T=0.5000)
+    conflict_test.go:225: penalty=0.5
+=== RUN   TestConflictMarksBothMemories/the_detection_comparison_stays_inside_the_budget
+    conflict_test.go:267: one comparison over 20 candidates: 3.458µs (budget 20ms)
+--- PASS: TestConflictMarksBothMemories (0.29s)
+    --- PASS: TestConflictMarksBothMemories/the_older_memory_becomes_a_superseded_candidate (0.00s)
+    --- PASS: TestConflictMarksBothMemories/the_newer_memory_is_marked_as_conflicting (0.00s)
+    --- PASS: TestConflictMarksBothMemories/both_memories_stay_in_the_pool_and_keep_their_marker (0.00s)
+    --- PASS: TestConflictMarksBothMemories/the_flagged_memory_scores_the_penalty_times_the_other (0.00s)
+    --- PASS: TestConflictMarksBothMemories/the_detection_comparison_stays_inside_the_budget (0.00s)
+=== RUN   TestConflictWithoutADetectorMarksNothing
+--- PASS: TestConflictWithoutADetectorMarksNothing (0.22s)
+PASS
+ok  	synapse/internal/store	1.682s
+```
+
+The whole suite, with and without a database (the Postgres-backed tests skip when the
+DSN is unset, so CI with no Postgres stays green):
+
+```text
+$ go test ./...          # no DSN: every Postgres-backed test skips
+ok  synapse/internal/api         ok  synapse/internal/budget      ok  synapse/internal/classifier
+ok  synapse/internal/compiler    ok  synapse/internal/config      ok  synapse/internal/conflict
+ok  synapse/internal/dedup       ok  synapse/internal/embedder    ok  synapse/internal/integration
+ok  synapse/internal/plane       ok  synapse/internal/proxy       ok  synapse/internal/retrieval
+ok  synapse/internal/scorer      ok  synapse/internal/store       ok  synapse/internal/supersession
+ok  synapse/internal/sync        ok  synapse/internal/tenant      ok  synapse/internal/trace
+
+$ SYNAPSE_TEST_DB_DSN=... go test ./...
+ok  synapse/internal/store	5.685s
+ok  synapse/internal/tenant	1.150s
+... every other package unchanged
+```
+
+`go vet ./...` is clean and `gofmt -l` lists none of the new files. Three mutations plus
+one control were run to confirm the new tests bite rather than passing for their own
+reasons; each was reverted afterwards and the suite re-run green:
+
+```text
+# 1. drop the penalty multiplication from scoreMemory
+--- FAIL: TestConflictMarksBothMemories
+    --- FAIL: .../the_flagged_memory_scores_the_penalty_times_the_other
+        Error: Max difference between 0.8999999625747428 and 0.4499999812873714 allowed is 0.001
+        Messages: a superseded candidate's Total must be exactly the penalty times the score of the memory it conflicts with
+
+# 2. mark the contradicted memory 'conflict' instead of 'superseded_candidate'
+--- FAIL: .../the_older_memory_becomes_a_superseded_candidate
+--- FAIL: .../both_memories_stay_in_the_pool_and_keep_their_marker
+
+# 3. mark the new memory 'superseded_candidate' instead of 'conflict'
+--- FAIL: .../the_newer_memory_is_marked_as_conflicting
+--- FAIL: .../the_flagged_memory_scores_the_penalty_times_the_other
+
+# 4. (control) no detector installed
+--- PASS: TestConflictWithoutADetectorMarksNothing
+    both rows read back conflict_status='none'
+```
+
+One further mutation attempt is worth naming: removing the marking block from `Write`
+does not compile (`conflictingID` declared and not used), which is why mutations 2 and 3
+mutate the values instead of the control flow.
+
+### The 20ms budget, and why it is measured in two halves rather than on a write
+
+The phase asks for the detection block to complete in under 20ms. The first attempt
+timed the whole detecting write and failed at 65.9ms — but profiling showed the insert
+was the cost, not the detection:
+
+```text
+$ SYNAPSE_TEST_DB_DSN=... go test ./internal/store -run TestScratchTiming -v   # scratch, removed
+round trip 0: 458.713µs            # SELECT 1: sub-millisecond round trips
+round trip 9: 190.298µs
+insert without embedding 0: 22.237894ms   # no detector, no embedding, still ~11ms
+insert without embedding 4: 11.070698ms
+insert with embedding 4: 11.07799ms
+conflictCandidates (20 rows) run 1: 905.735µs
+whole Write with detector run 3: 11.188997ms
+```
+
+Every insert costs ~11ms on this machine because it is its own transaction and pays the
+write-ahead-log fsync; `SELECT 1` costs 0.19ms. A wall-clock budget on a write is
+therefore a test of the database's fsync latency, which is why one run in six measured a
+43ms "block" that contained no detection at all.
+
+So the block is measured as the two things it actually is, each where it can be measured
+without that noise:
+
+- the **fetch**, in package `store` (`TestConflictCandidateFetch`): a plain SELECT, whose
+  median over 20 runs is ~0.7ms and whose worst sample has never exceeded 1.2ms — a margin of
+  more than 15× against the 20ms budget,
+  asserted on the median with the worst sample logged;
+- the **comparison**, in package `store_test` (the budget subtest): the real detector over
+  20 candidates, 3–9µs per comparison across runs.
+
+`ConflictDetectionBudget = 20ms` is exported from `internal/store` for exactly this: the
+write path logs a `conflict_detection_slow` warning when a block exceeds it, and both
+tests measure against the same number rather than two copies of it. The warning is not
+enforcement — a slow block still stores the memory — because detection is an annotation on
+a row that is otherwise perfectly storable.
+
+### Known limitations (all deliberate, none silent)
+
+1. **The insert and the marking update are not one transaction.** A failure or crash
+   between them leaves the new row `conflict` and the older one unmarked. An edge retry
+   converges (the insert is idempotent on the id, and detection re-runs), but a push that
+   never retries leaves the pair half-marked. Fixing it properly means wrapping the block
+   in a transaction, which changes the write path's retry story that Phase 8 built.
+2. **The candidate query has no covering index.** `WHERE superseded_by IS NULL AND
+   visibility = 'org' ORDER BY created_at DESC LIMIT 20` is a sort over the tenant's live
+   org-scoped rows; the tenant DDL's index is on `(session_id, created_at DESC)`. Fine at
+   the sizes measured here, worth an index before a tenant holds tens of thousands of
+   memories.
+3. **Detection is write-time only.** A memory is compared against what existed when it was
+   written. Two contradicting memories pushed in the same batch are compared in order, so
+   the pair is found, but a contradiction is never revisited later.
+4. **The threshold is the detector's default.** `cmd/plane` installs
+   `conflict.DefaultJaccardThreshold`; the plane's config has no conflict key yet, so an
+   operator cannot tune it there. `config.ConflictJaccardThreshold` (synapse.yaml) is read
+   by the standalone binary, which does not write to a tenant schema.
+5. **Everything Phase 12 listed about the detector itself still holds** — no stemming, no
+   synonyms, negation checked in the candidate only, a positional value-swap rule, and
+   first-contradiction-in-slice-order rather than the strongest. A false positive now
+   costs a real 0.5× penalty on the older memory, which is the first time it costs
+   anything at all.
+6. **The conflict reaches the stored row and the plane's JSON, but not the trace or a
+   score breakdown.** `GET /v2/memories/search` echoes `store.MemoryEntry`, so
+   `conflict_status` and `conflict_with_id` are already visible there for a marked memory.
+   What is missing is the *why*: the plane's response carries no S/R/I/T breakdown and no
+   trace id, and the edge's own trace has no field for a conflict, so a demoted score
+   still cannot be explained to a user. That is the last piece of the differentiation
+   story Phase 11 started for agent attribution.
+
+### Next phase
+
+Carry the conflict into the memory trace (id, status, and the id of the memory it
+conflicts with) so a user can see why a memory was demoted, and expose it on the plane's
+search response alongside the S/R/I/T breakdown. Then the two knobs that are still
+unreachable in production — the plane's conflict threshold, and a resolution path for a
+flagged contradiction — become worth wiring.
+
+
+

@@ -32,11 +32,40 @@ type MemoryWriter struct {
 	pool   *pgxpool.Pool
 	mu     sync.Mutex
 	stores map[string]*store.PGStore
+	// detector is installed on every store this writer opens, and is nil until
+	// SetConflictDetector is called. See that method for why the plane's write path
+	// is where a contradiction detector belongs.
+	detector store.ConflictDetector
 }
 
 // NewMemoryWriter returns a writer that opens one PostgreSQL store per tenant.
+//
+// No contradiction detector is installed yet: until SetConflictDetector is called,
+// pushed memories are stored exactly as they were before conflict detection
+// existed.
 func NewMemoryWriter(pool *pgxpool.Pool) *MemoryWriter {
 	return &MemoryWriter{pool: pool, stores: make(map[string]*store.PGStore)}
+}
+
+// SetConflictDetector installs the contradiction detector every store this writer
+// opens will consult, including the tenants it has already opened.
+//
+// The writer is the plane's only path into a tenant's schema, which is what makes
+// it the place the detector is attached: a contradiction is between memories that
+// arrived from different agents, so it can only be seen where they meet. A plane
+// that never calls this keeps behaving exactly as before.
+func (w *MemoryWriter) SetConflictDetector(d store.ConflictDetector) {
+	if w == nil {
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.detector = d
+	for _, st := range w.stores {
+		st.SetConflictDetector(d)
+	}
 }
 
 // WriteBatch stores every entry of one pushed batch in tenantSlug's schema.
@@ -135,6 +164,11 @@ func (w *MemoryWriter) storeFor(tenantSlug string) (*store.PGStore, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// The detector is installed here rather than in the caller so that a tenant's
+	// store is never briefly live without it -- a write that slipped through in
+	// between would be stored unmarked.
+	st.SetConflictDetector(w.detector)
 
 	w.stores[tenantSlug] = st
 

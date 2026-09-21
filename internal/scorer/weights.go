@@ -97,6 +97,33 @@ type Weights struct {
 	Importance           float64
 	TaskAlignment        float64
 	RecencyHalfLifeHours float64 // 0 (zero value) means "use DefaultRecencyHalfLifeHours"
+	// ConflictScorePenalty multiplies the Total of a memory another agent has
+	// contradicted and that is therefore a candidate to be superseded (see
+	// store.ConflictStatusSupersededCandidate). 0 (the zero value, which every
+	// existing GetWeights(...) call site produces) means
+	// "use DefaultConflictScorePenalty", so those call sites keep scoring exactly
+	// as they did before conflicts existed.
+	ConflictScorePenalty float64
+}
+
+// DefaultConflictScorePenalty is the multiplier a superseded candidate's Total is
+// scaled by when Weights.ConflictScorePenalty is not set: 0.5 halves it, which is
+// enough to put a contradicted memory behind the newer memory that named it while
+// leaving it in the pool and in the ranking. It is a starting guess like the
+// supersession band, not a tuned value, and it must stay in step with config's
+// conflict-score-penalty default -- the same literal-in-two-places arrangement
+// conflict.DefaultJaccardThreshold has with config's conflict-jaccard-threshold,
+// because config cannot be imported here without pulling a YAML file and the
+// whole v1 configuration surface into the scorer.
+const DefaultConflictScorePenalty = 0.5
+
+// conflictPenalty returns the penalty this scorer's weights ask for, resolving the
+// unset case to DefaultConflictScorePenalty.
+func (w Weights) conflictPenalty() float64 {
+	if w.ConflictScorePenalty <= 0 {
+		return DefaultConflictScorePenalty
+	}
+	return w.ConflictScorePenalty
 }
 
 // GetTaskAlignmentWeight returns the task alignment weight for a given intent and memory type

@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"synapse/internal/conflict"
 	"synapse/internal/plane"
 	"synapse/internal/tenant"
 
@@ -137,6 +138,15 @@ func main() {
 	// writer and the searcher, so the search endpoint reuses the same per-tenant
 	// PGStore cache (and the same connection pool) the write path built.
 	memoryStore := tenant.NewMemoryWriter(pool)
+
+	// Phase 13: a memory an agent pushes that contradicts one already stored in the
+	// tenant is marked on both sides -- the older row becomes a superseded candidate
+	// and the scorer demotes it -- instead of either row being dropped, and the
+	// contradiction is visible in the log by id. The threshold is the detector's own
+	// documented default; exposing it as a plane config key is a follow-up, since a
+	// wrong threshold here only mislabels a memory rather than losing one.
+	memoryStore.SetConflictDetector(conflict.NewContradictionDetector(conflict.DefaultJaccardThreshold))
+
 	srv := plane.NewServer(
 		cfg,
 		pool,

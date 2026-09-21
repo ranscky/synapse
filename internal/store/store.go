@@ -19,18 +19,20 @@ import (
 
 // MemoryEntry represents a stored memory entry
 type MemoryEntry struct {
-	ID           string    `json:"id"`                      // UUID
-	SessionID    string    `json:"session_id"`              // Session identifier
-	Content      string    `json:"content"`                 // Memory content (max 2048 bytes)
-	MemoryType   string    `json:"memory_type"`             // "decision"|"fact"|"error"|"preference"|"context"
-	Timestamp    time.Time `json:"timestamp"`               // Creation timestamp
-	Importance   float64   `json:"importance,omitempty"`    // Importance score
-	Embedding    []float32 `json:"embedding,omitempty"`     // 384-dim embedding vector
-	SupersededBy string    `json:"superseded_by,omitempty"` // ID of the memory that superseded this one, if any. Empty means still active/current. Populated by a later write, never set at the same time a memory is first created.
-	SyncStatus   string    `json:"sync_status,omitempty"`   // Where this memory currently lives, relative to a control plane: "local_only" | "sync_pending" | "synced". A memory written by the standalone v1 binary has never left the machine, so its zero value is normalized to "local_only" on write; a memory written through a tenant's Postgres schema is already on the plane, so its zero value is normalized to "synced". See the SyncStatus* constants.
-	AgentID      string    `json:"agent_id,omitempty"`      // The agent that wrote this memory: the node that pushed it to a control plane, or this node on a locally written row. Populated on every read that can carry it -- a candidate pulled from a plane carries the agent_id of the edge that pushed it -- and left empty by the local SQLite backend, whose table has no agent column (a standalone node IS the agent). Never an isolation key: the tenant is always the verified token's schema, never a value from a row.
-	Visibility   string    `json:"visibility,omitempty"`    // Who may read this memory: "private" | "team" | "org" (see the Visibility* constants). Enforced by the Postgres backend's Search; the local SQLite backend has no visibility concept at all, because one file is one process is one agent, so a local row is private by construction and this field is inert there. Blank means the column's own default, "org".
-	TeamID       string    `json:"team_id,omitempty"`       // The team a "team"-scoped memory belongs to, matched against the reader's own team id. Left empty when the memory is org- or private-scoped. Never an isolation key: the tenant is still the verified token's schema, and a team id can only ever narrow a search inside it.
+	ID             string    `json:"id"`                         // UUID
+	SessionID      string    `json:"session_id"`                 // Session identifier
+	Content        string    `json:"content"`                    // Memory content (max 2048 bytes)
+	MemoryType     string    `json:"memory_type"`                // "decision"|"fact"|"error"|"preference"|"context"
+	Timestamp      time.Time `json:"timestamp"`                  // Creation timestamp
+	Importance     float64   `json:"importance,omitempty"`       // Importance score
+	Embedding      []float32 `json:"embedding,omitempty"`        // 384-dim embedding vector
+	SupersededBy   string    `json:"superseded_by,omitempty"`    // ID of the memory that superseded this one, if any. Empty means still active/current. Populated by a later write, never set at the same time a memory is first created.
+	SyncStatus     string    `json:"sync_status,omitempty"`      // Where this memory currently lives, relative to a control plane: "local_only" | "sync_pending" | "synced". A memory written by the standalone v1 binary has never left the machine, so its zero value is normalized to "local_only" on write; a memory written through a tenant's Postgres schema is already on the plane, so its zero value is normalized to "synced". See the SyncStatus* constants.
+	AgentID        string    `json:"agent_id,omitempty"`         // The agent that wrote this memory: the node that pushed it to a control plane, or this node on a locally written row. Populated on every read that can carry it -- a candidate pulled from a plane carries the agent_id of the edge that pushed it -- and left empty by the local SQLite backend, whose table has no agent column (a standalone node IS the agent). Never an isolation key: the tenant is always the verified token's schema, never a value from a row.
+	Visibility     string    `json:"visibility,omitempty"`       // Who may read this memory: "private" | "team" | "org" (see the Visibility* constants). Enforced by the Postgres backend's Search; the local SQLite backend has no visibility concept at all, because one file is one process is one agent, so a local row is private by construction and this field is inert there. Blank means the column's own default, "org".
+	TeamID         string    `json:"team_id,omitempty"`          // The team a "team"-scoped memory belongs to, matched against the reader's own team id. Left empty when the memory is org- or private-scoped. Never an isolation key: the tenant is still the verified token's schema, and a team id can only ever narrow a search inside it.
+	ConflictStatus string    `json:"conflict_status,omitempty"`  // Whether a contradiction has been recorded for this memory: one of the ConflictStatus* values. Written by the Postgres backend's write path from the verdict of the ContradictionDetector installed on it -- the detector's verdict is the single source of truth, so a caller-supplied value is not honored -- and left empty by the local SQLite backend, whose table has no such column. ConflictStatusSupersededCandidate is the older memory a newer one contradicts: flagged, kept in the pool, and demoted by the scorer, never dropped.
+	ConflictWithID string    `json:"conflict_with_id,omitempty"` // The other half of ConflictStatus: the id of the memory this one disagrees with, so either row read on its own names its counterpart. The older row names the newer one and vice versa. Empty whenever no contradiction has been recorded.
 }
 
 // embeddingToBytes serializes a []float32 embedding into a byte slice for

@@ -21,7 +21,12 @@ import (
 // came from, or a caller has no way to tell an org-wide memory from its own
 // private one, and team_id is coalesced because it is NULL whenever a memory is
 // not team-scoped.
-const pgColumns = `id::text, session_id, content, memory_type, created_at, importance, sync_status, coalesce(superseded_by::text, ''), embedding, agent_id, visibility, coalesce(team_id, '')`
+//
+// conflict_status and conflict_with_id are what a caller needs to see *why* a
+// memory was surfaced with a demoted score: the status is NOT NULL so it always
+// scans into a string, and conflict_with_id is cast to text and coalesced
+// because it is NULL for every memory no contradiction has been recorded for.
+const pgColumns = `id::text, session_id, content, memory_type, created_at, importance, sync_status, coalesce(superseded_by::text, ''), embedding, agent_id, visibility, coalesce(team_id, ''), conflict_status, coalesce(conflict_with_id::text, '')`
 
 // queryEntries runs one read statement and scans every row, so both read paths
 // share a single error-wrapping and iteration story.
@@ -69,6 +74,7 @@ func scanEntry(rows pgx.Rows) (MemoryEntry, error) {
 		&entry.ID, &entry.SessionID, &entry.Content, &entry.MemoryType,
 		&entry.Timestamp, &entry.Importance, &entry.SyncStatus, &superseded, &embedding,
 		&entry.AgentID, &entry.Visibility, &entry.TeamID,
+		&entry.ConflictStatus, &entry.ConflictWithID,
 	)
 	if err != nil {
 		return MemoryEntry{}, fmt.Errorf("store: scan memory entry: %w", err)
