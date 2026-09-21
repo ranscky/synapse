@@ -34,6 +34,15 @@ const (
 	// a row to be deleted.
 	DefaultLedgerRetentionDays = 365
 
+	// DefaultReportTemplatePath is the HTML template GET
+	// /v2/compliance/report renders its PDF from, relative to the plane's
+	// working directory (which is a deployment's own choice: the repo root for
+	// a developer running ./plane, the image's working directory in a
+	// container). It is a default rather than a requirement because the JSON
+	// report needs no template at all: a plane that never serves PDFs should
+	// not fail to boot over a file.
+	DefaultReportTemplatePath = "ui/plane/compliance-report.html"
+
 	// MinJWTSecretLen is the shortest accepted HMAC signing key. 32 bytes is
 	// SHA-256's output size, i.e. the point below which the key rather than
 	// the hash becomes the weak link.
@@ -71,6 +80,10 @@ type PlaneConfig struct {
 	LogLevel string `yaml:"log-level"`
 	// LedgerRetentionDays bounds ledger reporting history, not row lifetime.
 	LedgerRetentionDays int `yaml:"ledger-retention-days"`
+	// ReportTemplatePath is the HTML template the compliance report renders
+	// its PDF from. Blank means DefaultReportTemplatePath. Not a secret, so it
+	// is reported verbatim.
+	ReportTemplatePath string `yaml:"report-template"`
 }
 
 // DefaultConfig returns the configuration the plane boots with when no YAML
@@ -85,6 +98,7 @@ func DefaultConfig() *PlaneConfig {
 		MasterKey:           os.Getenv(EnvMasterKey),
 		LogLevel:            DefaultLogLevel,
 		LedgerRetentionDays: DefaultLedgerRetentionDays,
+		ReportTemplatePath:  DefaultReportTemplatePath,
 	}
 }
 
@@ -128,6 +142,9 @@ func LoadConfig(path string) (*PlaneConfig, error) {
 	}
 	if cfg.LedgerRetentionDays == 0 {
 		cfg.LedgerRetentionDays = DefaultLedgerRetentionDays
+	}
+	if cfg.ReportTemplatePath == "" {
+		cfg.ReportTemplatePath = DefaultReportTemplatePath
 	}
 
 	applyEnvOverrides(cfg)
@@ -240,6 +257,7 @@ func (c *PlaneConfig) RedactedFields() []any {
 		"master_key", secretState(c.MasterKey),
 		"log_level", c.LogLevel,
 		"ledger_retention_days", c.LedgerRetentionDays,
+		"report_template", c.ReportTemplatePath,
 	}
 }
 

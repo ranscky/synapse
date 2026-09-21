@@ -38,10 +38,16 @@ const complianceAuditPath = "/v2/compliance/audit"
 // address, and is not empty.
 const complianceRemoteAddr = "203.0.113.7:54321"
 
-// fakeAuditor records what the handler asked for and answers with whatever the
-// test scripted. The handler calls it from the test's own goroutine
+// fakeAuditor records what the handlers asked for and answers with whatever the
+// test scripted. The handlers call it from the test's own goroutine
 // (httptest.ResponseRecorder spawns none), so plain fields need no
 // synchronisation.
+//
+// Phase 20's report fields sit beside Phase 19's page fields rather than in a
+// second fake, because one Server holds one ComplianceAuditor and a test that
+// installed two would be asserting about a topology production cannot build. The
+// report's own method is declared in compliance_report_unit_test.go, next to the
+// tests that script it.
 type fakeAuditor struct {
 	page      plane.AuditPage
 	pageErr   error
@@ -51,6 +57,15 @@ type fakeAuditor struct {
 	pageCalls int
 	tenantID  string
 	filter    plane.AuditFilter
+
+	// facts is what ReportFacts answers with, factsErr what it fails with, and the
+	// counters let a test assert that the report endpoint read the window it was
+	// given -- or that a refused caller never reached it.
+	facts       plane.ReportFacts
+	factsErr    error
+	factsCalls  int
+	factsTenant string
+	window      plane.ReportWindow
 }
 
 // AuditPage implements plane.ComplianceAuditor.

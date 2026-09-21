@@ -4861,3 +4861,537 @@ the plane's memory-search surface is still queued from Phase 14 — the same fie
 endpoint's `trace` object already carries verbatim out of the stored manifest, and the
 shape `.clinerules` requires of MCP responses.
 
+
+## Phase 20 — compliance report (JSON) and PDF report (complete)
+
+Phase 19 read the ledger a page at a time. This phase summarises it: `GET
+/v2/compliance/report` answers with a structured compliance report — the period it covers,
+the volume, whose memories were used, how contradictions and supersessions were handled,
+whether the chain is intact, and the Article 50 statement — as JSON, or as the PDF rendering
+of the same document. Same enterprise-tier gate as Phase 19, same
+`compliance_access_log` record before the answer, and the same tenant rule: the chain is the
+verified token's own, and no request value can name another one.
+
+No v1 internal package was touched. Two v2 packages gained files (`internal/plane`,
+`internal/ledger`) and one config key was added; `cmd/plane` needed no change at all, because
+the dependency the report needs — the auditor — was already wired for Phase 19.
+`internal/tenant/migrations.go` was read again rather than changed: `usage_events` and the
+`(tenant_id, created_at)` index already existed.
+
+Commit `feat: Phase 20 - compliance PDF report`
+
+New files:
+
+- `internal/plane/compliance_report_types.go` — 221 lines: `complianceReportRoute`,
+  `Article50Statement` (verbatim), `ReportWindow`, `ReportFacts`, `UsageTotals`,
+  `ComplianceReport` and its seven section types, and the 503 body. The struct the brief asks
+  for could not go in `compliance.go`: that file was already 296 lines, so the contract lives
+  in its own file in the same package.
+- `internal/plane/compliance_report.go` — 285 lines: `handleComplianceReport` (identity →
+  dependency → tier → parameters → renderer → read → build → chain verdict → record →
+  answer), `respondComplianceReportPDF`, `reportFailure`, `reportFilename`,
+  `reportTemplatePath`.
+- `internal/plane/compliance_report_build.go` — 232 lines: `buildComplianceReport` and the
+  accumulator behind it. Every number the report carries is computed here, from values that
+  were handed in.
+- `internal/plane/compliance_report_pdf.go` — 255 lines: the template render, the renderer
+  lookup, each tool family's argument shape, the temp working directory, and `cappedBuffer`.
+- `internal/plane/compliance_access.go` — 74 lines: `requireAccessRecord` and `recordAccess`,
+  moved out of `compliance.go` now that two endpoints write the same record and the endpoint
+  is a parameter. Two reasons, one of them the ceiling.
+- `internal/ledger/report.go` — 128 lines: `Auditor.ReportFacts`, the window query, and the
+  metering-totals query.
+- `ui/plane/compliance-report.html` — 428 lines: the print-ready A4 document, Go template
+  syntax, no external assets.
+- Tests: `compliance_report_unit_test.go` (196), `compliance_report_gate_test.go` (291),
+  `compliance_report_build_test.go` (225), `compliance_report_pdf_test.go` (413),
+  `compliance_report_setup_test.go` (213, integration), `compliance_report_test.go` (228,
+  integration). 23 untagged test functions and 2 build-tagged ones.
+
+Modified: `internal/plane/compliance.go` (the access helpers moved out; the audit handler now
+passes its own route to them), `compliance_params.go` (`parseWindow` extracted and shared,
+`parseReportParams` added, `formatJSON`/`formatPDF`), `compliance_types.go`
+(`ComplianceAuditor` gained `ReportFacts`; `AccessRecord.Endpoint` documents both routes),
+`handlers.go` (the route), `config.go` (`report-template`), `internal/ledger/doc.go`,
+`internal/plane/compliance_unit_test.go` (the shared fake auditor gained the report's
+fields), `synapse-plane.yaml.example`, `PROGRESS.md`.
+
+### Decisions
+
+1. **The report is built from the signed ledger, and the two metering-facing numbers prefer
+   `usage_events` when the window has rows.** This was the phase's opening question rather
+   than an implementation detail: nothing writes `usage_events` yet (metering is unbuilt), and
+   every ledgered trace carries `reduction_pct: 0` (Phase 18 finding 1), so *both* candidate
+   sources under-report today. The chosen rule — compilations and mean reduction from the
+   metering table when it has rows for the window, one per signed ledger entry and the mean of
+   the recorded traces when it does not — means the report shows honest ledger numbers now and
+   real ones the moment metering lands, with no second code path to add later. The integration
+   test asserts both sources and, crucially, that they produce *different* numbers (2 metering
+   rows and a 15% mean against 5 ledger entries and 30%), so which source answered is
+   observable rather than implied.
+2. **The arithmetic is a pure function in `internal/plane`; the SQL is in `internal/ledger`.**
+   The seam is `ReportFacts`: every ledger row the window holds, as stored, plus the metering
+   totals. The store does not interpret traces, and the HTTP package does not hold a database
+   handle. The reason is testability: `buildComplianceReport` is a function of its arguments,
+   so the percentages, the de-duplication, and the cross-agent counting are covered by
+   untagged tests that CI runs — 23 of this phase's 25 test functions need no database,
+   including every PDF case (the renderer is faked through `PATH`, which is the same mechanism
+   production uses).
+3. **`chain_integrity.valid` is this request's own walk, over the whole chain, and
+   `entries_in_period` is the window's count.** The verdict comes from Phase 17's
+   `Ledger.Verify` through the already-wired `LedgerVerifier`, so the report does not
+   reimplement signature checking and no new code path touches the tenant's signing secret.
+   The two fields are deliberately different scopes: a report that certified only the rows it
+   happened to read would certify nothing, and the struct says so.
+4. **Every count that names a memory is a set, and the two that name events are sums.**
+   `memories_superseded` and `contradictions_detected` count distinct memory ids — a memory
+   superseded a thousand times is one memory, not a thousand — and the older half of a
+   contradiction pair (`superseded_candidate`) is the same event seen from the other row, so it
+   is not counted again. `total_memories_used` and `cross_agent_retrievals` are event counts,
+   because "how many memories reached a context" and "how often another agent's memory showed
+   up" are what those names promise. `memory_type_breakdown`'s denominator is the count of
+   *used* memories by type, so the shares sum to 100 by construction rather than approximately.
+5. **The Article 50 statement is one constant, in `internal/plane`, and both formats render it
+   from that value.** The handler assigns it; the JSON field and the PDF's bordered box cannot
+   disagree, because there is only one string. It is stored verbatim, with the brief's line
+   wrapping joined by single spaces and no rewording (`organisation`, `2024/1689`, the
+   disclaimer sentence as written). In the PDF the apostrophe in `organisation's` is `&#39;` —
+   html/template escaping the same text, which is what makes the document safe to render.
+6. **No caller-controlled text can reach the renderer.** The renderer is executed directly (no
+   shell); its arguments are compile-time constants plus paths this process minted inside a
+   directory `os.MkdirTemp` created; the report's content travels only inside the pre-rendered
+   HTML file, where html/template has already escaped it. `format` is validated to one of two
+   literals *before* any of that, and `since`/`until` are re-rendered from parsed `time.Time`
+   values before they are recorded or used to name the attachment. The tests assert this from
+   both ends: the fake renderer's argv is read back and checked for the query values it must
+   not contain, and `format=pdf%3Brm%20-rf%20/`, `format=pdf%20--no-sandbox`, and
+   `format=pdf%0A--no-sandbox` are all 400s.
+7. **A missing renderer is 503 with the fix in the body; a renderer that fails is a logged
+   500.** `findPDFTool` resolves `wkhtmltopdf` first and then the Chromium family (`chromium`,
+   `chromium-browser`, `google-chrome`, `google-chrome-stable`) through `exec.LookPath`, and
+   the tool lookup happens *before* the window is read: an unfulfillable request should also be
+   a cheap one. The 503 body is the brief's, verbatim.
+8. **No window means the whole ledger.** `since`/`until` keep Phase 19's semantics exactly —
+   one shared `parseWindow`, the same RFC 3339 parsing with fractional-second fidelity, the
+   same "absent means no predicate", the same inverted window meaning an empty answer rather
+   than a 400. A report that silently defaulted to the last 30 days would answer a different
+   question than the one printed on its own header.
+9. **`report-template` is configuration with a documented default and no fatal validation.**
+   The plane's import graph cannot embed `ui/` (it is not inside `internal/plane`), so the path
+   is a config key: `ui/plane/compliance-report.html` by default, relative to the plane's
+   working directory. A plane that never serves a PDF boots without the file; a request that
+   needs it and cannot find it is a logged 500, with the path in the log and never in the
+   response.
+10. **`ComplianceAuditor` gained the report's read rather than the plane gaining a constructor
+    parameter.** One new method (`ReportFacts`) on an interface that already meant "read a
+    tenant's audit history and record that it happened" kept `NewServer`'s signature — and
+    therefore 11 call sites across `cmd/plane` and seven test files — unchanged, and
+    `ledger.NewAuditor` already satisfies it.
+
+
+### Verification (real output, this phase)
+
+Formatting, build, vet, and the untagged suites (what CI runs):
+
+```text
+$ gofmt -l internal/plane internal/ledger cmd/plane
+                                       # no output: every file this phase touched is formatted
+$ go build ./...                       # clean
+$ go vet ./...                         # clean
+$ go vet -tags integration ./internal/plane/... ./internal/ledger/...   # clean too
+$ go test -count=1 ./...
+ok  synapse/cmd/synapse      0.021s
+ok  synapse/internal/api     0.878s
+ok  synapse/internal/budget  0.210s
+ok  synapse/internal/classifier  0.008s
+ok  synapse/internal/compiler    0.761s
+ok  synapse/internal/config      0.006s
+ok  synapse/internal/conflict    0.006s
+ok  synapse/internal/dedup       0.005s
+ok  synapse/internal/embedder    2.583s
+ok  synapse/internal/integration 1.938s
+ok  synapse/internal/plane       0.200s
+ok  synapse/internal/proxy       0.418s
+ok  synapse/internal/retrieval   0.007s
+ok  synapse/internal/scorer      0.008s
+ok  synapse/internal/store       4.607s
+ok  synapse/internal/supersession 0.006s
+ok  synapse/internal/sync        4.409s
+ok  synapse/internal/tenant      0.791s
+ok  synapse/internal/trace       0.164s
+                                       # 19 packages, exit 0
+```
+
+The phase's own tests, against the compose database
+(`postgres://synapse:synapse@127.0.0.1:5432/synapse`), fresh rather than cached:
+
+```text
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+    go test -count=1 ./internal/plane/... -run TestComplianceReport -v -tags integration
+--- PASS: TestComplianceReportDeniesANonEnterpriseTier (0.00s)
+    --- PASS: .../team_tier   .../no_tier   .../other_tier   .../capitalized
+--- PASS: TestComplianceReportRequiresAVerifiedTenant (0.00s)
+--- PASS: TestComplianceReportRejectsBadParameters (0.00s)
+    --- PASS: .../since_is_not_a_time  .../since_is_a_date_only  .../until_is_not_a_time
+    --- PASS: .../format_is_xml  .../format_is_capitalized  .../format_carries_a_flag
+    --- PASS: .../format_carries_a_path  .../format_carries_a_shell_metachar
+    --- PASS: .../format_carries_a_newline
+--- PASS: TestComplianceReportFallsBackToJSONWhenTheQueryIsNotParseable (0.00s)
+--- PASS: TestComplianceReportPassesTheWindowThrough (0.00s)
+--- PASS: TestComplianceReportFailsClosedWithoutItsDependencies (0.00s)
+    --- PASS: .../no_auditor   .../no_verifier
+--- PASS: TestComplianceReportReportsFailuresAsInternal (0.00s)
+    --- PASS: .../read_failure  .../chain_walk_failure  .../unreadable_trace
+--- PASS: TestComplianceReportRefusesToAnswerWhenTheAccessRecordFails (0.00s)
+--- PASS: TestComplianceReportPDFRendersThroughTheInstalledRenderer (0.02s)
+--- PASS: TestComplianceReportPDFRendersThroughChromium (0.02s)
+--- PASS: TestComplianceReportPDFNamesABoundedWindow (0.02s)
+--- PASS: TestComplianceReportPDFAnswers503WithoutARenderer (0.00s)
+--- PASS: TestComplianceReportPDFRefusesAMissingTemplate (0.00s)
+--- PASS: TestComplianceReportTemplateSaysWhatTheReportSays (0.00s)
+--- PASS: TestComplianceReportTemplateSignalsABrokenChain (0.00s)
+--- PASS: TestComplianceReportTemplateRendersAnEmptyPeriod (0.00s)
+--- PASS: TestComplianceReport (0.30s)
+--- PASS: TestComplianceReportPrefersMeteringAndRefusesATeamTenant (4.30s)
+--- PASS: TestComplianceReportAnswersEverySectionWithTheArticle50Statement (0.00s)
+PASS
+ok  synapse/internal/plane  4.690s
+```
+
+The two tagged tests are the ones that need the database, and what they did rather than
+merely did-not-fail: `TestComplianceReport` provisioned an enterprise tenant through
+`tenant.Provisioner`, appended five HMAC-signed entries through `ledger.NewLedger(pool).Append`
+whose traces carry two used memories each (one of them another agent's), a superseded memory,
+and both halves of a contradiction, then read the report back over HTTP with the real
+`ledger.Auditor`, the real `Ledger.Verify` adapter, and the real middleware. It asserted the
+whole document against the fixtures: `total_compilations: 5` and `avg_reduction_pct: 30` from the
+ledger fallback, `total_memories_used: 9`, `memory_type_breakdown {fact: 57.14, decision:
+42.86}` (four facts and three decisions — the superseded memory and the older conflict half are
+not in the denominator), `cross_agent_retrievals: 2`, `unique_contributing_agents: 2`,
+`contradictions_detected: 1`, `memories_superseded: 1`, `chain_integrity {valid: true,
+entries_in_period: 5}`, and the Article 50 statement equal to `plane.Article50Statement`. It then
+asserted that `since` set to the newest entry's own `created_at` (to the microsecond) narrows the
+report to one entry and one memory type while the chain verdict still covers the whole chain. The
+second tagged test inserted two `usage_events` rows (10% and 20%) and asserted the report then
+says `total_compilations: 2, avg_reduction_pct: 15.00` with `entries_in_period: 5` — the two
+sources disagreeing, which is the point of the sourcing decision — plus the team tenant's 403,
+the PDF render, and the access-log rows for all of it (2 for the enterprise tenant, 1 for the
+refused one, with the endpoint, the codes, the recorded `format`, and a 64-character `ip_hash`).
+
+The integration test's PDF branch used a real renderer: the machine has no `wkhtmltopdf` but does
+have `google-chrome 153.0.8010.52`, and the test asserts `Content-Type: application/pdf` and a
+body starting `%PDF-` rather than skipping.
+
+Regression, unchanged by this phase but now running beside it — and here is where this
+phase's verification turned up something that is *not* about this phase:
+
+```text
+$ go test -count=1 -tags integration ./internal/plane/...      # three consecutive runs
+ok  synapse/internal/plane  6.853s
+ok  synapse/internal/plane  5.814s
+ok  synapse/internal/plane  6.052s
+
+$ go test -count=1 -tags integration ./internal/ledger/...
+ok  synapse/internal/ledger  1.863s        # run 2 of 3
+FAIL synapse/internal/ledger 1.525s        # run 1 of 3
+    --- FAIL: TestVerifyDetectsRewrittenSignature (0.02s)
+        Error: tenant: migrate ledger_revoke_public: ERROR: tuple concurrently updated (SQLSTATE XX000)
+$ go test -count=1 -tags integration ./internal/tenant/...
+ok  synapse/internal/tenant  1.279s        # run 1, 3 of 3
+FAIL synapse/internal/tenant 0.904s        # run 2 of 3
+    --- FAIL: TestProvisionerStoresTheHashAndIssuesAVerifiableToken
+        Error: tenant: migrate ledger_revoke_public: ERROR: tuple concurrently updated (SQLSTATE XX000)
+```
+
+Both suites are intermittently red, in roughly one run in three, and both failures are the same
+statement: `tenant.RunMigrations` re-issuing the role/ACL DDL (`REVOKE ALL ON ... FROM PUBLIC`,
+`GRANT ledger_writer TO CURRENT_USER`) while another session touches the same catalog tuple.
+Every integration test in both packages calls `RunMigrations` before it starts, and Go runs
+package test binaries in parallel by default, so two suites sharing one database can migrate at
+the same moment.
+
+It is **pre-existing, not caused by this phase**, and that was checked rather than assumed: a
+clean `git worktree` at the Phase 19 commit (`6b405ad`, this phase's parent) shows the same
+failure on the same class of test when the same loop is run against it:
+
+```text
+$ git worktree add /tmp/scc-base HEAD && cd /tmp/scc-base
+$ go test -count=1 -tags integration ./internal/ledger/...       # 4 consecutive runs
+FAIL synapse/internal/ledger 2.002s   --- FAIL: TestVerifyRejectsUnusableInput
+        Error:    tenant: migrate ledger_revoke_public: ERROR: tuple concurrently updated (SQLSTATE XX000)
+ok   synapse/internal/ledger 1.845s
+ok   synapse/internal/ledger 1.907s
+ok   synapse/internal/ledger 2.050s
+```
+
+The worktree was removed afterwards. Phase 19's PROGRESS entry pasted one green combined run;
+this phase's runs show the combined form is not reliably green on this machine. The phase's own
+evidence above is therefore per-package (`./internal/plane/...` alone, three times in a row) and
+the untagged `go test ./...`, both of which were green every time. The race is written up as
+finding 1 below.
+
+
+The live run, for the two formats the definition of done asks to be pasted. The plane was started
+from the repository root with an environment-only config (`SYNAPSE_DB_DSN`, `SYNAPSE_JWT_SECRET`,
+`SYNAPSE_ADMIN_TOKEN`, `SYNAPSE_MASTER_KEY` exported; no YAML file), against the compose database,
+with the template at its default path:
+
+```text
+2:28PM INFO plane: Control plane config loaded listen_addr=127.0.0.1:9091 database_dsn=set
+      jwt_secret=set admin_token=set master_key=set log_level=info ledger_retention_days=365
+      report_template=ui/plane/compliance-report.html
+2:28PM INFO plane: migrations complete schema=synapse_global
+2:28PM INFO plane: Synapse Control Plane v2.0.0 listening addr=127.0.0.1:9091
+```
+
+The enterprise-tier token needed one step outside HTTP, because `POST /v2/tenants` hard-codes the
+tier to `team` (finding 2): a throwaway `main` package calling the *production* issuer
+(`tenant.Provisioner`) and the ledger's real write path, appending five fixture entries. It lived
+in `.tmp-mint/`, printed only ids and tokens, and was deleted before the commit —
+`git status --porcelain` at the end of this section is the proof.
+
+**JSON report** (`format=json`, the response itself):
+
+```text
+$ curl -sS 'http://127.0.0.1:9091/v2/compliance/report?format=json' -H "Authorization: Bearer $ENTERPRISE_JWT" | python3 -m json.tool
+{
+    "header": {
+        "tenant_id": "2dad74fe-de20-4eda-8b7a-e484b06d7a0f",
+        "period": { "since": null, "until": null },
+        "generated_at": "2026-09-21T14:28:45.15524909Z",
+        "synapse_version": "2.0.0"
+    },
+    "summary": { "total_compilations": 5, "total_memories_used": 9, "avg_reduction_pct": 30 },
+    "memory_type_breakdown": { "decision": 42.86, "fact": 57.14 },
+    "global_brain": { "cross_agent_retrievals": 2, "unique_contributing_agents": 2 },
+    "conflict_resolution": { "contradictions_detected": 1 },
+    "supersession": { "memories_superseded": 1 },
+    "chain_integrity": {
+        "valid": true,
+        "last_verified_at": "2026-09-21T14:28:45.158292894Z",
+        "entries_in_period": 5
+    },
+    "article_50_statement": "This report is generated by Synapse Context Compiler, which provides cryptographically signed, tamper-evident audit trails of all memory compilation decisions made by AI agents in this organisation. Each compilation event is logged with its full decision trace, memory provenance, scoring rationale, and chain integrity verification. DISCLAIMER: This report provides technical traceability infrastructure. It does not constitute legal advice or guarantee regulatory compliance with Regulation (EU) 2024/1689 or any other instrument. Consult qualified legal counsel regarding your organisation's specific obligations under the EU AI Act."
+}
+```
+
+
+
+**PDF report.** The definition of done asks for the `Content-Type` header from `curl -I`; `curl -I`
+sends `HEAD`, and only `GET` is routed, so it answers `405 Method Not Allowed` with `Allow: GET` —
+asserting the route rather than reporting it, and finding 7 says why a `HEAD` route was not added
+purely for this. The headers below are therefore from a `GET`, which runs the same handler:
+
+```text
+$ curl -sS -I 'http://127.0.0.1:9091/v2/compliance/report?format=pdf' -H "Authorization: Bearer $ENTERPRISE_JWT"
+HTTP/1.1 405 Method Not Allowed
+Allow: GET
+
+$ curl -sS -D /tmp/phase20-pdf-headers.txt -o /tmp/phase20-report.pdf \
+    'http://127.0.0.1:9091/v2/compliance/report?format=pdf&since=2026-09-01T00:00:00Z' \
+    -H "Authorization: Bearer $ENTERPRISE_JWT"
+$ cat /tmp/phase20-pdf-headers.txt
+HTTP/1.1 200 OK
+Content-Disposition: attachment; filename="compliance-report-2026-09-01_now.pdf"
+Content-Type: application/pdf
+Date: Mon, 21 Sep 2026 14:28:54 GMT
+Transfer-Encoding: chunked
+
+$ ls -l /tmp/phase20-report.pdf
+-rw-rw-r-- 1 ranscky ranscky 53306 Sep 21 14:28 /tmp/phase20-report.pdf
+$ file /tmp/phase20-report.pdf
+/tmp/phase20-report.pdf: PDF document, version 1.4, 2 page(s)
+```
+
+The document is the report, not a placeholder — `pdftotext -layout` on those bytes:
+
+```text
+$ pdftotext -layout /tmp/phase20-report.pdf - | sed -n '1,12p;40,60p'
+generated 21 Sep 2026 14:28 UTC
+synapse v2.0.0
+
+Synapse Context Compiler
+COMPLIANCE REPORT — ARTICLE 50 TRACEABILITY
+
+TENANT                                        PERIOD COVERED
+2dad74fe-de20-4eda-8b7a-e484b06d7a0f          01 Sep 2026 00:00 UTC → now
+
+SUMMARY
+5                  9                  30.00%
+Compilations       Memories used      Average context reduction
+...
+   CHAIN VERIFIED
+   Entries in this period                                     5
+   Last verified                          21 Sep 2026 14:28:50 UTC
+   Every entry in this tenant's audit ledger was re-checked against its HMAC signature and its
+   predecessor's hash at the time this report was generated.
+
+    ARTICLE 50 STATEMENT
+    This report is generated by Synapse Context Compiler, which provides cryptographically signed,
+    tamper-evident audit trails ... Consult qualified legal counsel regarding your
+    organisation's specific obligations under the EU AI Act.
+```
+
+The tenant id, the `30.00%`, the entry count and the window are all this tenant's own values from
+the same `ComplianceReport` the JSON body carried, and the statement sits in its bordered box after
+the findings.
+
+
+**Refusals and the renderer-less host:**
+
+```text
+$ curl -sS -w ' HTTP %{http_code}\n' 'http://127.0.0.1:9091/v2/compliance/report?format=json' -H "Authorization: Bearer $TEAM_JWT"
+{"error":"compliance_tier_required","upgrade_url":"https://synapse.ai/enterprise"} HTTP 403
+
+$ curl -sS -w ' HTTP %{http_code}\n' 'http://127.0.0.1:9091/v2/compliance/report?format=pdf' -H "Authorization: Bearer $TEAM_JWT"
+{"error":"compliance_tier_required","upgrade_url":"https://synapse.ai/enterprise"} HTTP 403
+
+# A second plane started with PATH pointing at an empty directory, i.e. a host with no renderer:
+$ curl -sS -i 'http://127.0.0.1:9092/v2/compliance/report?format=pdf' -H "Authorization: Bearer $ENTERPRISE_JWT"
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Content-Length: 86
+
+{"error":"pdf_tool_unavailable","message":"install wkhtmltopdf to enable PDF reports"}
+$ curl -sS -o /dev/null -w 'HTTP %{http_code} %{content_type}\n' 'http://127.0.0.1:9092/v2/compliance/report?format=json' -H "Authorization: Bearer $ENTERPRISE_JWT"
+HTTP 200 application/json
+```
+
+**Every call above was recorded**, read straight from the table rather than from any endpoint:
+
+```text
+$ docker exec deploy-db-1 psql -U synapse -d synapse -c \
+    "SELECT endpoint, query_params_redacted, response_code, left(ip_hash,12) AS ip_hash_prefix, created_at \
+       FROM synapse_global.compliance_access_log WHERE tenant_id IN ('$ENTERPRISE_TENANT','$TEAM_TENANT') ORDER BY created_at, id;"
+       endpoint        |           query_params_redacted           | response_code | ip_hash_prefix |          created_at
+-----------------------+-------------------------------------------+---------------+----------------+-------------------------------
+ /v2/compliance/report | format=json                               |           200 | 7db19d8c23b9   | 2026-09-21 14:28:45.161594+00
+ /v2/compliance/report | format=pdf&since=2026-09-01T00%3A00%3A00Z |           200 | 5f27b71e0f38   | 2026-09-21 14:28:54.407591+00
+ /v2/compliance/report | format=json                               |           403 | b44d0ad8f66f   | 2026-09-21 14:29:02.294897+00
+ /v2/compliance/report | format=pdf                                |           403 | c7e8fe942d8f   | 2026-09-21 14:29:02.336042+00
+ /v2/compliance/report | format=pdf                                |           503 | 1aaec9d9abb1   | 2026-09-21 14:29:09.384416+00
+ /v2/compliance/report | format=json                               |           200 | 0880a023414f   | 2026-09-21 14:29:09.435163+00
+(6 rows)
+```
+
+Six calls, six rows: one endpoint name, the window and the format exactly as they were parsed, a
+64-character `ip_hash` in every case (never the address), and the 403s and the 503 present as the
+fail-closed rule requires — an attempt is an audit fact.
+
+```text
+$ git status --porcelain        # after the throwaway helper was removed, before the commit
+ M bin/synapse                  # pre-existing local build artifact, NOT part of this commit
+ M internal/ledger/doc.go
+ M internal/plane/compliance.go
+ M internal/plane/compliance_params.go
+ M internal/plane/compliance_types.go
+ M internal/plane/compliance_unit_test.go
+ M internal/plane/config.go
+ M internal/plane/handlers.go
+ M synapse-plane.yaml.example
+ M PROGRESS.md
+?? internal/ledger/report.go
+?? internal/plane/compliance_access.go
+?? internal/plane/compliance_report.go
+?? internal/plane/compliance_report_build.go
+?? internal/plane/compliance_report_build_test.go
+?? internal/plane/compliance_report_gate_test.go
+?? internal/plane/compliance_report_pdf.go
+?? internal/plane/compliance_report_pdf_test.go
+?? internal/plane/compliance_report_setup_test.go
+?? internal/plane/compliance_report_test.go
+?? internal/plane/compliance_report_types.go
+?? internal/plane/compliance_report_unit_test.go
+?? ui/plane/
+```
+
+No `.tmp-mint/`, no stray binary, and no v1 internal package in the list.
+
+### Findings this phase surfaced (not fixed here — this phase is one read endpoint)
+
+1. **`tenant.RunMigrations` is not safe to run concurrently, and the integration suites prove it
+   intermittently.** The verification section's failing runs are all this: `tenant: migrate
+   ledger_revoke_public: ERROR: tuple concurrently updated (SQLSTATE XX000)`, from the `REVOKE ALL
+   ON ... FROM PUBLIC` / `GRANT ledger_writer TO CURRENT_USER` statements that `migrations`
+   re-issues on every call. It is reproduced on the unmodified Phase 19 tree, so it is not this
+   phase's, but it makes "paste a green combined integration run" unreliable for whoever writes the
+   next phase's PROGRESS entry. The file's own comment already says a second plane booting
+   concurrently is unsupported; `SELECT pg_advisory_xact_lock(...)` as the first statement of
+   `RunMigrations` would make that limitation true in the database rather than in a comment, and it
+   is a one-line fix in a file this phase deliberately did not touch.
+2. **The plane image cannot render a PDF, and does not ship the template.** `deploy/Dockerfile.plane`
+   copies exactly one binary into `alpine:3.19`: no `ui/`, and no Chromium or wkhtmltopdf. In the
+   compose deployment `?format=pdf` therefore answers the documented 503 (proof that the fail-closed
+   path works, and useless to a compliance officer), and a deployment that installed a renderer but
+   not the template would get a 500. The ways forward, in increasing cost: `COPY` the `ui/` tree and
+   serve the HTML for client-side printing; add `chromium` (or `wkhtmltopdf`) to the image and accept
+   the size, which is the only option that makes the endpoint self-contained; or split the renderer
+   into a sidecar. This phase did none of them, and the finding is here so the choice is explicit.
+3. **No HTTP path mints an enterprise-tier token.** `POST /v2/tenants` writes
+   `ComplianceTier: defaultComplianceTier` — the literal `"team"` — so the tier both compliance
+   endpoints gate on is unreachable from outside: a tenant is enterprise only if a caller used
+   `tenant.Provisioner` directly (as the tests do) or a row was edited. That is Phase 2's decision
+   restated from the reporting side, and it is why this phase's live evidence needed a throwaway
+   helper. A validated `compliance_tier` field on the provisioning request (admin-only, since it is
+   a billing/compliance fact rather than a tenant preference) closes it.
+4. **Nothing writes `usage_events`, and `avg_reduction_pct` still reads 0 in any deployment.** The
+   sourcing decision makes the report metering-ready, but until metering exists the number comes
+   from ledgered traces whose `reduction_pct` is 0 (Phase 18 finding 1). So a compliance officer
+   reading today's report sees a real compilation count, a real memory-type mix, real conflict and
+   supersession counts, a real chain verdict — and `0.00%` context reduction, with no field in the
+   report to explain it. The fixes are metering (write the table) or Phase 18's fidelity gap (two
+   frozen v1 call sites); a note field on the summary was not added, because the brief's struct does
+   not have one.
+5. **A report costs a whole-window read plus a whole-chain walk, with no cap.** The audit
+   endpoint's page is limited to 200 rows; this one is limited by nothing, deliberately, because a
+   report covers the period it names. The consequence is that a tenant with a hundred thousand
+   entries pays a hundred thousand re-signed HMACs per report — and the walk is the *chain's*
+   length, not the window's, since the verdict covers everything. A cached verdict with a short TTL,
+   or a per-tenant rollup in the metering phase's shape, is the fix.
+6. **`usage_events` has no index on `(tenant_id, created_at)`.** The report's totals query uses
+   exactly that predicate, and today it is a sequential scan over a table nothing writes. It is
+   cheap now and will not be once metering lands, which makes it a migration worth adding in the
+   phase that starts writing rows rather than a phase that reads an empty table.
+7. **`curl -I` cannot show this endpoint's headers.** Only `GET` is routed (chi's `Get`), so `HEAD`
+   is a 405 — correct, and a small deviation from the definition of done's wording, which asked for
+   a `curl -I`. Adding a `HEAD` route would run the whole report and the whole PDF render to produce
+   headers nobody reads, unless a header-only path were written; that is a decision for a phase that
+   wants it, not a side effect of this one.
+8. **The chain verdict inside a report is not itself signed.** `chain_integrity.valid` is a claim
+   this process makes at a moment in time, and the document carrying it is not a ledger row, so
+   nobody can later prove which report a tenant was shown. Phase 19's finding 6 said the same about
+   a page read; a report is a stronger case for it, because a PDF is the artifact that gets filed.
+   Appending the report's own digest as a ledger entry — one row per report, with the window in the
+   payload — is the shape that would close it, and it is a write, so it belongs with a phase that
+   owns the ledger's growth.
+9. **`contradictions_detected` and `memories_superseded` are only as complete as the traces they
+   are computed from.** Both are read from `trace_json`, and a compilation whose trace was appended
+   before the contradicting memory was written will not mention it; nothing back-fills a trace,
+   deliberately, because a trace is a record of what the compiler saw rather than a mutable view of
+   the store. The store's own `memories` table is the fuller record (`conflict_status`,
+   `superseded_by`) and lives in the tenant's schema, which the compliance path deliberately does
+   not reach into for a cross-period report. An implementation that wants the store's view has to
+   decide whose numbers a compliance report should carry, which is a question about the report
+   rather than about the query.
+
+
+### Next phase
+
+Two items are now the obvious ones, and both come from findings above rather than from a roadmap.
+The smallest is finding 1 — an advisory lock at the top of `tenant.RunMigrations` — because it is
+one statement in the file that already owns the append-only role, and it turns an intermittent test
+failure into a database guarantee. The largest is the entry the last several phases have all
+queued: the external anchor for each tenant's chain head (Phase 17 finding 2, restated by Phase 18
+finding 6 and Phase 20 finding 8), without which "the whole chain was deleted" and "nothing was
+ever appended" remain the same answer, and without which no report can prove which report a tenant
+was shown. Key versioning and returning the signing secret to the tenant at provisioning are the
+other two queued ledger items.
+
+Metering is the phase that would make this report's summary section honest rather than merely
+explicit (findings 4 and 6): it writes the table the report already prefers, and it is where
+`avg_reduction_pct` stops being 0. The compliance-tier provisioning field (finding 3) is a small
+addition that belongs with whichever phase touches `POST /v2/tenants` next. And the S/R/I/T
+breakdown plus `trace_id` on the plane's memory-search surface is still queued from Phase 14, still
+the shape `.clinerules` requires of MCP responses, and now the third surface (after the audit page
+and this report) where those fields would be read.
+

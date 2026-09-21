@@ -31,11 +31,20 @@
 // The role that matters here is the opposite one: verification needs the owner's
 // connection, since tenant.LedgerWriterRole holds no SELECT at all.
 //
+// Phase 20 adds the ledger's second read shape: a whole window of a tenant's chain at
+// once, plus the metering totals for the same window, as the raw material a compliance
+// report is built from (Auditor.ReportFacts, report.go). It is the same table, read the
+// same way, and the boundary is drawn so that what the numbers *mean* stays out of this
+// package: the rows come back as stored, and internal/plane folds them into the report,
+// where that arithmetic is a pure function and can be tested without a database.
+//
 // Files:
 //
 //	ledger.go   the write path: Ledger, LedgerEntry, Append, and the chain reads
 //	chain.go    the hashing primitives: genesis hash, chain message, HMAC signature
 //	verify.go   the read path: ChainIntegrityResult, verifyQuery, Ledger.Verify
+//	compliance.go the paged audit read and the access record: Auditor
+//	report.go   the report's window read: ReportFacts and the metering totals
 //	ledger_test.go, ledger_table_test.go, verify_test.go, verify_input_test.go
 //	            integration tests (build tag: integration)
 //
@@ -47,6 +56,7 @@
 //	go test ./internal/ledger/... -run TestAppend -v -tags integration
 //	go test ./internal/ledger/... -run TestVerify -v -tags integration
 //	go test ./internal/ledger/... -run TestLedgerTablePermissions -v -tags integration
+//	go test ./internal/plane/...  -run TestComplianceReport -v -tags integration
 //
 // There is no untagged unit test for either path, because everything they do
 // happens against Postgres and a fake pgx.Tx would mostly test the fake. What is

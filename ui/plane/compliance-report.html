@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<!--
+  Synapse Context Compiler — compliance report template.
+
+  This file is rendered by GET /v2/compliance/report?format=pdf with a
+  plane.ComplianceReport as its data, and the result is handed to wkhtmltopdf or a
+  headless Chromium to become the PDF a compliance officer files. It is also
+  readable on its own in a browser, because "print-ready" is a layout rather than a
+  separate document.
+
+  Three properties are deliberate and worth keeping:
+
+    * No external assets. No web fonts, no CDN, no images, no scripts. The plane
+      renders this offline, inside a temp directory that is deleted immediately
+      afterwards, and a template that fetched anything would produce a document
+      whose appearance depends on the renderer's network access.
+    * Print first. The palette is ink-on-paper and the layout is A4 with a real
+      margin; @media print adds the page-level rules a paper version needs. The
+      on-screen view is the same sheet.
+    * Every number comes from the report value and nothing is computed here. The
+      JSON body and this document are two renderings of one struct, which is what
+      makes "the PDF says what the API said" true by construction.
+
+  Template syntax is Go's html/template. `range` over a map iterates in sorted key
+  order, so the memory-type breakdown is alphabetical without a sort in Go.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Synapse Compliance Report — {{.Header.TenantID}}</title>
+<style>
+  @page {
+    size: A4;
+    margin: 18mm 16mm 16mm 16mm;
+  }
+
+  :root {
+    --ink:      #111417;
+    --muted:    #5b6570;
+    --rule:     #d3d8dd;
+    --rule-hi:  #111417;
+    --wash:     #f4f6f8;
+    --accent:   #0b6b52;
+    --warn:     #9a3412;
+    --mono:     "DejaVu Sans Mono", "Liberation Mono", Menlo, Consolas, monospace;
+    --sans:     "DejaVu Sans", "Liberation Sans", Helvetica, Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    font-family: var(--sans);
+    font-size: 10.5pt;
+    line-height: 1.45;
+    color: var(--ink);
+    background: #fff;
+  }
+
+  .sheet {
+    max-width: 178mm;
+    margin: 0 auto;
+    padding: 6mm 0 0 0;
+  }
+
+  /* ── masthead ─────────────────────────────────────────── */
+  .masthead {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8mm;
+    border-bottom: 2px solid var(--rule-hi);
+    padding-bottom: 4mm;
+  }
+
+  .wordmark {
+    font-size: 13pt;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+  }
+
+  .wordmark span { color: var(--accent); }
+
+  .doc-type {
+    font-family: var(--mono);
+    font-size: 8pt;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-top: 1.5mm;
+  }
+
+  .masthead-meta {
+    font-family: var(--mono);
+    font-size: 8pt;
+    color: var(--muted);
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  /* ── identity block ───────────────────────────────────── */
+  .identity {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3mm 10mm;
+    margin: 5mm 0 7mm 0;
+  }
+
+  .field { min-width: 0; }
+
+  .field-label {
+    font-family: var(--mono);
+    font-size: 7.5pt;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 1mm;
+  }
+
+  .field-value {
+    font-family: var(--mono);
+    font-size: 9.5pt;
+    word-break: break-all;
+  }
+
+  /* ── section frames ───────────────────────────────────── */
+  section {
+    margin-bottom: 6mm;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  h2 {
+    font-family: var(--mono);
+    font-size: 8.5pt;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 1.5mm;
+    margin: 0 0 3mm 0;
+  }
+
+  /* ── figures ──────────────────────────────────────────── */
+  .figures {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 3mm;
+  }
+
+  .figure {
+    border: 1px solid var(--rule);
+    background: var(--wash);
+    padding: 3mm 3.5mm;
+  }
+
+  .figure-value {
+    font-family: var(--mono);
+    font-size: 17pt;
+    font-weight: 700;
+    line-height: 1.1;
+  }
+
+  .figure-unit {
+    font-family: var(--mono);
+    font-size: 9pt;
+    font-weight: 400;
+    color: var(--muted);
+  }
+
+  .figure-label {
+    font-size: 8pt;
+    color: var(--muted);
+    margin-top: 1.5mm;
+  }
+
+  /* ── tables ───────────────────────────────────────────── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 9.5pt;
+  }
+
+  th {
+    font-family: var(--mono);
+    font-size: 7.5pt;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    text-align: left;
+    border-bottom: 1px solid var(--rule);
+    padding: 0 0 1.5mm 0;
+  }
+
+  td {
+    padding: 1.5mm 0;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  td.num, th.num {
+    text-align: right;
+    font-family: var(--mono);
+    white-space: nowrap;
+  }
+
+  .empty {
+    font-size: 9pt;
+    color: var(--muted);
+    font-style: italic;
+  }
+
+  dl.pairs {
+    margin: 0;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 1.5mm 6mm;
+  }
+
+  dl.pairs dt {
+    font-family: var(--mono);
+    font-size: 9pt;
+    color: var(--muted);
+  }
+
+  dl.pairs dd {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 9.5pt;
+    text-align: right;
+    font-weight: 700;
+  }
+
+  /* ── chain verdict ────────────────────────────────────── */
+  .verdict {
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    padding: 3mm 3.5mm;
+    background: var(--wash);
+  }
+
+  .verdict.broken {
+    border-left-color: var(--warn);
+  }
+
+  .verdict-head {
+    font-family: var(--mono);
+    font-size: 10pt;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 1.5mm;
+  }
+
+  .verdict.broken .verdict-head { color: var(--warn); }
+
+  .verdict-note {
+    font-size: 8.5pt;
+    color: var(--muted);
+    margin-top: 1.5mm;
+  }
+
+  /* ── article 50 statement ─────────────────────────────── */
+  .statement {
+    border: 1.5px solid var(--rule-hi);
+    padding: 4mm 4.5mm;
+    margin-top: 8mm;
+  }
+
+  .statement h2 {
+    border-bottom: none;
+    padding-bottom: 0;
+    margin-bottom: 2.5mm;
+  }
+
+  .statement p {
+    margin: 0;
+    font-size: 9.5pt;
+    text-align: justify;
+  }
+
+  .colophon {
+    margin-top: 5mm;
+    padding-top: 2.5mm;
+    border-top: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 7.5pt;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    gap: 6mm;
+  }
+
+  @media print {
+    body { font-size: 10pt; }
+    .sheet { max-width: none; padding: 0; }
+    section, .verdict, .statement { break-inside: avoid; page-break-inside: avoid; }
+    .masthead { break-after: avoid; page-break-after: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="sheet">
+
+  <header class="masthead">
+    <div>
+      <div class="wordmark">Synapse <span>Context Compiler</span></div>
+      <div class="doc-type">Compliance Report — Article 50 Traceability</div>
+    </div>
+    <div class="masthead-meta">
+      generated {{.Header.GeneratedAt.UTC.Format "02 Jan 2006 15:04 UTC"}}<br>
+      synapse v{{.Header.SynapseVersion}}
+    </div>
+  </header>
+
+  <div class="identity">
+    <div class="field">
+      <div class="field-label">Tenant</div>
+      <div class="field-value">{{.Header.TenantID}}</div>
+    </div>
+    <div class="field">
+      <div class="field-label">Period covered</div>
+      <div class="field-value">
+        {{if .Header.Period.Since}}{{.Header.Period.Since.UTC.Format "02 Jan 2006 15:04 UTC"}}{{else}}start of this tenant's ledger{{end}}
+        &rarr;
+        {{if .Header.Period.Until}}{{.Header.Period.Until.UTC.Format "02 Jan 2006 15:04 UTC"}}{{else}}now{{end}}
+      </div>
+    </div>
+  </div>
+
+  <section>
+    <h2>Summary</h2>
+    <div class="figures">
+      <div class="figure">
+        <div class="figure-value">{{.Summary.TotalCompilations}}</div>
+        <div class="figure-label">Compilations</div>
+      </div>
+      <div class="figure">
+        <div class="figure-value">{{.Summary.TotalMemoriesUsed}}</div>
+        <div class="figure-label">Memories used</div>
+      </div>
+      <div class="figure">
+        <div class="figure-value">{{printf "%.2f" .Summary.AvgReductionPct}}<span class="figure-unit">%</span></div>
+        <div class="figure-label">Average context reduction</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Memory type breakdown</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Memory type</th>
+          <th class="num">Share of memories used</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range $type, $share := .MemoryTypeBreakdown}}
+        <tr>
+          <td>{{$type}}</td>
+          <td class="num">{{printf "%.2f" $share}}%</td>
+        </tr>
+        {{else}}
+        <tr><td colspan="2" class="empty">No memories were used in this period.</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Global Brain</h2>
+    <dl class="pairs">
+      <dt>Memories retrieved from another agent</dt>
+      <dd>{{.GlobalBrain.CrossAgentRetrievals}}</dd>
+      <dt>Distinct contributing agents</dt>
+      <dd>{{.GlobalBrain.UniqueContributingAgents}}</dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>Conflict resolution and supersession</h2>
+    <dl class="pairs">
+      <dt>Contradictions detected</dt>
+      <dd>{{.ConflictResolution.ContradictionsDetected}}</dd>
+      <dt>Memories superseded</dt>
+      <dd>{{.Supersession.MemoriesSuperseded}}</dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>Chain integrity</h2>
+    <div class="verdict{{if not .ChainIntegrity.Valid}} broken{{end}}">
+      <div class="verdict-head">
+        {{if .ChainIntegrity.Valid}}Chain verified{{else}}Chain integrity failure{{end}}
+      </div>
+      <dl class="pairs">
+        <dt>Entries in this period</dt>
+        <dd>{{.ChainIntegrity.EntriesInPeriod}}</dd>
+        <dt>Last verified</dt>
+        <dd>{{.ChainIntegrity.LastVerifiedAt.UTC.Format "02 Jan 2006 15:04:05 UTC"}}</dd>
+      </dl>
+      <div class="verdict-note">
+        Every entry in this tenant's audit ledger was re-checked against its HMAC signature and its
+        predecessor's hash at the time this report was generated.
+        {{if not .ChainIntegrity.Valid}}The verification found a break: treat the entries above as
+        unverified until it is resolved.{{end}}
+      </div>
+    </div>
+  </section>
+
+  <div class="statement">
+    <h2>Article 50 statement</h2>
+    <p>{{.Article50Statement}}</p>
+  </div>
+
+  <div class="colophon">
+    <span>{{.Header.TenantID}} &mdash; synapse v{{.Header.SynapseVersion}}</span>
+    <span>generated {{.Header.GeneratedAt.UTC.Format "2006-01-02T15:04:05Z"}}</span>
+  </div>
+
+</div>
+</body>
+</html>

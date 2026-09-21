@@ -36,7 +36,6 @@
 package plane
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -126,7 +125,7 @@ func (s *Server) handleComplianceAudit(w http.ResponseWriter, r *http.Request) {
 	params, reason := parseAuditParams(r)
 
 	if ComplianceTierFromCtx(r.Context()) != complianceTierEnterprise {
-		if !s.requireAccessRecord(w, r, tenantID, params.redacted, http.StatusForbidden) {
+		if !s.requireAccessRecord(w, r, complianceAuditRoute, tenantID, params.redacted, http.StatusForbidden) {
 			return
 		}
 
@@ -138,7 +137,7 @@ func (s *Server) handleComplianceAudit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if reason != "" {
-		if !s.requireAccessRecord(w, r, tenantID, params.redacted, http.StatusBadRequest) {
+		if !s.requireAccessRecord(w, r, complianceAuditRoute, tenantID, params.redacted, http.StatusBadRequest) {
 			return
 		}
 
@@ -159,7 +158,7 @@ func (s *Server) handleComplianceAudit(w http.ResponseWriter, r *http.Request) {
 		// The answer is a 500 either way, so a failed record changes nothing
 		// the caller sees: requireAccessRecord has already written the 500 when
 		// it could not record, and this writes the same body when it could.
-		if s.requireAccessRecord(w, r, tenantID, params.redacted, http.StatusInternalServerError) {
+		if s.requireAccessRecord(w, r, complianceAuditRoute, tenantID, params.redacted, http.StatusInternalServerError) {
 			writeError(w, http.StatusInternalServerError, "internal")
 		}
 		return
@@ -181,7 +180,7 @@ func (s *Server) handleComplianceAudit(w http.ResponseWriter, r *http.Request) {
 					"tenant_id", tenantID, "entry_id", entry.ID, "error", err)
 			}
 
-			if s.requireAccessRecord(w, r, tenantID, params.redacted, http.StatusInternalServerError) {
+			if s.requireAccessRecord(w, r, complianceAuditRoute, tenantID, params.redacted, http.StatusInternalServerError) {
 				writeError(w, http.StatusInternalServerError, "internal")
 			}
 			return
@@ -198,7 +197,7 @@ func (s *Server) handleComplianceAudit(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if !s.requireAccessRecord(w, r, tenantID, params.redacted, http.StatusOK) {
+	if !s.requireAccessRecord(w, r, complianceAuditRoute, tenantID, params.redacted, http.StatusOK) {
 		return
 	}
 
@@ -239,58 +238,8 @@ func parseAuditTrace(entry AuditRow) (trace.TraceManifest, error) {
 	return manifest, nil
 }
 
-// requireAccessRecord writes this call's compliance_access_log row and reports
-// whether the caller's answer may be sent. When the record cannot be written it
-// logs the failure, writes this package's generic 500, and returns false, so the
-// caller's own answer -- audit data included -- is never sent.
-//
-// Fail-closed rather than best-effort is the deliberate choice, and the reason is
-// what this endpoint is for. An audit read that goes unrecorded is precisely the
-// event a compliance officer has to be able to rule out, and a plane that
-// answered anyway would be handing over a tenant's audit history with no
-// evidence that anyone asked -- the failure mode the ledger itself exists to
-// prevent. The cost is stated rather than hidden: the access table and the
-// ledger are in one database, so a long run of reads that worked means the next
-// one is overwhelmingly likely to write its record too, and the case where it
-// does not is a database that has stopped answering -- at which point the read
-// being recorded would have failed as well.
-//
-// The alternative, answering and logging the failure server-side, was rejected:
-// it makes "log every call" a best effort, which is a property no auditor can
-// rely on.
-func (s *Server) requireAccessRecord(w http.ResponseWriter, r *http.Request, tenantID, redacted string, code int) bool {
-	if err := s.recordAccess(r, tenantID, redacted, code); err != nil {
-		if s.logger != nil {
-			s.logger.Error("Compliance access log write failed",
-				"tenant_id", tenantID, "response_code", code, "error", err)
-		}
-
-		writeError(w, http.StatusInternalServerError, "internal")
-		return false
-	}
-
-	return true
-}
-
-// recordAccess writes one row of the tenant's compliance access log: the
-// verified tenant, this endpoint, the caller's window and paging as they were
-// parsed, the caller's address as a digest, and the code about to be written.
-//
-// The request's own context is detached before the write. The read this records
-// is already over by the time the row is written, and a client that hung up in
-// the meantime must not take the record of its own read with it -- which is
-// exactly the case an auditor would ask about, since a caller who disconnects
-// mid-response is still a caller who asked. WithoutCancel keeps the request's
-// values and drops its cancellation; the ceiling below replaces it.
-func (s *Server) recordAccess(r *http.Request, tenantID, redacted string, code int) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), complianceAccessLogTimeout)
-	defer cancel()
-
-	return s.auditor.RecordAccess(ctx, AccessRecord{
-		TenantID:            tenantID,
-		Endpoint:            complianceAuditRoute,
-		QueryParamsRedacted: redacted,
-		IPHash:              ipHash(r.RemoteAddr),
-		ResponseCode:        code,
-	})
-}
+// requireAccessRecord and recordAccess -- the access record both compliance
+// endpoints write before they answer -- live in compliance_access.go. They are
+// shared by GET /v2/compliance/audit and GET /v2/compliance/report, and this file
+// is already at the 300-line ceiling this project holds every file to, which is
+// the second reason they are their own file rather than a section here.

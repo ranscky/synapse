@@ -16,22 +16,24 @@ import (
 	"synapse/internal/trace"
 )
 
-// ComplianceAuditor is everything GET /v2/compliance/audit needs from
-// synapse_global: one page of a tenant's signed ledger entries, and the record
-// that the page was read.
+// ComplianceAuditor is everything the two compliance endpoints need from
+// synapse_global: one page of a tenant's signed ledger entries, one window's worth
+// of raw report material, and the record that either was read.
 //
 // Like MemoryWriter, MemorySearcher, and LedgerVerifier it is declared on the
 // consumer side, so this package depends on a behaviour rather than on a
-// database handle and the endpoint is testable without PostgreSQL. The
+// database handle and the endpoints are testable without PostgreSQL. The
 // implementation lives in internal/ledger (the package that already owns the
 // ledger table's name and read path) and is bound in cmd/plane, the one place
 // that can see both packages.
 //
-// The two capabilities travel in one interface because they are one thing to a
+// The three capabilities travel in one interface because they are one thing to a
 // caller -- "read a tenant's audit history and record that it happened" -- and
-// because this endpoint needs both before it will answer at all: the record is
-// written first, so an implementation that cannot write one cannot serve a read
-// either.
+// because both readers need the record before they will answer at all: the record
+// is written first, so an implementation that cannot write one cannot serve a read
+// either. The report's own arithmetic deliberately does *not* live here: it is a
+// pure function of the facts (see compliance_report_build.go), which is what keeps
+// it testable without a database.
 type ComplianceAuditor interface {
 	// AuditPage returns one page of tenantID's ledger entries, newest first,
 	// restricted to the filter's inclusive time window, together with the total
@@ -42,8 +44,19 @@ type ComplianceAuditor interface {
 	// a caller can only ever page through its own chain. Soft-deleted rows are
 	// excluded, the same way the chain walk excludes them.
 	AuditPage(ctx context.Context, tenantID string, filter AuditFilter) (AuditPage, error)
+	// ReportFacts returns the window's raw material: every ledger entry it
+	// holds, newest first, plus the metering totals it holds. It is the whole
+	// window rather than a page, because a report covers the period it names --
+	// a page of it would be a report about a page.
+	//
+	// The rows carry trace_json as stored, unparsed: what the traces *mean* is
+	// the HTTP layer's contract (see buildComplianceReport), and a store that
+	// interpreted them would be a second place for the report's numbers to be
+	// computed. An empty window is a zero-length slice and a UsageTotals with
+	// HasRows false, never an error.
+	ReportFacts(ctx context.Context, tenantID string, window ReportWindow) (ReportFacts, error)
 	// RecordAccess writes one row of synapse_global.compliance_access_log: who
-	// read what, with what window, from which hashed address, and what this
+	// read what, with what window, from which hashed address, and what the
 	// endpoint answered. It is called before the answer is written, and its
 	// failure is what refuses the read.
 	RecordAccess(ctx context.Context, record AccessRecord) error
@@ -112,7 +125,8 @@ type AccessRecord struct {
 	// TenantID is the verified token's tenant, and the column the row is keyed
 	// by.
 	TenantID string
-	// Endpoint is the path that was called -- complianceAuditRoute here.
+	// Endpoint is the path that was called -- complianceAuditRoute or
+	// complianceReportRoute.
 	Endpoint string
 	// QueryParamsRedacted is the caller's window and paging, re-rendered. See
 	// parseAuditParams for what is and is not in it.

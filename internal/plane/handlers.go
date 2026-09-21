@@ -106,15 +106,16 @@ func NewServer(
 
 // Routes returns the plane's router: GET /health is open, POST /v2/tenants is
 // behind the admin token, and POST /v2/sync/memories, GET /v2/memories/search,
-// GET /v2/ledger/verify, and GET /v2/compliance/audit are behind a tenant token.
+// GET /v2/ledger/verify, GET /v2/compliance/audit, and GET
+// /v2/compliance/report are behind a tenant token.
 //
 // The ledger route is tenant-scoped rather than admin-guarded on purpose: the
 // chain it verifies is the caller's own (the tenant id comes from the verified
 // token), so verification is the tenant's own audit of its own records rather
-// than an operator reading someone else's. The compliance route is tenant-scoped
-// for the same reason and adds one gate of its own -- the token's compliance tier
-// -- which the handler applies, because it is a property of the caller rather
-// than of the route.
+// than an operator reading someone else's. The two compliance routes are
+// tenant-scoped for the same reason and add one gate of their own -- the token's
+// compliance tier -- which the handlers apply, because it is a property of the
+// caller rather than of the route.
 func (s *Server) Routes() http.Handler {
 	router := chi.NewRouter()
 	router.Get("/health", s.handleHealth)
@@ -123,6 +124,7 @@ func (s *Server) Routes() http.Handler {
 	router.With(s.requireJWT).Get(searchRoute, s.handleSearchMemories)
 	router.With(s.requireJWT).Get(ledgerVerifyRoute, s.handleVerifyLedger)
 	router.With(s.requireJWT).Get(complianceAuditRoute, s.handleComplianceAudit)
+	router.With(s.requireJWT).Get(complianceReportRoute, s.handleComplianceReport)
 
 	return router
 }

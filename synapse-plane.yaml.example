@@ -57,3 +57,14 @@ log-level: "info"
 # ledger table is append-only and is never updated or deleted, so this value
 # never triggers data removal. No environment override.
 ledger-retention-days: 365
+
+# HTML template GET /v2/compliance/report?format=pdf renders its document from,
+# relative to the plane's working directory. Blank means the default below.
+#
+# It is not a secret and not a requirement: a plane that only ever serves the
+# JSON report boots fine without this file, and a PDF request against a missing
+# template is a logged 500 rather than a startup failure. The PDF renderer
+# itself (wkhtmltopdf, or chromium/google-chrome --headless --print-to-pdf) is
+# resolved from PATH at request time; with none installed, ?format=pdf answers
+# 503 with the fix in its body. No environment override.
+report-template: "ui/plane/compliance-report.html"
