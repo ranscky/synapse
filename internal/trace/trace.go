@@ -27,7 +27,15 @@ type TraceManifest struct {
 	Memories              []TraceMemory `json:"memories"`
 }
 
-// TraceMemory represents a memory entry in the trace manifest
+// TraceMemory represents a memory entry in the trace manifest.
+//
+// The two provenance fields at the end answer a different question from the
+// four scores: not "how well did this memory rank" but "whose memory is this".
+// AgentID echoes the memory's own agent as its backend returned it, and
+// CrossAgent says whether that agent is a different one from the node that
+// assembled this context -- which is the one thing a node cannot tell from the
+// scores alone, because a memory pulled from a shared plane and a memory of its
+// own look identical once they are scored.
 type TraceMemory struct {
 	ID                 string  `json:"id"`
 	MemoryType         string  `json:"memory_type"`
@@ -40,6 +48,8 @@ type TraceMemory struct {
 	Included           bool    `json:"included"`
 	ExclusionReason    string  `json:"exclusion_reason,omitempty"`
 	SupersededBy       string  `json:"superseded_by,omitempty"`
+	AgentID            string  `json:"agent_id"`    // The agent that wrote this memory: the node that pushed it to a control plane, or this node on a locally written row. Empty for a backend that records no agent at all (the local SQLite store: one file is one agent), which is also the value a standalone node sees for every memory it wrote itself. Marshaled unconditionally, so every entry says where it stands rather than leaving the reader to guess.
+	CrossAgent         bool    `json:"cross_agent"` // True when AgentID names an agent other than the node that assembled this context. A blank AgentID is unattributed, not someone else, so it never sets this: a standalone node's own memories are not cross-agent. Marshaled unconditionally for the same reason as AgentID.
 }
 
 // NewTraceManifest creates a new trace manifest from pipeline data.
@@ -48,6 +58,14 @@ type TraceMemory struct {
 // survived the similarity pass. Anything in scoredMemories but NOT in
 // dedupedMemories was dropped as a duplicate. Anything in dedupedMemories but
 // NOT in selectedMemories was dropped because it didn't fit the token budget.
+//
+// localAgentID is the agent-id of the node building this manifest (its
+// config.AgentID). It is compared against each memory's own AgentID to set
+// TraceMemory.CrossAgent, and it is the only thing that can make a memory
+// cross-agent: an entry with no agent of its own is unattributed rather than
+// someone else's, so a standalone node — which has no id and whose memories have
+// no agent either — reports every entry as not cross-agent rather than
+// flagging all of them.
 func NewTraceManifest(
 	requestID string,
 	intent string,
@@ -61,6 +79,7 @@ func NewTraceManifest(
 	scoredMemories []scorer.ScoredMemory,
 	dedupedMemories []scorer.ScoredMemory,
 	selectedMemories []scorer.ScoredMemory,
+	localAgentID string,
 ) *TraceManifest {
 	// Build lookup maps for O(1) membership checks.
 	dedupedMap := make(map[string]bool, len(dedupedMemories))
@@ -112,6 +131,13 @@ func NewTraceManifest(
 			Included:           included,
 			ExclusionReason:    exclusionReason,
 			SupersededBy:       memory.SupersededBy,
+			// Provenance. AgentID is whatever the memory's own backend put
+			// there (the plane's agent_id column for a pulled candidate, empty
+			// for the local SQLite store); CrossAgent is that value measured
+			// against this node's own id, and stays false when the memory
+			// carries no agent at all -- unattributed is not another agent's.
+			AgentID:    memory.AgentID,
+			CrossAgent: memory.AgentID != "" && memory.AgentID != localAgentID,
 		}
 	}
 

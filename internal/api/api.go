@@ -351,6 +351,10 @@ func (a *APIServer) runCompilePipeline(ctx context.Context, sessionID string, me
 		time.Since(compileStart).Milliseconds(),
 		scoredMemories,
 		deduplicated,
+		// This node's own agent-id, so the trace can say whether a compiled
+		// memory came from another agent (Phase 11). Same config value the
+		// retrieval scope above is built from -- not anything from the request.
+		a.config.AgentID,
 	)
 	compileResult.Trace.TokensUsed = totalTokens
 	

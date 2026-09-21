@@ -197,6 +197,7 @@ func TestIntegration(t *testing.T) {
 			nil,
 			nil,
 			[]scorer.ScoredMemory{},
+			"",
 		)
 
 		// Test saving trace

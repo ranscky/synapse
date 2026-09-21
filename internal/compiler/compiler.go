@@ -17,6 +17,14 @@ type CompileResult struct {
 }
 
 // Compile assembles the final message context from original messages, selected memories, and last user message
+//
+// localAgentID is the compiling node's own agent-id (config.AgentID), and it is
+// used for attribution only -- it decides nothing about what is scored or
+// selected, and it never widens what a caller may read. It is what every traced
+// memory's cross_agent is measured against: a memory whose own agent_id is
+// different from this one came from another agent. Pass "" for a node with no
+// identity of its own (a standalone node): nothing can be attributed to anyone
+// there, so no memory is ever reported as cross-agent.
 func Compile(
 	selected []scorer.ScoredMemory,
 	lastUserMessage string,
@@ -29,6 +37,7 @@ func Compile(
 	compileDurationMs int64,
 	allScoredMemories []scorer.ScoredMemory,
 	dedupedMemories []scorer.ScoredMemory,
+	localAgentID string,
 ) *CompileResult {
 	compileStart := time.Now()
 
@@ -89,6 +98,7 @@ func Compile(
 		allScoredMemories,
 		dedupedMemories,
 		selected,
+		localAgentID,
 	)
 
 	return &CompileResult{
@@ -97,7 +107,10 @@ func Compile(
 	}
 }
 
-// CompileWithContext includes system message if present
+// CompileWithContext includes system message if present.
+//
+// localAgentID is forwarded to Compile unchanged; see its doc comment for what
+// it means.
 func CompileWithContext(
 	systemMessage string,
 	selected []scorer.ScoredMemory,
@@ -111,6 +124,7 @@ func CompileWithContext(
 	compileDurationMs int64,
 	allScoredMemories []scorer.ScoredMemory,
 	dedupedMemories []scorer.ScoredMemory,
+	localAgentID string,
 ) *CompileResult {
 	result := make([]map[string]interface{}, 0)
 
@@ -133,6 +147,7 @@ func CompileWithContext(
 		compileDurationMs,
 		allScoredMemories,
 		dedupedMemories,
+		localAgentID,
 	)
 	result = append(result, compileResult.Messages...)
 

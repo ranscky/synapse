@@ -113,6 +113,14 @@
             "type": "string",
             "enum": ["deduped", "budget_exceeded", "null"],
             "description": "Reason for exclusion if not included"
+          },
+          "agent_id": {
+            "type": "string",
+            "description": "The agent that wrote this memory, echoed from the memory's own backend: the agent_id of the edge that pushed it for a candidate pulled from a control plane, or the local node on a locally written row. Empty when the backend records no agent at all -- the local SQLite store has no agent column, because one file is one agent, so a standalone node's own memories are unattributed. Always present on every entry, included or not: an empty string means unattributed, never another agent."
+          },
+          "cross_agent": {
+            "type": "boolean",
+            "description": "True when agent_id names an agent other than the node that assembled this context, i.e. when this memory came from another agent. False when the memory belongs to the compiling node or carries no agent at all -- unattributed is not someone else's, so a standalone node never reports one of its own memories as cross-agent. Always present on every entry, included or not."
           }
         },
         "required": [
@@ -124,7 +132,9 @@
           "score_importance",
           "score_task_alignment",
           "score_total",
-          "included"
+          "included",
+          "agent_id",
+          "cross_agent"
         ]
       }
     }

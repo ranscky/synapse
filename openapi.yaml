@@ -299,6 +299,8 @@ components:
         - score_task_alignment
         - score_total
         - included
+        - agent_id
+        - cross_agent
       properties:
         id:
           type: string
@@ -333,6 +335,23 @@ components:
         exclusion_reason:
           type: string
           enum: [deduped, budget_exceeded, null]
+        agent_id:
+          type: string
+          description: >-
+            The agent that wrote this memory, echoed from the memory's own
+            backend: the agent_id of the edge that pushed it for a candidate
+            pulled from a control plane, or the local node on a locally written
+            row. Empty when the backend records no agent at all (the local
+            SQLite store has no agent column -- one file is one agent). Always
+            present on every entry, including excluded ones; an empty string
+            means unattributed, never another agent.
+        cross_agent:
+          type: boolean
+          description: >-
+            True when agent_id names an agent other than the node that assembled
+            this context, i.e. when this memory came from another agent. False
+            when the memory belongs to the compiling node or carries no agent at
+            all. Always present on every entry, including excluded ones.
 
     MemoryEntry:
       type: object

@@ -177,6 +177,8 @@
         .trace-mem-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
         .trace-mem-preview { font-size: 12px; color: var(--text-mid); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
         .excl-badge { font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; padding: 2px 7px; background: var(--burn-dim); color: var(--burn); border: 1px solid rgba(255,107,43,0.3); flex-shrink: 0; }
+        /* Phase 11: a memory another agent wrote. Violet rather than the burn orange the exclusion badge uses -- provenance, not a rejection. The agent id is part of the label. */
+        .cross-agent-badge { font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; padding: 2px 7px; background: rgba(139,92,246,0.12); color: var(--violet); border: 1px solid rgba(139,92,246,0.35); flex-shrink: 0; }
         .trace-mem-scores { padding: 11px 15px 13px; }
 
         .score-bar { height: 20px; background: #111; border: 1px solid var(--border); display: flex; overflow: hidden; margin-bottom: 9px; }
@@ -415,6 +417,7 @@
                 <div class="trace-mem-head">
                     <div class="trace-mem-left">
                         <span class="type-badge type-${memory.memory_type}">${memory.memory_type}</span>
+                        ${memory.cross_agent ? `<span class="cross-agent-badge" title="Written by agent ${memory.agent_id}">cross-agent: ${memory.agent_id}</span>` : ''}
                         <span class="trace-mem-preview">${memory.content_preview.substring(0, 90)}${memory.content_preview.length > 90 ? '…' : ''}</span>
                     </div>
                     ${!memory.included ? `<span class="excl-badge"${memory.superseded_by ? ` title="Superseded by ${memory.superseded_by}"` : ''}>${memory.exclusion_reason === 'superseded' && memory.superseded_by ? `superseded &rarr; ${memory.superseded_by.slice(0, 8)}` : (memory.exclusion_reason || 'excluded')}</span>` : ''}

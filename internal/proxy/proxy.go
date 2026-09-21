@@ -625,6 +625,10 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		0, // placeholder -- real duration set below, after Compile() actually runs
 		scoredMemories,
 		deduplicated,
+		// This node's own agent-id, so the trace can say whether a compiled
+		// memory came from another agent (Phase 11). Same config value the
+		// retrieval scope above is built from -- never a header or a body.
+		p.config.AgentID,
 	)
 	compileDuration := time.Since(compileStart)
 

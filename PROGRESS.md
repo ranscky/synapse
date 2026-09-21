@@ -2152,3 +2152,280 @@ Next phase: mark memories `sync_pending` on the write path (still the piece
 Phase 8 expected Phase 9 to be), or make the edge stamp `default-visibility` onto
 what it writes — both are now the missing halves of a pipeline whose ends exist.
 
+
+## Phase 11 — cross_agent field in the Memory Trace (complete)
+
+Commit `feat: Phase 11 - cross_agent field in Memory Trace`
+
+The scores in a trace say how well a memory ranked. None of them say *whose*
+memory it was — and once an edge node pulls candidates from a shared plane, a
+memory another agent wrote and a memory this node wrote are indistinguishable in
+the compiled output: same four scores, same preview, same entry shape. This phase
+adds the two fields that answer that question, and nothing else.
+
+```go
+// internal/trace/trace.go
+type TraceMemory struct {
+	...
+	AgentID    string `json:"agent_id"`    // the memory's own agent, as its backend returned it
+	CrossAgent bool   `json:"cross_agent"` // that agent is not the one that built this context
+}
+```
+
+`CrossAgent` is `memory.AgentID != "" && memory.AgentID != localAgentID`, where
+`localAgentID` is the compiling node's `config.AgentID`. A blank `AgentID` is
+**unattributed, not someone else's**: the local SQLite backend has no agent column
+(one file is one agent) and a standalone node has no configured id, so its own
+memories must not come out flagged as cross-agent. Neither field carries
+`omitempty`, so every entry — included or excluded — says where it stands instead
+of leaving "absent" to be read as a third state.
+
+### Where the identity comes from
+
+`cfg.AgentID` lived only in the two v1 callers: `internal/api/api.go`'s
+`a.config.AgentID` (already used to build the retrieval scope) and
+`internal/proxy/proxy.go`'s `p.config.AgentID`. It is now threaded explicitly as
+one new final parameter through `compiler.Compile`,
+`compiler.CompileWithContext`, and `trace.NewTraceManifest`. That is three
+mechanical call-site additions and no logic change in any v1 file. The
+alternative — a package-level default set at boot — was rejected because the
+project rule is no global state, and because it would make the meaning of a trace
+depend on init order.
+
+| File | Change |
+| --- | --- |
+| `internal/trace/trace.go` | `TraceMemory.AgentID`/`.CrossAgent`; `NewTraceManifest` takes `localAgentID` and stamps both on every entry it builds |
+| `internal/compiler/compiler.go` | `Compile`/`CompileWithContext` take `localAgentID` and forward it to `NewTraceManifest` |
+| `internal/api/api.go`, `internal/proxy/proxy.go` | pass `config.AgentID` — one argument each, no other edit |
+| `internal/api/integration_test.go` | that test's direct `NewTraceManifest` call passes `""` |
+| `schemas/memory-trace.schema.json`, `openapi.yaml` | `agent_id` (string) and `cross_agent` (boolean) on the memory entry, both in `required` |
+| `ui/index.html`, `ui/session.html` | a violet `cross-agent: <agent_id>` badge on entries where `cross_agent` is true |
+
+`scorer`, `store`, `dedup`, and `budget` needed no changes at all: `ScoredMemory`
+embeds `store.MemoryEntry`, which has carried `AgentID` since Phase 10, and
+`Deduplicate`/`Fill` copy whole `ScoredMemory` values — so provenance survives
+scoring, dedup, and the token budget intact (asserted in
+`TestCompile_TraceAgentProvenance` rather than assumed).
+
+### The two UI files are independent, and both needed the badge
+
+Neither inspector renders a trace entry as generic key/value pairs: each builds
+the entry field by field in its own `renderMemoryTrace`, so `agent_id` and
+`cross_agent` were invisible in both. Both files got the badge and their own CSS
+rule. `session.html`'s entries additionally open a raw JSON dump on click (so
+`agent_id` is visible there twice); `index.html`'s playground entries have no such
+modal, which is why the badge label carries the agent id rather than only the
+words "cross-agent".
+
+### Verification (real output, this phase)
+
+```text
+$ gofmt -l <every file touched>
+(each of these v1 files is already unformatted at HEAD; the gofmt diff of each
+ HEAD revision was compared against the current one and the +/- line counts are
+ identical -- trace.go 34/34, compiler.go 4/4, trace_test.go 5/5,
+ compiler_test.go 64/64 -- so this phase added no new formatting dirt and
+ reformatted nothing pre-existing)
+
+$ go vet ./...
+(no output)                                                    EXIT=0
+
+$ go build ./...
+BUILD OK
+$ CGO_ENABLED=0 go build -o /dev/null ./cmd/plane
+CGO_ENABLED=0 PLANE BUILD OK
+
+$ go test ./... -count=1
+ok  synapse/internal/api 0.980s          ok  synapse/internal/proxy 0.216s
+ok  synapse/internal/budget 0.534s       ok  synapse/internal/retrieval 0.008s
+ok  synapse/internal/classifier 0.023s   ok  synapse/internal/scorer 0.008s
+ok  synapse/internal/compiler 0.564s     ok  synapse/internal/store 20.853s
+ok  synapse/internal/config 0.011s       ok  synapse/internal/supersession 0.005s
+ok  synapse/internal/dedup 0.015s        ok  synapse/internal/sync 20.954s
+ok  synapse/internal/embedder 3.505s     ok  synapse/internal/tenant 0.802s
+ok  synapse/internal/integration 4.787s  ok  synapse/internal/trace 0.174s
+ok  synapse/internal/plane 0.083s
+                                                               EXIT=0
+
+$ SYNAPSE_TEST_DB_DSN='...' go test ./internal/store/... -run TestVisibility -count=1
+--- PASS: TestVisibilityScopes (0.33s)              [4 subtests]
+--- PASS: TestVisibilityTeamScopes (0.74s)          [4 subtests]
+--- PASS: TestVisibilityWriteNormalization (0.64s)  [3 subtests]
+ok  synapse/internal/store 2.729s                              EXIT=0
+
+$ go test ./internal/trace/ -run 'TestNewTraceManifest|TestTraceMemory' -v
+--- PASS: TestNewTraceManifest_ExclusionReasons
+--- PASS: TestNewTraceManifest_SupersededByOmittedWhenNotSuperseded
+--- PASS: TestNewTraceManifest_AgentProvenance (0.00s)
+    --- PASS: .../another_agent's_memory_is_cross-agent
+    --- PASS: .../this_node's_own_memory_is_not
+    --- PASS: .../an_unattributed_memory_is_not_cross-agent
+    --- PASS: .../a_standalone_node_reports_nothing_as_cross-agent
+    --- PASS: .../a_plane_memory_is_cross-agent_even_for_a_node_with_no_id
+--- PASS: TestTraceMemory_ProvenanceAlwaysMarshaled
+PASS
+
+$ go test ./internal/compiler/ -run TestCompile_TraceAgentProvenance -v
+--- PASS: TestCompile_TraceAgentProvenance (0.14s)
+```
+
+Live end-to-end test — real binaries, real Postgres, two edge configs. The
+compose `db` service came up healthy; the plane ran with its four secrets from
+the environment and no config file; each edge ran with `agent-id`, its own
+`control-plane-api-key`, its own `db-path`, and its own loopback port. Both config
+files were written 0600 via `umask 077`, and the tenant JWT never appears in
+anything printed below.
+
+```text
+$ cd deploy && docker compose up -d db      # pgvector/pgvector:pg16
+$ docker compose ps db --format '{{.Status}}'
+Up 10 seconds (healthy)
+
+$ SYNAPSE_DB_DSN='postgres://...' SYNAPSE_JWT_SECRET='…' SYNAPSE_ADMIN_TOKEN='…' \
+  SYNAPSE_MASTER_KEY='…' ./bin/plane > /tmp/synapse-phase11/plane.log 2>&1 &
+$ curl -s http://127.0.0.1:9090/health
+{"status":"ok","version":"2.0.0","db":"connected"}
+
+# requireAdmin compares the raw Authorization header, so the admin token is sent
+# without a "Bearer " prefix here (the tenant JWT is the one that takes Bearer).
+$ curl -s -X POST http://127.0.0.1:9090/v2/tenants -H 'Authorization: <admin token>' \
+      -H 'Content-Type: application/json' -d '{"slug":"phase11-edge"}' -o tenant.json
+$ jq '{tenant_id, jwt_len: (.jwt|length)}' tenant.json
+{ "tenant_id": "418f3cfe-22eb-49c7-8070-973bf4fa0db7", "jwt_len": 387 }
+
+# --- edge_a (agent-id: agent_a) writes one session ----------------------------
+$ ./bin/synapse --config /tmp/synapse-phase11/edge_a.yaml &
+INFO synapse: Store initialized db_path=/tmp/synapse-phase11/edge_a.db
+INFO synapse: sync: background flusher started control_plane_url=…/v2/sync/memories \
+     agent_id=agent_a interval_seconds=30 batch_size=20
+INFO synapse: Starting Synapse proxy address=127.0.0.1:8081 upstream=http://127.0.0.1:11434
+
+$ curl -s -X POST http://127.0.0.1:8081/v1/compile -H 'Content-Type: application/json' \
+    -d '{"session_id":"sess-phase11-a","messages":[{"role":"user","content":"PLANE-ORG-DECISION: we decided the retrieval pipeline embeds the query exactly once per turn."}]}'
+HTTP 200
+$ jq '.trace | {candidates_retrieved, memories_compiled}' compile_a.json
+{ "candidates_retrieved": 0, "memories_compiled": 0 }   # the tenant's schema is still empty
+
+# the memory edge_a just wrote is on local disk only -- nothing marks it
+# sync_pending, so the background flusher has nothing to push (see findings)
+$ python3 -c "import sqlite3;print(sqlite3.connect('/tmp/synapse-phase11/edge_a.db').execute('select id, session_id, memory_type, sync_status, length(embedding) from memories').fetchall())"
+[('req-1789988915117028336', 'sess-phase11-a', 'decision', 'local_only', 1536)]
+
+# --- that exact row goes to the plane through the documented push protocol ----
+# (the same body shape and route sync.Syncer.Push uses, envelope naming agent_a;
+#  the embedding is read back out of edge_a's own row, 384 floats)
+$ curl -s -X POST http://127.0.0.1:9090/v2/sync/memories -H "Authorization: Bearer $JWT" \
+    -H 'Content-Type: application/json' -d @push.json
+{"written":1,"sanitized":0} HTTP 200
+plane.log: INFO plane: Memories synced tenant_slug=phase11-edge agent_id=agent_a written=1 sanitized=0
+
+$ docker compose exec -T db psql -U synapse -d synapse \
+    -c "select agent_id, visibility, session_id, left(content,45) from tenant_phase11_edge.memories"
+ agent_id | visibility |   session_id   |                    content
+----------+------------+----------------+-----------------------------------------------
+ agent_a  | org        | sess-phase11-a | PLANE-ORG-DECISION: we decided the retrieval
+```
+
+```text
+# --- edge_b (agent-id: agent_b) compiles a NEW session ------------------------
+$ ./bin/synapse --config /tmp/synapse-phase11/edge_b.yaml &
+INFO synapse: sync: background flusher started agent_id=agent_b interval_seconds=30 batch_size=20
+INFO synapse: Starting Synapse proxy address=127.0.0.1:8082 upstream=http://127.0.0.1:11434
+
+$ curl -s -X POST http://127.0.0.1:8082/v1/compile -H 'Content-Type: application/json' \
+    -d '{"session_id":"sess-phase11-b","messages":[{"role":"user","content":"what did we decide about the retrieval pipeline?"}]}' \
+    -o compile_b.json -w 'HTTP %{http_code} in %{time_total}s\n'
+HTTP 200 in 0.136244s
+$ jq '.trace | {candidates_retrieved, candidates_after_dedup, memories_compiled, tokens_used,
+                memories: [.memories[] | {id, memory_type, agent_id, cross_agent, included}]}' compile_b.json
+{
+  "candidates_retrieved": 1, "candidates_after_dedup": 1,
+  "memories_compiled": 1, "tokens_used": 22,
+  "memories": [
+    { "id": "84b67539-c16a-563c-914d-2532a39e4d0b", "memory_type": "decision",
+      "agent_id": "agent_a", "cross_agent": true, "included": true }
+  ]
+}
+$ jq -r '.compiled_messages[] | "[\(.role)] \(.content)"' compile_b.json
+[user] [Memory: decision] PLANE-ORG-DECISION: we decided the retrieval pipeline embeds the query exactly once per turn.
+
+what did we decide about the retrieval pipeline?
+plane.log: INFO plane: Memories searched tenant_slug=phase11-edge agent_id="" request_agent_id=agent_b memories=1
+
+# every entry carries both keys, included or not -- the DoD's "on every memory
+# entry", asserted against the real response rather than eyeballed:
+$ jq 'all(.trace.memories[]; has("agent_id") and has("cross_agent"))' compile_b.json
+true
+```
+
+```text
+# --- the raw entry the session inspector itself receives ----------------------
+$ curl -s http://127.0.0.1:8082/api/sessions/69b9b106-c5ec-44a6-95d3-ee4e877b5e6b/trace | jq -c '.memories[0]'
+{"id":"84b67539-c16a-563c-914d-2532a39e4d0b","memory_type":"decision",
+ "content_preview":"PLANE-ORG-DECISION: we decided the retrieval pipeline embeds the query exactly once per turn.",
+ "score_semantic":0.5083690453533551,"score_recency":0.9994540326375881,"score_importance":1,
+ "score_task_alignment":0.5,"score_total":0.7032930214051009,"included":true,
+ "agent_id":"agent_a","cross_agent":true}
+
+# --- both inspectors actually render it ---------------------------------------
+# Each UI's own renderMemoryTrace was extracted from the HTML the server is
+# serving and executed against that JSON in node, so this is the markup a browser
+# inserts, not a description of it:
+ui/session.html  ->  <span class="cross-agent-badge" title="Written by agent agent_a">cross-agent: agent_a</span>
+ui/index.html    ->  <span class="cross-agent-badge" title="Written by agent agent_a">cross-agent: agent_a</span>
+# and for an entry with agent_id "" / cross_agent false, both emit no badge at all:
+ui/session.html  ->  <span class="type-badge type-decision">decision</span> <span class="trace-mem-preview">…</span>
+ui/index.html    ->  <span class="type-badge type-decision">decision</span> <span class="trace-mem-preview">…</span>
+```
+
+```text
+# --- control: the plane is killed, so edge_b compiles from its own SQLite ------
+$ kill $(pgrep -f 'bin/plane')
+edge_b.log: WARN synapse: Control plane candidate pull failed, falling back to local search
+            plane_unavailable=true fallback=local
+            error="sync: search request: Get \"http://127.0.0.1:9090/v2/memories/search\": dial tcp 127.0.0.1:9090: connect: connection refused"
+$ curl -s -X POST http://127.0.0.1:8082/v1/compile -H 'Content-Type: application/json' \
+    -d '{"session_id":"sess-phase11-b","messages":[{"role":"user","content":"what did we decide about the retrieval pipeline?"}]}'
+HTTP 200 in 0.037175s
+$ jq '.trace.memories[] | {memory_type, agent_id, cross_agent, included}' compile_b_offline.json
+{ "memory_type": "context", "agent_id": "", "cross_agent": false, "included": true }
+```
+
+That last pair is the whole phase in two entries: the same node, the same flag,
+`true` for the memory the plane attributed to `agent_a` and `false` for the row
+the node wrote itself. A flag that only meant "this memory came from somewhere
+else", or only "this memory has an agent id", could not produce both.
+
+### Findings this phase surfaced (not fixed here — this phase is one field)
+
+1. **Nothing marks a locally written memory `sync_pending`**, so
+   `RunBackground`'s queue is always empty and the flusher never pushes anything:
+   attribution reaches the plane only through a push that something else drives.
+   This verification drove it with the documented endpoint, exactly as
+   `sync.Syncer.Push` would. Phase 10's closing note already lists this as the next
+   phase's work, and this phase's live run is the second time it has come up.
+2. **Two agents in one tenant cannot each hold an agent-scoped token.**
+   `POST /v2/tenants` with an `agent_id` creates a *new* tenant schema, and no
+   route mints a second token for an existing tenant. The run above therefore used
+   one tenant-level token (no agent claim) for both edges, which the plane
+   deliberately allows to name whichever node presents it
+   (`internal/plane/search.go`), while each edge declares its own `agent-id` in
+   config. That is exactly the scenario this phase's flag is about — an org memory
+   another agent wrote, surfaced to this one — but per-agent credentials inside one
+   tenant are still missing.
+3. **`memoryUUID` maps edge ids onto the plane.** `internal/tenant/memorywriter.go`
+   turns the edge's non-uuid ids (`req-<nano>`) into a deterministic SHA-1 uuid,
+   which is why the trace entry above names
+   `84b67539-c16a-563c-914d-2532a39e4d0b` rather than `req-1789988915117028336`.
+   Worth knowing before correlating a trace entry with a local row.
+4. **A hand-built push body must use an RFC3339 timestamp.** The SQLite column
+   holds Go's non-RFC3339 `time.Time` string (`2026-09-21 11:08:35.117+00:00`) and
+   the plane answers `invalid_body` for it, because its decoder is strict. Not a
+   defect in the protocol — the real edge marshals the struct, which produces
+   RFC3339 — but it is the trap for anyone scripting the endpoint by hand.
+
+Next phase: mark memories `sync_pending` on the write path, and give an existing
+tenant a way to mint per-agent tokens, so attributed memories reach the plane
+without a hand-driven push. Those are the two gaps left between "a trace can say
+this came from agent_a" and "a node's memories get there on their own".
+

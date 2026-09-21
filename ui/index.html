@@ -566,6 +566,22 @@ input[type="number"] {
     border: 1px solid rgba(255, 107, 43, 0.3);
     flex-shrink: 0;
 }
+/* Phase 11: a memory another agent wrote. Violet rather than the burn orange
+   the exclusion badge uses -- "someone else wrote this" is provenance, not a
+   rejection. The agent id is part of the label, so the trace says which agent
+   rather than only that it was not this node. */
+.cross-agent-badge {
+    font-family: var(--font-mono);
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    background: rgba(139, 92, 246, 0.12);
+    color: var(--violet);
+    border: 1px solid rgba(139, 92, 246, 0.35);
+    flex-shrink: 0;
+}
 
 .trace-mem-scores { padding: 8px 11px 10px; }
 .score-bar { height: 16px; background: #111; border: 1px solid var(--border); display: flex; overflow: hidden; margin-bottom: 6px; }
@@ -1128,6 +1144,7 @@ function renderMemoryTrace(memory) {
             <div class="trace-mem-head">
                 <div class="trace-mem-left">
                     <span class="type-badge type-${memory.memory_type}">${memory.memory_type}</span>
+                    ${memory.cross_agent ? `<span class="cross-agent-badge" title="Written by agent ${memory.agent_id}">cross-agent: ${memory.agent_id}</span>` : ''}
                     <span class="trace-mem-preview">${memory.content_preview.substring(0, 40)}${memory.content_preview.length > 40 ? '…' : ''}</span>
                 </div>
                 ${!memory.included ? `<span class="excl-badge"${memory.superseded_by ? ` title="Superseded by ${memory.superseded_by}"` : ''}>${memory.exclusion_reason === 'superseded' && memory.superseded_by ? `superseded &rarr; ${memory.superseded_by.slice(0, 8)}` : (memory.exclusion_reason || 'excluded')}</span>` : ''}

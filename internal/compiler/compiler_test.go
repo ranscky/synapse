@@ -7,6 +7,7 @@ import (
 
 	"synapse/internal/scorer"
 	"synapse/internal/store"
+	"synapse/internal/trace"
 )
 
 func TestCompile(t *testing.T) {
@@ -73,6 +74,7 @@ func TestCompile(t *testing.T) {
 				10,
 				tt.selected,
 				[]scorer.ScoredMemory{mem1},
+				"",
 			)
 			
 			if len(result.Messages) != tt.expectedLength {
@@ -143,6 +145,7 @@ func TestCompileWithContext(t *testing.T) {
 				10,
 				tt.selected,
 				[]scorer.ScoredMemory{mem1},
+				"",
 			)
 			
 			if len(result.Messages) != tt.expectedLength {
@@ -184,6 +187,7 @@ func TestMemoryHeaders(t *testing.T) {
 		10,
 		[]scorer.ScoredMemory{mem1},
 		[]scorer.ScoredMemory{mem1},
+		"",
 	)
 	
 	if len(result.Messages) < 1 {
@@ -202,4 +206,68 @@ func TestMemoryHeaders(t *testing.T) {
 // Helper function to check if string contains substring
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
+}
+
+// TestCompile_TraceAgentProvenance proves the Phase 11 provenance fields make it
+// all the way through the real compile path rather than only through
+// trace.NewTraceManifest in isolation: a candidate that carries agent_a's
+// agent_id (what the plane returns for a memory another edge pushed) has to come
+// out of Compile's trace still naming agent_a and still flagged cross-agent,
+// next to a memory of this node's own that is neither. Dedup and the token
+// budget sit between the candidate list and the trace, so this is also the
+// assertion that both preserve the embedded MemoryEntry's agent.
+func TestCompile_TraceAgentProvenance(t *testing.T) {
+	fromAgentA := scorer.ScoredMemory{
+		MemoryEntry: store.MemoryEntry{
+			ID:         "plane-1",
+			SessionID:  "sess-agent-a",
+			Content:    "the org decided the retrieval pipeline embeds once per turn",
+			MemoryType: "decision",
+			Timestamp:  time.Now().Add(-30 * time.Minute),
+			AgentID:    "agent_a",
+		},
+		Total: 0.9,
+	}
+	local := scorer.ScoredMemory{
+		MemoryEntry: store.MemoryEntry{
+			ID:         "local-1",
+			SessionID:  "sess-agent-b",
+			Content:    "a local note about the retrieval pipeline",
+			MemoryType: "fact",
+			Timestamp:  time.Now().Add(-5 * time.Minute),
+		},
+		Total: 0.4,
+	}
+
+	result := Compile(
+		[]scorer.ScoredMemory{fromAgentA, local},
+		"what did we decide about the retrieval pipeline?",
+		"req-agent",
+		"generic",
+		0.5,
+		2,
+		2,
+		3000,
+		10,
+		[]scorer.ScoredMemory{fromAgentA, local},
+		[]scorer.ScoredMemory{fromAgentA, local},
+		"agent_b", // this node is agent_b
+	)
+
+	byID := make(map[string]trace.TraceMemory, len(result.Trace.Memories))
+	for _, memory := range result.Trace.Memories {
+		byID[memory.ID] = memory
+	}
+
+	if got, ok := byID["plane-1"]; !ok {
+		t.Fatal("plane-1 is missing from the trace")
+	} else if got.AgentID != "agent_a" || !got.CrossAgent {
+		t.Errorf("plane-1: agent_id=%q cross_agent=%v, want agent_a/true", got.AgentID, got.CrossAgent)
+	}
+
+	if got, ok := byID["local-1"]; !ok {
+		t.Fatal("local-1 is missing from the trace")
+	} else if got.AgentID != "" || got.CrossAgent {
+		t.Errorf("local-1: agent_id=%q cross_agent=%v, want \"\"/false", got.AgentID, got.CrossAgent)
+	}
 }
