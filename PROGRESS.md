@@ -3867,3 +3867,330 @@ what makes rotation safe to offer. The S/R/I/T breakdown and `trace_id` on the
 plane's own memory-search surface — the shape `.clinerules` already requires of MCP
 responses — is the other queued item, from Phase 14's findings.
 
+## Phase 17 — chain integrity Verify (complete)
+
+Scope was the ledger's read path and the one route that exposes it:
+`Ledger.Verify` walks one tenant's rows in chain order, recomputes every signature
+under that tenant's own secret, checks every link, and names the first entry that
+does not hold up; `GET /v2/ledger/verify` returns that finding as JSON, tenant-scoped
+by the verified token. Nothing was added to the write path, no v1 package was
+touched, and no request path signs anything yet — so in a running deployment the
+endpoint has nothing to verify until provisioning mints a secret (finding 1).
+
+Commit `feat: Phase 17 - chain integrity Verify`
+
+New files:
+
+- `internal/ledger/verify.go` — 158 lines: `ChainIntegrityResult` (an alias, see
+  decision 1), `verifyQuery`, and `Ledger.Verify` — fail-closed guards, a streamed
+  walk in `created_at` order, a per-row signature check and link check, and a named,
+  located first break. It runs on the pool's own connection, never as
+  `ledger_writer`: that role holds no SELECT at all (Phase 16 finding 3, inherited).
+- `internal/ledger/verify_test.go` — 262 lines, `//go:build integration`:
+  `TestVerify`, the three tamper tests (`TestVerifyDetectsTamperedTrace`,
+  `TestVerifyDetectsRewrittenSignature`, `TestVerifyDetectsRemovedRow`),
+  `TestVerifyDetectsTruncatedGenesis`, and the negative control
+  (`TestVerifyRejectsAnotherSecret`), plus the `chainedEntries` and `tamper` helpers.
+  Tampering is done with SQL against the real table, through a connection whose
+  privilege is asserted first.
+- `internal/ledger/verify_input_test.go` — 81 lines, same tag: the two cases that are
+  about *not* answering — `TestVerifyEmptyChain` and `TestVerifyRejectsUnusableInput`.
+  Split out because `verify_test.go` hit the 300-line ceiling.
+- `internal/plane/ledger.go` — 136 lines: `ledgerVerifyRoute`, the plane-owned
+  `ChainIntegrityResult` and `LedgerVerifier` (decision 1), and `handleVerifyLedger`.
+- `internal/plane/ledger_test.go` — 222 lines, no build tag, so CI runs it:
+  `TestVerifyLedgerRequiresAVerifiedTenantToken`,
+  `TestVerifyLedgerAnswersWithTheChainVerdict` (both outcomes, asserted as JSON),
+  `TestVerifyLedgerReportsAFailedCheckAsInternal`,
+  `TestVerifyLedgerFailsClosedWithoutAVerifier`, and
+  `TestVerifyLedgerRefusesAnUnverifiedRequest`.
+- `cmd/plane/ledger.go` — 63 lines: `ledgerVerifier`, the adapter that fetches a
+  tenant's secret with `tenant.GetSecret` and hands it to `Ledger.Verify`. It is the
+  only file that can see both internal/ledger and internal/plane.
+
+Changed files:
+
+- `internal/plane/handlers.go` — 178 → 201 lines: the `ledger LedgerVerifier` field,
+  the `NewServer` parameter and its documentation, and the route registration
+  (`router.With(s.requireJWT).Get(ledgerVerifyRoute, s.handleVerifyLedger)`).
+- `internal/plane/sync.go` — 242 → 273 lines: `tenantIDKey` and
+  `WithTenantID`/`TenantIDFromCtx`, the fourth verified claim this package republishes,
+  next to the three that were already there.
+- `internal/tenant/auth.go` — one line in `withClaims` (`plane.WithTenantID(ctx,
+  c.TenantID)`) plus its comment. The tenant's uuid is already in the signed token;
+  this is what makes it readable by an endpoint that cannot import internal/tenant.
+- `cmd/plane/main.go` — 8 lines: `newLedgerVerifier(pool)`, passed as `NewServer`'s
+  sixth argument.
+- `internal/plane/handlers_test.go`, `sync_test.go`, `search_test.go` — one extra
+  `nil` at each of the four `NewServer` call sites. No assertion changed.
+- `internal/ledger/doc.go` — Phase 17's contract, the file list, and the `-run
+  TestVerify` command.
+
+No new dependencies: `crypto/hmac` is stdlib and was already used by the write path.
+No v1 internal package was touched — `internal/ledger`, `internal/plane`,
+`internal/tenant`, and `cmd/plane` are all v2.
+
+Decisions made in this phase:
+
+- **The brief's result type could not be declared where the brief put it, and
+  declaring it twice was the one thing not to do.** `internal/plane` cannot import
+  `internal/ledger`: the ledger imports `internal/tenant` (schema name, writer role,
+  and now `GetSecret`) and `internal/tenant` imports the plane (the verified-claim
+  accessors `JWTMiddleware` publishes), so the import is a cycle —
+  `go list -deps ./internal/ledger` prints `synapse/internal/plane` today. The type is
+  therefore declared in the plane, where its only consumer is, and `internal/ledger`
+  aliases it: `type ChainIntegrityResult = plane.ChainIntegrityResult`. One definition,
+  so `entries_checked`/`chain_valid`/`first_break_id`/`first_break_at`/`checked_at`
+  cannot drift between the walk and the wire. This is the arrangement
+  `plane.ProvisionResult` already has, one endpoint over. The cost is honest and
+  recorded: a JSON-tagged type lives in the HTTP package, which is a mild layering
+  inversion, contained by keeping the interface, the type, and the handler in one new
+  file and the ledger's dependency on the plane explicit rather than hidden behind
+  `internal/tenant`.
+- **`Verify` is a new file, not an addition to `ledger.go`.** That file is 289 lines
+  and the walk plus its result type is ~110, so the brief's "add to ledger.go" was
+  impossible under the 300-line cap this project holds every file to. Same reason
+  `chain.go` and `secrets.go` exist. `verify_test.go` hit the same ceiling at 322 lines
+  and lost its two boundary cases to `verify_input_test.go`.
+- **The verified tenant uuid is republished, not looked up.** The chain is keyed by
+  `tenant_id uuid`, and the token already carries that value as its subject — but
+  internal/plane cannot read internal/tenant's context keys, so `plane.WithTenantID`
+  joins `WithTenantSlug`/`WithAgentID`/`WithTeamID` and `withClaims` publishes it. The
+  alternative was deleting a query's worth of work by resolving slug→uuid in the
+  adapter (`SELECT id FROM synapse_global.tenants WHERE slug = $1`) and touching no
+  other package; two extra round trips and a second source of truth for "which tenant
+  is this" were not worth avoiding one line.
+- **`hmac.Equal`, not `!=`.** Both sides are 64-character hex digests, so the lengths
+  always match and the comparison is constant time. A verifier has no reason to offer a
+  timing channel about how far into a digest two values agree.
+- **The walk starts at genesis, which is one check beyond the brief.** Seeding `prev`
+  with `genesisHash()` holds the first surviving row to the rule the write path applied
+  to it. It costs nothing and it is the *only* detector of a truncated chain: delete the
+  first entries and every remaining row's signature is still valid over its own fields,
+  so a signature-only walk reports a shortened ledger as valid. `TestVerifyDetectsTruncatedGenesis`
+  is that case, and it asserts the surviving signature still verifies, so the test fails
+  if the genesis link is removed and something else starts catching it.
+- **`EntriesChecked` counts the row that broke the chain.** A break at the fifth of ten
+  reports 5, and the walk stops there: once one row is unaccounted for, every later link
+  is unverifiable with it, and "how many were fine after the break" is not a question
+  this endpoint answers. Documented on the field, so the number is not read as "5
+  entries verified".
+- **A broken chain is a 200.** The check succeeded; `chain_valid: false` is the finding.
+  An error status would collapse "your ledger no longer verifies" into "the check could
+  not run", which is exactly the distinction an audit endpoint exists to draw. A check
+  that could not run — no verifier wired, database unreachable, no stored secret — is
+  500 with the one error body, and the underlying error is logged server-side only.
+- **The tamper tests rewrite the ledger through the application connection, and assert
+  that it can.** This deployment has no `postgres` role: compose sets
+  `POSTGRES_USER: synapse`, and `SELECT rolname, rolsuper FROM pg_roles` returns exactly
+  `synapse|t` and `ledger_writer|f`, so the application user *is* the superuser and the
+  table's owner — the same fact Phase 15 recorded when it ran its permission probes
+  inside `SET LOCAL ROLE ledger_writer`. `tamper` therefore asserts `rolsuper` (or
+  `has_table_privilege(..., 'UPDATE')`) before its statement, so the probe states its
+  precondition instead of passing vacuously on a database where nothing could be
+  rewritten, and so the tests make the threat model explicit: what they simulate is
+  precisely what the append-only grants cannot stop.
+- **The three ids are cast to `text` in the verification query.** `uuid::text` is the
+  canonical lowercase rendering, which is the exact string the signature covers, and
+  reading a uuid back as text is what `tenant.Store.CreateTenant` already does
+  (`RETURNING id::text`). One convention for one value; the values are identical to what
+  the brief's un-cast `SELECT` would have produced.
+- **The walk streams; it does not collect the chain.** Answering "where is the first
+  break" does not need one tenant's whole ledger in memory, and a verifier that loaded it
+  would be the slowest way to answer the cheapest question about a chain. `rows.Next()`
+  keeps exactly one predecessor hash.
+- **The route is tenant-scoped, not admin-guarded.** The chain verified is the caller's
+  own, chosen from the verified token's `tenant_id`, so this is a tenant auditing its own
+  records rather than an operator reading someone else's. There is no path, query, body,
+  or header parameter that names a tenant, which is what keeps the endpoint from becoming
+  a way to read another tenant's row ids and timestamps.
+
+Verification (real output, this phase):
+
+The compose stack from Phase 4 was already up for this phase (`deploy-db-1`,
+pgvector/pgvector:pg16, healthy, published on `127.0.0.1:5432`), which is the only
+precondition the integration tests need.
+
+```text
+$ gofmt -l internal/ledger internal/plane internal/tenant cmd/plane
+$ go vet ./...
+$ go vet -tags integration ./internal/ledger
+VET OK
+
+$ go test ./internal/ledger/... -run TestVerify -v -tags integration -count=1
+=== RUN   TestVerifyEmptyChain
+--- PASS: TestVerifyEmptyChain (0.09s)
+=== RUN   TestVerifyRejectsUnusableInput
+=== RUN   TestVerifyRejectsUnusableInput/no_ledger_at_all
+=== RUN   TestVerifyRejectsUnusableInput/no_database_pool
+=== RUN   TestVerifyRejectsUnusableInput/no_signing_secret
+=== RUN   TestVerifyRejectsUnusableInput/tenant_id_is_not_a_uuid
+--- PASS: TestVerifyRejectsUnusableInput (0.04s)
+    --- PASS: TestVerifyRejectsUnusableInput/no_ledger_at_all (0.00s)
+    --- PASS: TestVerifyRejectsUnusableInput/no_database_pool (0.00s)
+    --- PASS: TestVerifyRejectsUnusableInput/no_signing_secret (0.00s)
+    --- PASS: TestVerifyRejectsUnusableInput/tenant_id_is_not_a_uuid (0.00s)
+=== RUN   TestVerify
+--- PASS: TestVerify (0.17s)
+=== RUN   TestVerifyDetectsTamperedTrace
+--- PASS: TestVerifyDetectsTamperedTrace (0.19s)
+=== RUN   TestVerifyDetectsRewrittenSignature
+--- PASS: TestVerifyDetectsRewrittenSignature (0.17s)
+=== RUN   TestVerifyDetectsRemovedRow
+--- PASS: TestVerifyDetectsRemovedRow (0.17s)
+=== RUN   TestVerifyDetectsTruncatedGenesis
+--- PASS: TestVerifyDetectsTruncatedGenesis (0.17s)
+=== RUN   TestVerifyRejectsAnotherSecret
+--- PASS: TestVerifyRejectsAnotherSecret (0.27s)
+PASS
+ok  	synapse/internal/ledger	1.259s
+```
+
+The phase's headline case is in there: ten appends, `entry[4].trace_json` rewritten
+with SQL, and `FirstBreakID` is `entry[4].ID` with `EntriesChecked == 5`. Phase 16's
+tests still pass beside it, which is the check that verification did not quietly
+change the write path:
+
+```text
+$ go test ./internal/ledger/... -tags integration -count=1
+ok  	synapse/internal/ledger	1.630s
+
+$ go test ./internal/plane/... -run TestVerifyLedger -v -count=1
+=== RUN   TestVerifyLedgerRequiresAVerifiedTenantToken
+--- PASS: TestVerifyLedgerRequiresAVerifiedTenantToken (0.00s)
+    --- PASS: TestVerifyLedgerRequiresAVerifiedTenantToken/a_string_that_is_not_a_token_at_all (0.00s)
+    --- PASS: TestVerifyLedgerRequiresAVerifiedTenantToken/token_without_the_scheme (0.00s)
+    --- PASS: TestVerifyLedgerRequiresAVerifiedTenantToken/a_token_signed_with_another_secret (0.00s)
+    --- PASS: TestVerifyLedgerRequiresAVerifiedTenantToken/no_header (0.00s)
+    --- PASS: TestVerifyLedgerRequiresAVerifiedTenantToken/empty_bearer (0.00s)
+=== RUN   TestVerifyLedgerAnswersWithTheChainVerdict
+--- PASS: TestVerifyLedgerAnswersWithTheChainVerdict (0.00s)
+    --- PASS: TestVerifyLedgerAnswersWithTheChainVerdict/the_whole_chain_verifies (0.00s)
+    --- PASS: TestVerifyLedgerAnswersWithTheChainVerdict/a_rewritten_entry_is_reported,_not_an_error (0.00s)
+=== RUN   TestVerifyLedgerReportsAFailedCheckAsInternal
+--- PASS: TestVerifyLedgerReportsAFailedCheckAsInternal (0.00s)
+=== RUN   TestVerifyLedgerFailsClosedWithoutAVerifier
+--- PASS: TestVerifyLedgerFailsClosedWithoutAVerifier (0.00s)
+=== RUN   TestVerifyLedgerRefusesAnUnverifiedRequest
+--- PASS: TestVerifyLedgerRefusesAnUnverifiedRequest (0.00s)
+PASS
+ok  	synapse/internal/plane	0.008s
+
+$ go test ./...
+ok  	synapse/internal/api	(cached)
+ok  	synapse/internal/budget	(cached)
+ok  	synapse/internal/classifier	(cached)
+ok  	synapse/internal/compiler	(cached)
+ok  	synapse/internal/config	(cached)
+ok  	synapse/internal/conflict	(cached)
+ok  	synapse/internal/dedup	(cached)
+ok  	synapse/internal/embedder	(cached)
+ok  	synapse/internal/integration	(cached)
+ok  	synapse/internal/plane	0.060s
+ok  	synapse/internal/proxy	(cached)
+ok  	synapse/internal/retrieval	(cached)
+ok  	synapse/internal/scorer	(cached)
+ok  	synapse/internal/store	2.021s
+ok  	synapse/internal/supersession	(cached)
+ok  	synapse/internal/sync	(cached)
+ok  	synapse/internal/tenant	0.774s
+ok  	synapse/internal/trace	(cached)
+```
+
+The rows the previous phases left behind in the development database were the
+strongest check that a per-tenant walk stays per-tenant: `TestVerify` walked its own
+fresh tenant only, and Phase 15's unsigned probe rows and Phase 16's four
+deliberately forked chains were invisible to it, exactly as Phase 16 finding 6
+predicted.
+
+### Findings this phase surfaced (not fixed here — this phase is the read path)
+
+1. **In a running deployment, `GET /v2/ledger/verify` cannot verify anything yet.**
+   `tenant.GenerateAndStoreSecret` is still called by tests and by nothing else, and
+   no code path constructs a `Ledger` outside a test, so every real tenant answers
+   `500 {"error":"internal"}` (through `tenant.ErrSecretNotFound`) and every real
+   ledger is empty. Phase 16's finding 1 now has a consumer that makes its cost
+   visible: the endpoint is built, wired, and truthful, and there is nothing behind
+   it. Minting a secret at provisioning — returning it once, the way the API key
+   already is — is the next phase's first item.
+2. **An empty chain is valid, so deleting a tenant's whole ledger is undetectable
+   from inside the system.** `Verify` reports `chain_valid: true, entries_checked: 0`
+   for a tenant whose rows are gone, and it has to: "nothing was ever appended" and
+   "everything was removed" are indistinguishable from the rows alone. Anyone with
+   superuser rights has exactly that power. The fix is an external anchor — publishing
+   or storing the chain head hash somewhere the same credentials cannot rewrite — and
+   until there is one, this property has to be stated rather than implied. It is the
+   single largest hole in what this phase delivers.
+3. **Rotation is now visibly indistinguishable from tampering.**
+   `GenerateAndStoreSecret` refuses a second secret (`ErrSecretExists`) because the
+   table has no key id, and Phase 16 called that an honest limitation. It now has a
+   face: replace a tenant's secret and `Verify` reports a break at `entries[0]` — the
+   same answer as an attacker who rewrote the first entry. Key versioning (a key id in
+   the row, or in the signed message) is what makes rotation safe, and it is cheaper
+   to add before real chains exist than after.
+4. **Verification is unbounded work per call.** The walk reads one tenant's entire
+   chain and recomputes an HMAC per row, with no limit and no cursor. That is the right
+   shape for "answer the question exactly", but a tenant with a long history makes this
+   endpoint the most expensive thing it can ask for, repeatedly, and the only thing
+   bounding it is the request timeout the plane does not set. A row-count cap, a `since`
+   cursor, or a per-tenant verification budget belongs with metering
+   (`internal/metering`, still unbuilt).
+5. **The verdict says "broken here", not "broken how".** `chain_valid: false` plus a
+   first-break id cannot distinguish a rewritten row from a removed one — the walk
+   refuses to interpret past the first failure, deliberately, since nothing after a
+   break is trustworthy. An operator investigating will want per-row detail (which of
+   the two checks failed, and the neighbouring hashes); that is a second, explicitly
+   diagnostic endpoint rather than a wider verdict.
+6. **The tamper tests leave permanent damage, like Phase 15's and 16's probes.**
+   `TestVerifyDetectsRemovedRow` and `TestVerifyDetectsTruncatedGenesis` delete rows
+   the append-only rule means nobody can put back, so each run adds test tenants with
+   real holes in their chains. They are distinguishable by their `ledger-…` slugs and
+   by having no in-product history, but the development database accumulates them, and
+   PROGRESS.md is where that is recorded rather than discovered.
+7. **CI still runs none of the walk.** Every test that touches Postgres in
+   `internal/ledger` carries `//go:build integration`, so `go test ./...` — what
+   `ci.yml` runs — compiles the package and executes nothing in it. This phase put what
+   it could on the CI side of that line: the whole HTTP half of the feature (route,
+   wire shape, fail-closed answers, tenant selection) is in
+   `internal/plane/ledger_test.go` with no build tag, so the endpoint's contract *is*
+   covered where CI looks, even though the chain maths is not.
+8. **`ledger.ChainIntegrityResult` is now a plane type, and that is a real coupling.**
+   A future CLI (`synapse ledger verify`) or an MCP tool can still use the name — the
+   alias keeps it — but the struct it gets is declared in an HTTP package, so the audit
+   domain's own result type now depends on a package whose subject is HTTP. The cycle
+   that forced it is real and documented, and the alternative (two structurally
+   identical structs, one per package) was worse: it is exactly the drift this project
+   keeps refusing. If a third consumer ever appears, the move is a small
+   `internal/ledgerverify` package both can import, not a second declaration.
+9. **`first_break_at` is emitted as the zero time on a valid chain.** `omitempty` does
+   not work on `time.Time` (a struct is never "empty" to `encoding/json`), so the field
+   is always present and `0001-01-01T00:00:00Z` is the encoding of "no value". A client
+   that parsed the timestamp without reading `chain_valid` first would see a date two
+   thousand years in the past. Documented on the field and in the JSON contract test,
+   which asserts the exact body.
+10. **The verification route is the first plane endpoint whose 200 body carries
+    timestamps.** `syncResponse` and `searchResponse` are counts and records;
+    `ChainIntegrityResult` introduces RFC 3339 wire timestamps. Nothing else needs to
+    change because of it, but the API's shape has moved, and the next endpoint that
+    returns a time should follow this one rather than inventing a format.
+11. **MCP does not have the endpoint's contract yet, and `.clinerules` will want it
+    to.** The hard rule "MCP responses MUST include score breakdown (S/R/I/T) and
+    trace_id so users can see WHY a memory was surfaced" is about memory search, not
+    about the ledger — but the same rule implies an MCP ledger tool would have to
+    report `chain_valid`, the first break, and the checked-at time, which is exactly
+    this JSON. Reusing this shape rather than inventing a second one is the thing to
+    do in the phase that adds MCP tools.
+
+### Next phase
+
+Mint a tenant secret when a tenant is provisioned, returning it once the way the API
+key already is, and append a ledger entry from the plane for each compiled request —
+otherwise this phase's endpoint has a permanent 500 and an empty table behind it
+(finding 1). Key versioning (finding 3) belongs in that same work, because a verifier
+now exists to make rotation safe to offer, and because a key id added after real chains
+exist is a migration over data that cannot be rewritten. The external anchor for the
+chain head (finding 2) is the item that closes the only hole this phase's design leaves
+open. The S/R/I/T breakdown and `trace_id` on the plane's own memory-search surface —
+the shape `.clinerules` already requires of MCP responses — is still queued from
+Phase 14.
+

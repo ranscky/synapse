@@ -217,14 +217,16 @@ func withClaims(ctx context.Context, c *claims) context.Context {
 	ctx = context.WithValue(ctx, agentIDKey, c.AgentID)
 	ctx = context.WithValue(ctx, teamIDKey, c.TeamID)
 
-	// The slug, agent id, and team id are also published through internal/plane's
-	// own accessors, because the keys above are unexported here and the plane's
-	// endpoints -- which cannot import this package -- need them: the slug picks
+	// The tenant id, slug, agent id, and team id are also published through
+	// internal/plane's own accessors, because the keys above are unexported here
+	// and the plane's endpoints -- which cannot import this package -- need
+	// them: the id names the tenant the audit ledger is keyed by, the slug picks
 	// the tenant's schema, and the agent and team are the scope its memory
 	// visibility predicate is evaluated against. Every accessor carries the same
 	// verified value; nothing is re-derived and no claim is ever taken from
 	// anywhere but this signed token.
 	ctx = plane.WithTenantSlug(ctx, c.TenantSlug)
+	ctx = plane.WithTenantID(ctx, c.TenantID)
 	ctx = plane.WithAgentID(ctx, c.AgentID)
 
 	return plane.WithTeamID(ctx, c.TeamID)

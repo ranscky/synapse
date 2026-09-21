@@ -147,12 +147,20 @@ func main() {
 	// wrong threshold here only mislabels a memory rather than losing one.
 	memoryStore.SetConflictDetector(conflict.NewContradictionDetector(conflict.DefaultJaccardThreshold))
 
+	// Phase 17: the audit endpoint's dependency. GET /v2/ledger/verify walks the
+	// calling tenant's signed chain and reports the first break; the adapter
+	// fetches that tenant's signing secret and hands it to the walk, and is
+	// built here because it is the only place that can see both internal/ledger
+	// and internal/plane.
+	ledgerVerifier := newLedgerVerifier(pool)
+
 	srv := plane.NewServer(
 		cfg,
 		pool,
 		tenant.NewProvisioner(cfg, tenant.NewStore(pool)),
 		memoryStore,
 		memoryStore,
+		ledgerVerifier,
 		tenant.JWTMiddleware(cfg),
 		logger,
 	)

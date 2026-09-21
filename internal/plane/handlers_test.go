@@ -82,7 +82,7 @@ func newRouter(cfg *plane.PlaneConfig, db plane.Database, tenants plane.TenantPr
 		ReportTimestamp: false,
 	})
 
-	return plane.NewServer(cfg, db, tenants, nil, nil, nil, logger).Routes(), &logs
+	return plane.NewServer(cfg, db, tenants, nil, nil, nil, nil, logger).Routes(), &logs
 }
 
 // postTenant sends body to POST /v2/tenants with the given Authorization header,

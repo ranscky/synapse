@@ -32,9 +32,9 @@ type Database interface {
 // Server is the control plane's HTTP surface.
 //
 // Every external dependency arrives through the constructor -- a database probe,
-// the tenant provisioner, the tenant memory writer, the token middleware, the
-// config holding the secrets, and the logger -- so there is no global state and
-// no route reaches for one.
+// the tenant provisioner, the tenant memory writer and searcher, the audit
+// ledger verifier, the token middleware, the config holding the secrets, and the
+// logger -- so there is no global state and no route reaches for one.
 //
 // auth is a plain constructor-injected func rather than an import of
 // internal/tenant for a concrete reason: internal/tenant already imports this
@@ -47,20 +47,27 @@ type Server struct {
 	tenants  TenantProvisioner
 	memories MemoryWriter
 	searcher MemorySearcher
+	ledger   LedgerVerifier
 	auth     func(http.Handler) http.Handler
 	logger   *charmlog.Logger
 }
 
 // NewServer returns a Server serving the control plane routes. db, tenants,
-// memories, searcher, and auth may be nil: the health endpoint then reports a
-// disconnected database, the provisioning endpoint answers 500, and the sync
-// and search endpoints refuse every request instead of panicking or trusting an
-// unverified tenant.
+// memories, searcher, ledger, and auth may be nil: the health endpoint then
+// reports a disconnected database, the provisioning endpoint answers 500, and
+// the sync, search, and ledger endpoints refuse every request instead of
+// panicking or trusting an unverified tenant.
 //
 // memories and searcher are separate parameters rather than one wider interface
 // because they are two different capabilities: a plane can be wired to accept
 // pushes without serving reads, and each endpoint then degrades on its own.
 // cmd/plane passes the same tenant-backed implementation for both.
+//
+// ledger is a third capability again -- walking an audit chain with a tenant's
+// signing key -- and it is a separate parameter for the same reason: a plane
+// wired to serve memories has not thereby agreed to expose audit verification,
+// and the ledger's read path needs a database identity the tenant data layer
+// does not (the writer role holds no SELECT on that table).
 //
 // logger may be nil, in which case this package logs nothing.
 func NewServer(
@@ -69,21 +76,37 @@ func NewServer(
 	tenants TenantProvisioner,
 	memories MemoryWriter,
 	searcher MemorySearcher,
+	ledger LedgerVerifier,
 	auth func(http.Handler) http.Handler,
 	logger *charmlog.Logger,
 ) *Server {
-	return &Server{cfg: cfg, db: db, tenants: tenants, memories: memories, searcher: searcher, auth: auth, logger: logger}
+	return &Server{
+		cfg:      cfg,
+		db:       db,
+		tenants:  tenants,
+		memories: memories,
+		searcher: searcher,
+		ledger:   ledger,
+		auth:     auth,
+		logger:   logger,
+	}
 }
 
 // Routes returns the plane's router: GET /health is open, POST /v2/tenants is
-// behind the admin token, and POST /v2/sync/memories plus
-// GET /v2/memories/search are behind a tenant token.
+// behind the admin token, and POST /v2/sync/memories, GET /v2/memories/search,
+// and GET /v2/ledger/verify are behind a tenant token.
+//
+// The ledger route is tenant-scoped rather than admin-guarded on purpose: the
+// chain it verifies is the caller's own (the tenant id comes from the verified
+// token), so verification is the tenant's own audit of its own records rather
+// than an operator reading someone else's.
 func (s *Server) Routes() http.Handler {
 	router := chi.NewRouter()
 	router.Get("/health", s.handleHealth)
 	router.With(s.requireAdmin).Post("/v2/tenants", s.handleCreateTenant)
 	router.With(s.requireJWT).Post(syncRoute, s.handleSyncMemories)
 	router.With(s.requireJWT).Get(searchRoute, s.handleSearchMemories)
+	router.With(s.requireJWT).Get(ledgerVerifyRoute, s.handleVerifyLedger)
 
 	return router
 }

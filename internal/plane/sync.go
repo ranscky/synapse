@@ -177,10 +177,15 @@ type ctxKey int
 // Context keys for the verified claims this package's endpoints read back out,
 // one per claim. They are values of an unexported int type (declared just above)
 // so no other package can collide with them by reusing a string key.
+//
+// tenantIDKey is appended rather than inserted: the three keys above it are
+// already in use by running binaries, and a key's value is not what makes it
+// unguessable -- its type is.
 const (
 	tenantSlugKey ctxKey = iota
 	agentIDKey
 	teamIDKey
+	tenantIDKey
 )
 
 // WithTenantSlug returns a copy of ctx carrying a verified tenant slug.
@@ -201,6 +206,32 @@ func TenantSlugFromCtx(ctx context.Context) string {
 	slug, _ := ctx.Value(tenantSlugKey).(string)
 
 	return slug
+}
+
+// WithTenantID returns a copy of ctx carrying a verified tenant id.
+//
+// Same arrangement as WithTenantSlug, and the same verified-claim-only rule:
+// internal/tenant's middleware calls this from withClaims, after the signature,
+// the expiry, and the tenant claim itself have all been checked, because its own
+// keys are unexported and this package cannot read them.
+//
+// The id is the tenant's uuid -- the value the ledger's rows are keyed by and
+// the value the chain's signature covers -- so it is the only thing
+// GET /v2/ledger/verify may use to choose a chain. A slug would name a schema;
+// this names the tenant.
+func WithTenantID(ctx context.Context, tenantID string) context.Context {
+	return context.WithValue(ctx, tenantIDKey, tenantID)
+}
+
+// TenantIDFromCtx returns the verified tenant id attached by WithTenantID, or
+// "" when the request never passed through the middleware.
+//
+// Empty is fail-closed: the ledger endpoint answers 401 for it rather than
+// treating it as a tenant that owns nothing.
+func TenantIDFromCtx(ctx context.Context) string {
+	tenantID, _ := ctx.Value(tenantIDKey).(string)
+
+	return tenantID
 }
 
 // WithAgentID returns a copy of ctx carrying the verified agent id.
