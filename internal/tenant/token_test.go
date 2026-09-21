@@ -195,3 +195,59 @@ func TestIssueTokenFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+// TestParseTokenClaimsReadsOwnCredential is the edge node's contract: the token
+// this node holds as its own credential yields exactly the identity provisioning
+// minted it for, so the ledger can be wired to the right tenant and the right
+// plan.
+func TestParseTokenClaimsReadsOwnCredential(t *testing.T) {
+	token, err := IssueToken(&plane.PlaneConfig{JWTSecret: tokenTestSecret}, testTokenIdentity())
+	require.NoError(t, err)
+
+	got, err := ParseTokenClaims(token)
+	require.NoError(t, err)
+
+	assert.Equal(t, testTokenIdentity(), got)
+}
+
+// TestParseTokenClaimsDoesNotVerifyTheSignature is the documented cost of this
+// function rather than a bug: it is a claim reader, not an authenticator. The
+// test exists so that nobody adds a signature check here under the impression
+// that the edge can perform one -- it cannot, because it holds no JWT secret.
+func TestParseTokenClaimsDoesNotVerifyTheSignature(t *testing.T) {
+	token, err := IssueToken(&plane.PlaneConfig{JWTSecret: "a-secret-this-node-does-not-have-0123456789"}, testTokenIdentity())
+	require.NoError(t, err)
+
+	got, err := ParseTokenClaims(token)
+	require.NoError(t, err)
+	assert.Equal(t, testTokenTenantID, got.TenantID)
+}
+
+// TestParseTokenClaimsFailsClosed covers the two shapes a caller must handle:
+// nothing to read, and something that is not a token. A well-formed token that
+// simply carries no tenant is not an error -- the identity is empty, and a
+// caller that needs a tenant id is the one that has to check.
+func TestParseTokenClaimsFailsClosed(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		got, err := ParseTokenClaims("")
+		require.Error(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("not a token", func(t *testing.T) {
+		got, err := ParseTokenClaims("not-a-jwt")
+		require.Error(t, err)
+		assert.Empty(t, got)
+		assert.NotContains(t, err.Error(), "not-a-jwt", "the value is not echoed into an error")
+	})
+
+	t.Run("no tenant claims", func(t *testing.T) {
+		bare, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"sub": "nobody"}).
+			SignedString([]byte(tokenTestSecret))
+		require.NoError(t, err)
+
+		got, err := ParseTokenClaims(bare)
+		require.NoError(t, err)
+		assert.Empty(t, got.TenantID, "a token with no tenant claim yields an empty identity, not a guess")
+	})
+}

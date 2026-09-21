@@ -101,6 +101,13 @@ func Compile(
 		localAgentID,
 	)
 
+	// Audit ledger (Phase 18): if this process is an enterprise tenant's node
+	// and a sink is installed, the trace is snapshotted here and appended in a
+	// goroutine -- never awaited, so the compilation's own duration is what it
+	// was before this call existed. See ledger.go for why the snapshot is
+	// synchronous and the append is not.
+	recordTrace(traceManifest)
+
 	return &CompileResult{
 		Messages: result,
 		Trace:    traceManifest,

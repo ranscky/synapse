@@ -136,8 +136,14 @@ func TestProvisionerStoresTheHashAndIssuesAVerifiableToken(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, RunMigrations(ctx, pool))
 
+	// Phase 18 made provisioning mint the tenant's ledger signing secret, so
+	// this path now needs the wrapping key that secrets.go reads from the
+	// environment. The test supplies its own, exactly as the signing tests do,
+	// so it needs nothing exported in the developer's shell.
+	t.Setenv(plane.EnvMasterKey, secretsTestMasterKey)
+
 	cfg := &plane.PlaneConfig{JWTSecret: tokenTestSecret}
-	provisioner := NewProvisioner(cfg, NewStore(pool))
+	provisioner := NewProvisioner(cfg, NewStore(pool), pool)
 	slug := uniqueSlug(t)
 
 	result, err := provisioner.Provision(ctx, plane.ProvisionRequest{Slug: slug, Plan: "team", ComplianceTier: "team"})
@@ -177,6 +183,21 @@ func TestProvisionerStoresTheHashAndIssuesAVerifiableToken(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, result.TenantID, verifiedTenantID)
+
+	// Phase 18: the tenant walks away usable for the audit ledger too. The
+	// secret is stored (never returned) and the row is retrievable under the
+	// master key this test supplied -- which is exactly what the ledger's write
+	// path does before every append.
+	secret, err := GetSecret(ctx, pool, result.TenantID)
+	require.NoError(t, err, "provisioning must leave the tenant with a signing secret")
+	assert.Len(t, secret, secretEntropyBytes)
+	assert.NotContains(t, string(secret), result.APIKey, "the signing secret must be its own value")
+
+	var storedSecrets int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM synapse_global.tenant_secrets s JOIN synapse_global.tenants t ON t.id = s.tenant_id WHERE t.slug = $1`,
+		slug).Scan(&storedSecrets))
+	assert.Equal(t, 1, storedSecrets, "exactly one secret row per tenant")
 
 	// A second attempt on the same slug is a conflict, and it must not have left
 	// a stray row behind. The plane-facing sentinel is what the HTTP layer maps

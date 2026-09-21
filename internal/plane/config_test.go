@@ -53,11 +53,17 @@ func writeConfig(t *testing.T, body string) string {
 
 // validConfig is a baseline that passes Validate, for tests that only want to
 // vary one field at a time.
+//
+// MasterKey is present because Validate has required it since Phase 18, when
+// provisioning began wrapping each tenant's signing secret under it. Only its
+// presence is checked here; the 32-byte hex shape is internal/tenant's rule
+// (masterKeyFromEnv), deliberately not duplicated in this package.
 func validConfig() *PlaneConfig {
 	return &PlaneConfig{
 		ListenAddr:          "127.0.0.1:9090",
 		DatabaseDSN:         "postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable",
 		JWTSecret:           strings.Repeat("k", MinJWTSecretLen),
+		MasterKey:           strings.Repeat("a", 64),
 		LogLevel:            "info",
 		LedgerRetentionDays: 365,
 	}
@@ -184,6 +190,7 @@ func TestValidate(t *testing.T) {
 		{name: "missing database-dsn", mutate: func(c *PlaneConfig) { c.DatabaseDSN = "" }, wantError: "database-dsn is required"},
 		{name: "missing jwt-secret", mutate: func(c *PlaneConfig) { c.JWTSecret = "" }, wantError: "jwt-secret is required"},
 		{name: "short jwt-secret", mutate: func(c *PlaneConfig) { c.JWTSecret = strings.Repeat("k", MinJWTSecretLen-1) }, wantError: "jwt-secret is too short"},
+		{name: "missing master-key", mutate: func(c *PlaneConfig) { c.MasterKey = "" }, wantError: "master-key is required"},
 		{name: "negative retention", mutate: func(c *PlaneConfig) { c.LedgerRetentionDays = -1 }, wantError: "ledger-retention-days must not be negative"},
 	}
 

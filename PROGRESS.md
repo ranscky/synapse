@@ -4194,3 +4194,393 @@ open. The S/R/I/T breakdown and `trace_id` on the plane's own memory-search surf
 the shape `.clinerules` already requires of MCP responses — is still queued from
 Phase 14.
 
+
+## Phase 18 — ledger wired into compilation (complete)
+
+Scope was the write path's last missing piece: after every successful compilation
+for an enterprise tenant, the finished trace is signed and appended to that
+tenant's ledger chain, in a goroutine no request waits on. `internal/compiler` was
+edited under the explicit exception the task granted ("do not touch any v1 internal
+package except internal/compiler"); every other v1 package is untouched. Provisioning
+now also mints each tenant's signing secret, without which no tenant could have
+produced a row at all (Phase 17 finding 1).
+
+Commit `feat: Phase 18 - ledger wired into compilation pipeline`
+
+New files:
+
+- `internal/compiler/ledger.go` — 162 lines: `EnterprisePlan`, `ledgerAppendTimeout`,
+  the `LedgerSink` interface, `ledgerWiring`, the `atomic.Pointer` that holds it,
+  `SetLedgerSink`, the gated `ledgerSink` reader, and `recordTrace` — the snapshot
+  and the goroutine.
+- `internal/compiler/ledger_test.go` — 250 lines: `recordingSink` (buffered channel,
+  no sleeps), `blockingSink` (released only after `Compile` has returned),
+  `installLedgerSink` (clears the process wiring via `t.Cleanup`), and six tests:
+  the enterprise append, five non-enterprise plans that must stay silent, the
+  no-sink standalone path, a nil sink under an enterprise plan, the
+  does-not-wait-for-the-append proof, and a failing append that leaves the
+  `CompileResult` alone.
+- `cmd/synapse/ledger.go` — 239 lines: `enterpriseLedger` (the `compiler.LedgerSink`
+  implementation), the `secretReader`/`entryAppender` seams that keep it testable
+  without PostgreSQL, `ledgerRequestID` (the uuid mapping), `ledgerPlan`,
+  `resolveLedgerPlan`, and `enableEnterpriseLedger` (the one boot-time wiring call).
+- `cmd/synapse/ledger_test.go` — 266 lines: five test functions over fakes —
+  the signed append, the two fail-closed stages, the uuid mapping's determinism and
+  uniqueness, the claim reader, and the boot decision table.
+
+Changed:
+
+- `internal/compiler/compiler.go` — one call, `recordTrace(traceManifest)`, plus its
+  comment, inserted after the trace is assembled and before `Compile` returns.
+- `internal/tenant/token.go` — `ParseTokenClaims`, the unverified claim reader the
+  edge needs and the plane must never use.
+- `internal/tenant/token_test.go` — three tests: the round trip, the documented
+  absence of a signature check, and the fail-closed shapes.
+- `internal/tenant/provision.go` — `Provisioner` gained the pool and `NewProvisioner`
+  a third parameter; `Provision` now mints and stores the tenant's signing secret.
+- `internal/tenant/migrations_test.go` — the call site, a `t.Setenv(plane.EnvMasterKey, …)`
+  so the path needs nothing exported, and the secret assertions.
+- `internal/plane/config.go` — `Validate` now requires `master-key`, and the doc
+  paragraph that said it was deliberately not required yet was rewritten to say why
+  it is now.
+- `internal/plane/config_test.go` — `validConfig` carries a master key; `TestValidate`
+  gained the "missing master-key" case.
+- `cmd/plane/main.go` — `NewProvisioner(cfg, tenant.NewStore(pool), pool)`.
+- `cmd/synapse/main.go` — the wiring block: parse this node's credential, and when
+  the plan is enterprise, open the ledger pool and install the sink; a warning if it
+  cannot be wired, never a refusal to serve.
+- `deploy/docker-compose.yml`, `synapse-plane.yaml.example` — a master key that is
+  actually 64 hex characters. See decision 9: the previous dev placeholder was not
+  hex at all.
+
+
+
+### Decisions made in this phase
+
+1. **The control plane does not compile, so there was one call site, not two.** The
+   task asked to confirm this before wiring. `internal/plane.Routes()` registers
+   `/health`, `POST /v2/tenants`, `POST /v2/sync/memories`, `GET /v2/memories/search`,
+   and `GET /v2/ledger/verify` — there is no `/v1/compile` and no `compiler.Compile`
+   call anywhere in `internal/plane` or `cmd/plane` (`grep -i compile` finds only
+   `regexp.MustCompile`). Compilation happens in exactly two places, both on the edge
+   node and both inside frozen v1 packages: `internal/proxy/proxy.go:616` for live
+   proxied traffic and `internal/api/api.go:342` for `POST /v1/compile`. "Wire exactly
+   one place" therefore resolved to the edge node's process, and the hook had to live
+   in `internal/compiler` because neither call site could be edited.
+2. **The sink is installed process-wide, and that is a deliberate exception to "no
+   global state".** `compiler.Compile` is a free function with twelve positional
+   parameters and no `Compiler` struct, and its two callers may not be touched this
+   phase, so there is no constructor to inject into and no argument to pass. The
+   wiring is therefore an `atomic.Pointer[ledgerWiring]` written once from
+   `cmd/synapse/main.go` before the router serves and read once per compile. It costs
+   a pointer load and a string comparison on the request path, and it is why a
+   standalone node's behavior is unchanged rather than merely untested: with no sink
+   installed, `recordTrace` returns before it marshals anything.
+3. **The trace is marshalled synchronously and only the append is asynchronous.** This
+   is not a detail: both callers mutate the very `*TraceManifest` `Compile` returns
+   (`proxy.go:645-650`, `api.go:359-363` set `TokensUsed` and `ReductionPct`), so a
+   goroutine that read the struct while they wrote it would be a data race, and
+   `go test -race` would have caught it in any test that exercised an enterprise
+   compile. Serializing before the goroutine takes the snapshot off the shared struct.
+   The price is documented on `recordTrace` rather than hidden: the ledgered trace
+   carries `tokens_used: 0` and `reduction_pct: 0`, because both are still unset at
+   the only moment the trace is complete from the compiler's point of view (finding 1
+   says what closing that would take).
+4. **The request id is mapped, not passed through.** `ledger.Append` fails closed on a
+   request id that is not a uuid, and v1 mints `req-<unixnano>` (`internal/api`) and
+   `req-<unixnano>-<seq>` (`internal/proxy`). Rather than change a v1 id format from
+   inside a frozen file, the ledger's `request_id` is derived with
+   `uuid.NewSHA1(ledgerRequestNamespace, []byte(requestID))`. A uuid v5 is
+   deterministic, so the mapping is traceable in the one direction that matters: the
+   ledgered trace JSON still carries the original `request_id` verbatim, and a
+   verifier recomputes the row's `request_id` from it. An id that is already a uuid is
+   canonicalized instead of hashed, so a future v1 change to uuid ids needs no change
+   here. Without this every append would have been rejected and this phase's
+   verification would have shown `count = 0` beside a full error log.
+
+
+5. **Which tenant a node belongs to comes from the node's own credential, read
+   unverified — on purpose.** The edge holds the tenant JWT provisioning returned
+   (`control-plane-api-key`) and nothing else that names a tenant: `internal/config`
+   has no tenant-id key. `tenant.ParseTokenClaims` reads `tenant_id` and `plan` from
+   it with `jwt.ParseUnverified`, which is safe here for a reason that does not
+   generalize: the value is this node's own configuration, no request can supply it,
+   and reading it grants nothing — the plane still verifies the same token on every
+   sync and every candidate pull, and the ledger row it enables is a write this node
+   makes under that credential's authority. A credential that parses but names no
+   tenant is an error, not an empty identity, because appending to an unnamed tenant
+   is the fail-open shape this path exists to avoid.
+6. **Provisioning mints and stores the signing secret; it does not return it.**
+   Phase 17 finding 1 said nothing in a running deployment ever called
+   `GenerateAndStoreSecret`, so every tenant's chain was unwritable and
+   `GET /v2/ledger/verify` answered 500. That is now closed at the only point where a
+   tenant id exists. The secret is deliberately not handed back to the tenant the way
+   the API key is: the ledger fetches and unwraps it per append, so nothing in the
+   product needs the plaintext, and adding it to the provisioning response would have
+   changed the wire shape for no requirement this phase had. Phase 17's note suggested
+   returning it; that is deferred, not forgotten, and recorded as the open half. The
+   mint is not atomic with the tenant row — `CreateTenant` commits first, because the
+   uuid it returns is the additional authenticated data the secret is sealed with, so
+   the id genuinely cannot exist any earlier — and finding 3 is the live tenant that
+   window produced.
+7. **`master-key` is now fatal at boot.** Phase 1's config comment said `MasterKey`
+   was "parsed and redacted but deliberately not enforced yet, because Phase 1
+   registers no authenticated route; it becomes required in the phase that introduces
+   auth and tenant key wrapping." This is that phase. A plane without it would accept
+   a provisioning request, commit the tenant row, and then fail to store the secret: a
+   half-provisioned tenant whose audit chain can never be written or verified.
+   `Validate` checks only that the key is present; the 64-hex-character shape stays
+   `internal/tenant`'s rule (`masterKeyFromEnv`), next to the code that uses it,
+   because two copies of that rule are two rules to keep in step.
+8. **Wiring the ledger at the edge is never fatal.** Every failure — no credential, a
+   credential that names no tenant, an enterprise tenant with no `database-dsn`, a
+   pool that will not open — returns an error `main` logs as a warning, leaving no sink
+   installed. An edge node whose ledger database is unreachable still compiles: putting
+   the audit sink ahead of the product it audits would be the wrong trade, and the
+   append itself is already fire-and-forget for the same reason.
+9. **The compose stack's master key was not hex, and provisioning could not have
+   worked with it.** `deploy/docker-compose.yml` shipped
+   `SYNAPSE_MASTER_KEY: change-me-master-key-32-chars-min`, and `masterKeyFromEnv`
+   hex-decodes the value and requires exactly 32 bytes. With this phase's minting in
+   place that placeholder fails every provisioning request with `must be hex-encoded
+   (64 characters for 32 bytes)` — which is exactly what the first live attempt
+   produced. Both the compose file and `synapse-plane.yaml.example` now carry a
+   shape-correct, clearly-labelled dev value. Worth recording: the replacement written
+   first was 63 characters, not 64, and the new boot-time requirement plus the
+   plane's own error message is what caught it.
+
+### Verification (real output, this phase)
+
+Unit and integration-free suites:
+
+```text
+$ go build ./...                      # clean
+$ go vet ./...                        # VET OK
+$ go test -count=1 ./...              # EXIT=0, no failures
+$ go test -race -count=1 ./internal/compiler
+ok  synapse/internal/compiler  2.077s
+
+  --- PASS: TestCompileAppendsTraceForEnterprisePlan
+  --- PASS: TestCompileSkipsLedgerForNonEnterprisePlans (5 subtests: oss, team, "", Enterprise, enterprise-plus)
+  --- PASS: TestCompileWithoutLedgerSink
+  --- PASS: TestSetLedgerSinkIgnoresNilSinkUnderEnterprisePlan
+  --- PASS: TestCompileDoesNotWaitForLedgerAppend
+  --- PASS: TestCompileSurvivesFailedLedgerAppend
+     2026/09/21 13:02:23 ERROR ledger: append failed error="ledger: append needs a signing secret"
+
+$ go test -count=1 ./cmd/synapse
+ok  synapse/cmd/synapse  0.007s
+  --- PASS: TestAppendTraceSignsForThisNodesTenant
+  --- PASS: TestAppendTraceFailsClosed (3 subtests)
+  --- PASS: TestLedgerRequestIDIsDeterministicAndUuidShaped
+  --- PASS: TestResolveLedgerPlanReadsThisNodesOwnCredential (3 subtests)
+  --- PASS: TestEnableEnterpriseLedgerRefusesIncompleteConfiguration (4 subtests)
+```
+
+`TestCompileDoesNotWaitForLedgerAppend` is the SLA proof rather than a timing
+measurement: the sink blocks until the test releases it, and it is released only
+after `Compile`'s result has been received, so a `Compile` that waited for the
+append would hang the test instead of failing it.
+
+The live run, against the compose stack (`docker compose up -d --build`, plane
+`v2.0.0` on 127.0.0.1:9090, PostgreSQL on 127.0.0.1:5432) and a real edge node
+(`/tmp/synapse-edge`, built from this tree, listening on 127.0.0.1:8099, ONNX
+embedder, SQLite memory store, `control-plane-url` set):
+
+```text
+$ curl -sS -X POST http://127.0.0.1:9090/v2/tenants -H "Authorization: change-me-admin-token" \
+       -H 'Content-Type: application/json' -d '{"slug":"enterprise-ledger18","plan":"enterprise"}'
+HTTP 201
+{"tenant_id":"b63b1d9d-898b-49ab-906e-64ed3edfa427","jwt":"eyJ…","api_key":"…"}
+
+$ grep 'Audit ledger' /tmp/edge.log
+1:12PM INFO synapse: Audit ledger enabled: every compiled trace is appended for this enterprise tenant
+
+rows before any request: 0
+request 1: http 200 in 0.273831s
+  ledger rows after request 1: 1
+request 2: http 200 in 0.052375s
+  ledger rows after request 2: 2
+request 3: http 200 in 0.053549s
+  ledger rows after request 3: 3
+
+$ docker exec deploy-db-1 psql -U synapse -d synapse -c \
+    "SELECT COUNT(*) FROM synapse_global.ledger WHERE tenant_id='b63b1d9d-898b-49ab-906e-64ed3edfa427';"
+ count
+-------
+     3
+(1 row)
+
+$ docker exec deploy-db-1 psql -U synapse -d synapse -c \
+    "SELECT left(id::text,8) AS id, request_id, left(prev_hash,12) AS prev_hash, \
+            left(hash_value,12) AS hash_value, created_at \
+       FROM synapse_global.ledger WHERE tenant_id='b63b1d9d-898b-49ab-906e-64ed3edfa427' ORDER BY created_at;"
+    id    |              request_id              |  prev_hash   |  hash_value  |          created_at
+----------+--------------------------------------+--------------+--------------+-------------------------------
+ 9bec637b | 0912b375-cbac-5058-8b2d-6d3cf774d527 | aeebad4a796f | f5e10eca7123 | 2026-09-21 13:13:16.687888+00
+ 50e6b497 | 32c9a29d-5619-56de-b433-c52a7056567a | f5e10eca7123 | fe7d8ed21996 | 2026-09-21 13:13:17.901891+00
+ bfad27cc | b48d3cb1-de43-585c-9ed4-865821381609 | fe7d8ed21996 | 60adf3bbbac6 | 2026-09-21 13:13:19.112474+00
+(3 rows)
+```
+
+Three properties are visible in that table: the ids are uuid **v5** values derived
+from the edge's ids, each row's `prev_hash` is the previous row's `hash_value` (one
+chain, no fork), and the trace inside each row still carries the id the edge actually
+minted:
+
+```text
+$ docker exec deploy-db-1 psql -U synapse -d synapse -t -A -c \
+    "SELECT request_id || ' <- ' || (trace_json::json->>'request_id') FROM synapse_global.ledger WHERE …;"
+0912b375-cbac-5058-8b2d-6d3cf774d527 <- req-1789996396680271140
+32c9a29d-5619-56de-b433-c52a7056567a <- req-1789996397898105349
+b48d3cb1-de43-585c-9ed4-865821381609 <- req-1789996399109191440
+```
+
+The tenant's own audit endpoint reads the same rows and agrees:
+
+```text
+$ curl -sS http://127.0.0.1:9090/v2/ledger/verify -H "Authorization: Bearer <enterprise jwt>"
+{"entries_checked":3,"chain_valid":true,"first_break_at":"0001-01-01T00:00:00Z","checked_at":"2026-09-21T13:13:33.449193366Z"}
+```
+
+Latency. An A/B on the same host, same binary, same database-dsn, eight warm
+compilations each — the only difference being the plan in the node's own credential,
+which is the only thing that decides whether a sink is installed:
+
+```text
+enterprise node (ledger ON ):  44ms 35ms 56ms 35ms 34ms 35ms 38ms 56ms
+team node       (ledger OFF):  44ms 43ms 35ms 43ms 54ms 45ms 58ms 35ms
+median ledger ON : 36ms
+median ledger OFF: 44ms
+min/max ON : 34/56ms
+
+$ grep 'API compile completed' /tmp/edge.log | tail -3
+1:13PM INFO synapse: API compile completed total_duration_ms=265 total_tokens=0
+1:13PM INFO synapse: API compile completed total_duration_ms=51 total_tokens=0
+1:13PM INFO synapse: API compile completed total_duration_ms=51 total_tokens=0
+```
+
+The 265ms first request is the ONNX model's first inference, not the ledger: it
+appears on the ledger-off node too (`0.249869s`), and every request after it is
+34-56ms on both nodes — inside the <100ms the task asked for, and inside the 50ms
+band the project tracks. After the A/B the enterprise tenant's chain held 11 rows
+(3 + 8) and the team tenant's held none:
+
+```text
+              tenant_id               | rows
+--------------------------------------+------
+ b63b1d9d-898b-49ab-906e-64ed3edfa427 |   11
+(1 row)
+```
+
+The gate, live: a `team` tenant was provisioned, given the *same* `database-dsn` and
+a credential node of its own on 127.0.0.1:8098, and compiled once.
+
+```text
+$ grep -c 'Audit ledger enabled' /tmp/edge-team.log
+0
+$ curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' -X POST http://127.0.0.1:8098/v1/compile …
+200 0.249869
+$ docker exec deploy-db-1 psql -U synapse -d synapse -c \
+    "SELECT count(*) FROM synapse_global.ledger WHERE tenant_id='6b6e6afc-ad90-4460-a33a-da21d5ff1642';"
+ count
+-------
+     0
+(1 row)
+```
+
+The negative path was seen live too, when the edge was first started without
+`SYNAPSE_MASTER_KEY` exported. Compilations kept succeeding and the failure stayed
+where the design puts it:
+
+```text
+1:12PM INFO synapse: API compile completed total_duration_ms=33 total_tokens=0
+1:12PM INFO synapse: API request method=POST path=/v1/compile status=200 duration_ms=34 …
+1:12PM ERRO synapse: ledger: append failed error="ledger: fetch tenant secret: tenant: SYNAPSE_MASTER_KEY is required to wrap tenant secrets"
+```
+
+No trace payload, no request id, no secret, no ciphertext, and no key value in that
+line — and no row written.
+
+
+### Findings this phase surfaced (not fixed here — this phase wires the write path)
+
+1. **The ledgered trace is not quite the trace the caller received.** `tokens_used`
+   and `reduction_pct` are 0 in every row, because both are finalised by the call
+   sites after `Compile` returns and the snapshot has to be taken before that (decision
+   3). Everything else in the manifest — the ids, the scores, the counts, the intent,
+   the memories and their provenance — is exact. Closing this means appending after the
+   callers' fixups, which means editing `internal/proxy/proxy.go` and
+   `internal/api/api.go`; that was Option C in this phase's plan and was declined to
+   keep the v1 freeze. It is a two-file, handful-of-lines change whenever the project
+   decides an audit entry's token count matters more than the freeze.
+2. **The edge node now holds `SYNAPSE_MASTER_KEY`.** It has to: `tenant.GetSecret`
+   unwraps the tenant's signing secret with it, and this phase chose in-process
+   appending at the edge (Option A) over a plane-owned append route (Option B). For a
+   single-tenant edge node that is one tenant's key material on one host, which is the
+   deployment this is sized for — but it is a real widening of who can unwrap a signing
+   secret, and Option B remains the design that does not require it. Recorded so the
+   choice is visible rather than implied.
+3. **There is now a half-provisioned tenant in the development database, and no way to
+   repair it.** The first live provisioning attempt ran before the compose master key
+   was fixed: the tenant row committed, the secret mint failed, and the request
+   answered 500. `enterprise-demo` therefore has `has_secret = f`, and re-provisioning
+   under that slug is refused (`ErrTenantExists`), so the tenant can never write or
+   verify an audit chain. This is the non-atomic window decision 6 describes, caught
+   live by accident. A repair path — reissue the secret for an existing tenant, the
+   operation `ErrSecretExists` deliberately refuses — belongs in the phase that also
+   does key versioning, because reissuing a secret after rows exist is exactly the
+   situation Phase 17 finding 3 says must not be attempted without a key id.
+4. **Key versioning is still absent.** Phase 17 finding 3 is unchanged by this phase:
+   the ledger has no key id, `GenerateAndStoreSecret` refuses a second secret, and
+   replacing a tenant's secret would make `Verify` report a break at `entries[0]` — the
+   same answer as tampering. This phase made that limitation load-bearing rather than
+   theoretical, because there are now real chains behind it.
+
+5. **Every compilation means one row, including the ones a human is just poking at.**
+   Both frozen call sites reach `Compile`, so `POST /v1/compile`, every proxied
+   `/v1/messages`, `/v1/chat/completions`, and `/api/chat` turn, and
+   `POST /api/playground/compile` from the trace inspector all produce a ledger entry
+   with a full trace in it. That is what "after every successful compilation" asked
+   for, and it is worth stating plainly: a chatty agent produces one row per turn, and
+   a user experimenting in the playground adds audit rows to their tenant's chain.
+   Excluding the playground would mean a per-route decision at a call site, so it is a
+   deliberate later question rather than an accident.
+6. **A failed append is logged once and dropped; there is no queue and no retry.** The
+   negative path verified live (see above) is the intended shape — a compilation is
+   never failed by its audit write — but the consequence is that a database outage
+   during a burst of compilations loses those rows permanently, and the chain will not
+   show the hole: each row still chains from the row before it, so the ledger looks
+   internally perfect. Phase 17 finding 2's external anchor is the only thing that
+   could ever make that visible, and it is still unbuilt.
+7. **An enterprise edge node now writes to two stores.** Memories stay in the local
+   SQLite file (`cmd/synapse` still calls `store.NewStore(cfg.DBPath)`;
+   `store.NewStoreFromConfig`, the Postgres memory path, has no callers), while the
+   audit ledger goes to the plane's PostgreSQL through `database-dsn`. The ledger is
+   the only part of the v2 data model an edge node reaches, which is worth knowing
+   before anything else on that node assumes a tenant schema exists.
+8. **CI still cannot catch a broken ledger wiring.** `internal/ledger` has no untagged
+   tests by design (a fake `pgx.Tx` would mostly test the fake), so the only thing that
+   exercises `ledger.NewLedger(pool).Append` end to end is the manual run above. What
+   is covered where CI looks is everything on this side of the database: the gate, the
+   snapshot, the goroutine, the uuid mapping, the claim reader, the fail-closed stages,
+   and the boot decision table — all in `internal/compiler` and `cmd/synapse`, both of
+   which run untagged.
+
+### Next phase
+
+The write path now has a consumer and a hole, in that order. The hole is the external
+anchor for the chain head (Phase 17 finding 2, restated by finding 6 here): publish or
+store each tenant's head hash somewhere the credentials that can write the ledger
+cannot rewrite, or "the whole chain was deleted" and "nothing was ever appended"
+remain the same answer. Key versioning (finding 4) is the second item, and it now has
+a concrete reason beyond rotation: the repair path finding 3 describes — reissuing the
+secret of a tenant that already has rows — cannot be offered safely until a key id
+exists in the row or the signed message. Returning the signing secret to the tenant
+once at provisioning (Phase 17's note, decision 6's deferral) is the third item, and it
+is the one that lets a tenant verify its own chain without trusting the plane. The
+`tokens_used: 0` fidelity gap (finding 1) is a small change gated on unfreezing two v1
+files, so it should be decided explicitly rather than absorbed. The S/R/I/T breakdown
+and `trace_id` on the plane's own memory-search surface is still queued from Phase 14,
+and is also the shape `.clinerules` already requires of MCP responses.
+

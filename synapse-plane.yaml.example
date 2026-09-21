@@ -36,11 +36,18 @@ jwt-secret: "dev-only-placeholder-secret-not-for-any-real-deployment"
 # DEV PLACEHOLDER -- replace or blank it in any real deployment.
 admin-token: "dev-only-placeholder-admin-token"
 
-# Key used to wrap per-tenant API keys before storage. Overridden by
-# SYNAPSE_MASTER_KEY. Unused in Phase 1: no tenant material exists yet.
+# Key used to wrap per-tenant ledger signing secrets before storage. Overridden
+# by SYNAPSE_MASTER_KEY. Required since Phase 18: provisioning mints a signing
+# secret for every tenant, and that write cannot happen without this key, so the
+# plane refuses to boot without one.
+#
+# It must be exactly 64 hexadecimal characters (32 bytes) -- AES-256's key size
+# (tenant.masterKeyFromEnv enforces both the encoding and the length). The value
+# below is a shape-correct DEV PLACEHOLDER: replace it in any real deployment,
+# and note that a "change-me-..." style placeholder is not hex and will make
+# provisioning fail.
 # Secret: never logged.
-# DEV PLACEHOLDER -- replace or blank it in any real deployment.
-master-key: "dev-only-placeholder-master-key"
+master-key: "1f8b0a4c2d9e73511f8b0a4c2d9e73511f8b0a4c2d9e73511f8b0a4c2d9e7351"
 
 # Startup log verbosity: debug, info, warn, or error (anything else falls back
 # to info). No environment override.

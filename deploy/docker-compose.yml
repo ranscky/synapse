@@ -62,7 +62,11 @@ services:
       # replace all three before any real deployment.
       SYNAPSE_JWT_SECRET: change-me-in-production-must-be-32-chars
       SYNAPSE_ADMIN_TOKEN: change-me-admin-token
-      SYNAPSE_MASTER_KEY: change-me-master-key-32-chars-min
+      # Exactly 64 hex characters, i.e. the 32 bytes AES-256-GCM needs to wrap
+      # each tenant's ledger signing secret. It must be hex: the plane refuses
+      # any other shape (tenant.masterKeyFromEnv) and provisioning fails with it,
+      # so a "change-me-..." placeholder here would half-provision every tenant.
+      SYNAPSE_MASTER_KEY: 1f8b0a4c2d9e73511f8b0a4c2d9e73511f8b0a4c2d9e73511f8b0a4c2d9e7351
 
 volumes:
   synapse_pg_data:

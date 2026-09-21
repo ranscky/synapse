@@ -187,6 +187,27 @@ func main() {
 		go syncer.RunBackground(syncCtx, storeInstance)
 	}
 
+	// Phase 18: an enterprise tenant's node writes every compiled trace to the
+	// audit ledger. The decision, the tenant, and the pool are settled here --
+	// once, before the router serves -- because the compile path has no place to
+	// make them: it is called by frozen v1 code (internal/proxy, internal/api)
+	// that passes no tenant at all, so the sink is installed on the compiler
+	// instead and reads this node's own credential. Nothing here can block or
+	// fail a compilation: the ledger's pool is opened at boot, and the append
+	// itself happens in a goroutine that no request waits on.
+	if cfg.ControlPlaneURL != "" {
+		closeLedger, ledgerEnabled, err := enableEnterpriseLedger(*cfg)
+		switch {
+		case err != nil:
+			// A warning, not a fatal: an audit sink that cannot be wired must
+			// never stop this node from compiling for its tenant.
+			slog.Warn("Audit ledger disabled", "error", err)
+		case ledgerEnabled:
+			defer closeLedger()
+			slog.Info("Audit ledger enabled: every compiled trace is appended for this enterprise tenant")
+		}
+	}
+
 	// If the configured model path isn't found relative to the current
 	// directory (the standalone-archive layout), try package-manager and
 	// OS-standard fallback locations before giving up.

@@ -157,7 +157,7 @@ func main() {
 	srv := plane.NewServer(
 		cfg,
 		pool,
-		tenant.NewProvisioner(cfg, tenant.NewStore(pool)),
+		tenant.NewProvisioner(cfg, tenant.NewStore(pool), pool),
 		memoryStore,
 		memoryStore,
 		ledgerVerifier,

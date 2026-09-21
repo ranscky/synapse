@@ -159,11 +159,23 @@ func applyEnvOverrides(cfg *PlaneConfig) {
 // offending key and never include its value: a validation failure is still a
 // line in the log, so a rejected secret must not be echoed there.
 //
-// DatabaseDSN and JWTSecret are fatal-by-design. AdminToken and MasterKey are
-// deliberately not required yet -- Phase 1 registers no authenticated route,
-// so demanding them now would make every local dev box mint credentials it
-// cannot use. They become required in the phase that introduces auth and
-// tenant key wrapping.
+// DatabaseDSN, JWTSecret, and MasterKey are fatal-by-design. AdminToken is
+// deliberately not required yet: a plane without one refuses POST /v2/tenants
+// with a 401 rather than provisioning anything, so the missing credential fails
+// closed at the route that needs it.
+//
+// MasterKey became required in Phase 18, which is the phase Phase 1's note
+// named: provisioning now mints each tenant's ledger signing secret, and that
+// secret is AES-256-GCM-wrapped under this key. A plane booting without it would
+// accept a provisioning request, commit the tenant row, and then fail to store
+// the secret -- a half-provisioned tenant whose audit chain can never be written
+// or verified. Refusing to boot is the cheaper failure, and it is the same
+// reasoning that made jwt-secret fatal.
+//
+// The key's *shape* is deliberately not checked here. Hex-decoding it and
+// demanding exactly 32 bytes is internal/tenant's rule (masterKeyFromEnv), next
+// to the code that uses it; duplicating it in this package would be two rules to
+// keep in step, which is how the two drift apart.
 func (c *PlaneConfig) Validate() error {
 	if c.ListenAddr == "" {
 		return fmt.Errorf("plane: listen-addr is required")
@@ -183,6 +195,10 @@ func (c *PlaneConfig) Validate() error {
 
 	if len(c.JWTSecret) < MinJWTSecretLen {
 		return fmt.Errorf("plane: jwt-secret is too short, minimum %d characters required", MinJWTSecretLen)
+	}
+
+	if c.MasterKey == "" {
+		return fmt.Errorf("plane: master-key is required to wrap tenant signing secrets (set it in the config file or %s)", EnvMasterKey)
 	}
 
 	if c.LedgerRetentionDays < 0 {

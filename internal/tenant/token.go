@@ -48,6 +48,52 @@ type TokenIdentity struct {
 	TeamID string
 }
 
+// ParseTokenClaims reads the identity out of a tenant token, without verifying
+// its signature.
+//
+// It exists for exactly one caller: the edge node, which holds the JWT the plane
+// issued it as its own credential (control-plane-api-key) and needs that token's
+// tenant id and plan -- to know which tenant's audit ledger its compilations
+// belong in, and whether that tenant's plan is one that ledger records. The edge
+// has no JWT secret, so it cannot verify the token; the plane does, and does, on
+// every request that token is presented for (see auth.go's JWTMiddleware, which
+// is the only path that trusts a token that arrived over the wire).
+//
+// The narrowness of what this returns is the safety property. It reads claims
+// and grants nothing: no signature check, no expiry check, no admin flag, and no
+// decision is made from it except "which tenant am I" and "what plan did the
+// plane put in my own credential". A caller must pass a value it owns -- never a
+// header, a body, or a query parameter -- because a caller-supplied token here
+// would be an unverified claim believed as fact.
+//
+// It fails closed on a token it cannot parse at all, and reports an identity
+// with empty fields rather than an error when the token is well-formed but
+// carries no tenant: a caller that needs a tenant id must check for one.
+func ParseTokenClaims(token string) (TokenIdentity, error) {
+	if token == "" {
+		return TokenIdentity{}, fmt.Errorf("tenant: no token to read claims from")
+	}
+
+	parsed, _, err := jwt.NewParser().ParseUnverified(token, &claims{})
+	if err != nil {
+		return TokenIdentity{}, fmt.Errorf("tenant: parse tenant token claims: %w", err)
+	}
+
+	payload, ok := parsed.Claims.(*claims)
+	if !ok {
+		return TokenIdentity{}, fmt.Errorf("tenant: tenant token carries no readable claims")
+	}
+
+	return TokenIdentity{
+		TenantID: payload.TenantID,
+		Slug:     payload.TenantSlug,
+		Plan:     payload.Plan,
+		Tier:     payload.ComplianceTier,
+		AgentID:  payload.AgentID,
+		TeamID:   payload.TeamID,
+	}, nil
+}
+
 // IssueToken mints the tenant JWT handed back at provisioning time.
 //
 // The payload is the same unexported claims struct JWTMiddleware parses, so the
