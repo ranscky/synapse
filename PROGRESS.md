@@ -6548,3 +6548,269 @@ still belongs with whichever phase touches `POST /v2/tenants` next; recording
 `GET /v2/compliance/chain-integrity`'s successful reads (Phase 21 finding 1) is still small enough to
 ride along; and Phase 23's finding 3 (a compile with no memories is indistinguishable from a compile
 that failed to retrieve) is unchanged, now joined by its search-side twin, finding 2 above.
+
+---
+
+## Phase 25 — synapse_write_memory MCP tool (complete)
+
+Phase 23 gave the MCP surface a compiler and Phase 24 gave it the read half; this phase gives it the
+write. `synapse_write_memory` stores one memory through the same sanitization pipeline every other
+write path in this process runs, embeds it with the same model, and answers with four facts and
+nothing else: the uuid it was stored under, whether the pipeline had to rewrite the content, whether
+it contradicts a memory the node already holds, and the id of the memory it contradicts. It never
+returns the content it was given — sanitized or otherwise — and it never logs it.
+
+Commit `feat: Phase 25 - synapse_write_memory MCP tool`
+
+New files:
+
+- `internal/mcp/write.go` — 253 lines: the tool definition and its schema, `writeArgs`, the handler,
+  `parseWriteArgs`/`validMemoryType`, and the `defaultWriteSessionID` constant.
+- `internal/mcp/write_conflict.go` — 67 lines: `writeConflictCandidatePool` and `conflictingMemoryID` —
+  the one part of this tool that is about the memories the node already holds rather than about the
+  write, with its own rationale for living in this layer instead of in the store.
+- `internal/mcp/write_result.go` — 29 lines: `writeToolResult`, split out of `write.go` on the same
+  seam that split `search_result.go` from `search.go` — the line count, not the taste: registration,
+  handler, validation and detection are already 250 lines, and the payload is another 30.
+- `internal/mcp/write_test.go` — 376 lines: the DoD round trip, the DoD injection case, the conflict
+  case the brief does not ask for, the rejection table, the registration/schema test, and the
+  `writeStore` double they share.
+
+Changed:
+
+- `internal/mcp/server.go` — 246 → 263 lines: `registerTools` gains one line, and the package doc gains
+  the Phase 25 paragraph plus a revision of its `.clinerules` paragraph. The write tool is the first
+  tool here that answers with neither a score breakdown nor a trace id, and the doc says why — it
+  surfaces nothing, so it is explained by its id and its conflict verdict — rather than leaving a
+  reader to infer that the rule was forgotten.
+- `internal/mcp/compile.go` — 278 → 285 lines: the `errorTypeWriteFailed` constant, kept beside its two
+  siblings for the reason Phase 24 recorded.
+- `bin/synapse` — **not** staged, and not rebuilt by this phase. It was already dirty at the first
+  `git status` of this session (`M bin/synapse`) and Phases 22-24 made the same call.
+
+### The conflict verdict forced a real decision, because `store.Write` reports nothing
+
+The brief says "call `store.Write(ctx, entry)`" and "return `conflict_detected` bool", and those two are
+only compatible if something tells this layer what the store thought. Nothing does:
+
+- `store.Backend.Write` returns `error` and nothing else (`internal/store/factory.go:31`), so no
+  verdict can come back with the write;
+- on the Postgres backend the verdict exists, but it is produced *inside* `Write` by a
+  `ConflictDetector` that only `cmd/plane` installs (`SetConflictDetector`), and it is written into the
+  row's `conflict_status`/`conflict_with_id` columns rather than returned;
+- the SQLite backend has no conflict columns at all, so on a standalone node there is no verdict stored
+  anywhere to read back — and a read-back would need a by-id read the `Backend` contract does not have;
+- `internal/store` is a v1 package this phase was told not to touch, so widening `Write` was not an
+  option.
+
+`write_conflict.go` therefore runs detection in this layer: `conflict.NewContradictionDetector` over the
+candidates `store.Search` returns, reporting what it found. Three properties are what make that a reuse
+rather than a second implementation:
+
+1. **The same detector the plane installs.** `internal/conflict` is a v2 package (import-only, which is
+   allowed), its `ContradictionDetector` is stateless, and `cmd/plane/main.go:149` passes the same
+   constructor with `conflict.DefaultJaccardThreshold`.
+2. **The same threshold from the same config key.** `cfg.ConflictJaccardThreshold`, whose default 0.4
+   the config file documents as having to stay in step with `conflict.DefaultJaccardThreshold`; a zero
+   value resolves to that constant — the "unset means default" convention this project uses for every
+   numeric knob — which is what makes a hand-built `Config` in a test behave like a configured node.
+3. **The same best-effort policy.** A candidate read that fails is logged and treated as "no
+   contradiction", exactly as `pgconflict.go` documents for its own detection: a write must not gain a
+   new failure mode from a feature whose whole purpose is to annotate a row that is otherwise perfectly
+   storable.
+
+The candidate set is the store's own `Search` at *this node's* identity (`cfg.AgentID`/`cfg.TeamID`) and
+the session the memory is being written into — the same backend the row lands in, under the same
+visibility predicate, which is the pair this detector exists for, and never anything the caller can
+name. The control plane is deliberately **not** consulted, unlike the search tool: a write's detection is
+best effort by policy, a plane pull would cost a second embedding, and it would return candidates that
+are not stored where this row is. `TestWriteMemoryReportsAConflict` pins both halves — the verdict
+itself, using `internal/conflict`'s own documented fixture pair (`"We decided to use Postgres"` against
+`"We decided to use MySQL"`, Jaccard 0.667, inside the 0.4 gate), and the exact reader scope the
+candidate read was made at.
+
+### The response cannot echo the content, and the tests check that rather than trusting it
+
+`.clinerules` for this phase says the sanitized content must never come back, and there are three
+distinct ways content could leak into this response: a `content` field, the error path quoting what
+failed to embed, and the log line. All three are closed:
+
+- `writeToolResult` has no content field at all, so there is nothing for a future edit to populate by
+  accident;
+- the embed failure path logs the cause and hands the caller a fixed sentence (the Phase 23/24 pattern:
+  an embedding error can name a model path, and that does not belong in a model's context);
+- the log line carries the memory id, the type, the visibility and the two booleans — no content, and
+  no session either, because a session is how private memories are addressed.
+
+The two DoD tests assert it from the outside: each takes the tool's own JSON text and
+`require.NotContains` the content it just sent. The injection test goes further and checks the **flag
+against storage** rather than against itself — it reads the row back with `GetRecent` and requires
+`"[SANITIZED]"`, because `sanitized: true` is a claim about what the store now holds, and a test that
+only checked the claim would pass for a tool that reported the flag and stored the original.
+
+That is also why the tool calls `store.Sanitize` itself instead of only relying on `Write` to do it:
+`Write` sanitizes silently, and a caller cannot ask a silent function what it did. `store.Sanitize` is
+the exported, package-level form of exactly the same pipeline (`internal/store/syncqueue.go`, which
+Phase 8 added for the same reason on the plane's write path) — one pattern list, one truncation rule,
+one place to change them, and the second pass inside `Write` is idempotent: neither `"[SANITIZED]"` nor
+an already-capped prefix re-triggers anything.
+
+### Defaults: three small judgment calls, all named here rather than buried
+
+1. **`default-visibility` is finally read.** The brief says the default is `"org"`, and this node's
+   config key says the same thing about itself (`config.go:82`: "DefaultVisibility is applied to
+   memories written with no visibility of their own") while nothing had ever read it. An omitted
+   `visibility` therefore resolves to `cfg.DefaultVisibility`, falling back to `store.VisibilityOrg`
+   when a hand-built `Config` leaves it blank. On every default-configured node that is `"org"`, exactly
+   as the brief specifies; on a node whose operator set `default-visibility: private`, the write tool
+   honours it, which is what the key was written for.
+2. **`session_id` is an optional argument defaulting to `"default-session"`.** The brief's schema named
+   no session, and a schema with no session is unimplementable on this project's backends: the
+   standalone store's reads are `WHERE session_id = ?` (`store.go:250`), so a memory written outside
+   every session is a memory no search can reach — the write would succeed and the DoD's round trip
+   would fail. The argument mirrors the search tool's optional `session_id`, is validated by the same
+   `api.ValidateSessionID`, and its default is the same `"default-session"` literal that
+   `api.extractSessionID` and `proxy` already fall back to.
+3. **The annotation hints are explicit, including the ones that are `false`.** `readOnlyHint: false`
+   (it writes), `destructiveHint: false` (every call inserts a new row under a freshly generated uuid;
+   no call updates or deletes an existing one — the SQLite backend only replaces on an id collision,
+   which a new uuid cannot cause, and the Postgres backend inserts `ON CONFLICT (id) DO NOTHING`), and
+   `idempotentHint: false` (two identical calls store two memories under two ids). mcp-go's defaults
+   describe every tool as destructive, so the destructive claim is the one that had to be made
+   explicitly; the registration test asserts all three, because a client gates on them.
+
+### Verification (real output, this phase)
+
+```text
+$ gofmt -l internal/mcp/*.go                     # empty
+$ go vet ./internal/mcp ./cmd/synapse
+VET_OK
+$ go build ./...
+BUILD_OK
+
+$ go test ./internal/mcp/... -run TestWriteMemory -v
+=== RUN   TestWriteMemoryStoresItAndSearchFindsIt
+2026/09/22 10:58:14 INFO Store initialized db_path=/tmp/TestWriteMemoryStoresItAndSearchFindsIt2874516267/001/mcp-write.db
+2026/09/22 10:58:14 INFO MCP memory write memory_id=663b90ea-776f-4522-bb72-29da88a6a4bb memory_type=decision visibility=org sanitized=false conflict_detected=false
+    write_test.go:128: synapse_write_memory response: {"id":"663b90ea-776f-4522-bb72-29da88a6a4bb","conflict_detected":false,"conflict_with_id":"","sanitized":false}
+2026/09/22 10:58:14 INFO MCP memory search trace_id=search-681e69ad42ebd392 visibility=org top_k=10 candidates=1 memories=1
+--- PASS: TestWriteMemoryStoresItAndSearchFindsIt (0.35s)
+=== RUN   TestWriteMemorySanitizesInjectionPattern
+2026/09/22 10:58:14 INFO Store initialized db_path=/tmp/TestWriteMemorySanitizesInjectionPattern3612561400/001/mcp-write.db
+2026/09/22 10:58:14 WARN Prompt injection detected and neutralized pattern="ignore all"
+2026/09/22 10:58:14 INFO MCP memory write memory_id=39ce700b-035b-4dc9-a194-9268e7fda2a3 memory_type=context visibility=org sanitized=true conflict_detected=false
+    write_test.go:184: synapse_write_memory response (injection): {"id":"39ce700b-035b-4dc9-a194-9268e7fda2a3","conflict_detected":false,"conflict_with_id":"","sanitized":true}
+--- PASS: TestWriteMemorySanitizesInjectionPattern (0.29s)
+=== RUN   TestWriteMemoryReportsAConflict
+2026/09/22 10:58:14 INFO MCP memory write memory_id=831830bf-ef4c-41a1-8802-827095f632b5 memory_type=decision visibility=org sanitized=false conflict_detected=true
+    write_test.go:234: synapse_write_memory response (conflict): {"id":"831830bf-ef4c-41a1-8802-827095f632b5","conflict_detected":true,"conflict_with_id":"existing-memory","sanitized":false}
+--- PASS: TestWriteMemoryReportsAConflict (0.00s)
+=== RUN   TestWriteMemoryRejectsInvalidArguments
+=== RUN   TestWriteMemoryRejectsInvalidArguments/an_unknown_memory_type_is_not_stored
+=== RUN   TestWriteMemoryRejectsInvalidArguments/a_missing_memory_type_is_not_stored
+=== RUN   TestWriteMemoryRejectsInvalidArguments/blank_content_is_not_stored
+=== RUN   TestWriteMemoryRejectsInvalidArguments/content_with_a_null_byte_is_not_stored
+=== RUN   TestWriteMemoryRejectsInvalidArguments/an_unknown_visibility_is_not_stored
+=== RUN   TestWriteMemoryRejectsInvalidArguments/an_illegal_session_id_is_not_stored
+--- PASS: TestWriteMemoryRejectsInvalidArguments (0.01s)
+    --- PASS: TestWriteMemoryRejectsInvalidArguments/an_unknown_memory_type_is_not_stored (0.00s)
+    --- PASS: TestWriteMemoryRejectsInvalidArguments/a_missing_memory_type_is_not_stored (0.00s)
+    --- PASS: TestWriteMemoryRejectsInvalidArguments/blank_content_is_not_stored (0.00s)
+    --- PASS: TestWriteMemoryRejectsInvalidArguments/content_with_a_null_byte_is_not_stored (0.00s)
+    --- PASS: TestWriteMemoryRejectsInvalidArguments/an_unknown_visibility_is_not_stored (0.00s)
+    --- PASS: TestWriteMemoryRejectsInvalidArguments/an_illegal_session_id_is_not_stored (0.00s)
+=== RUN   TestWriteMemoryToolIsRegisteredAndAdvertisesItsSchema
+--- PASS: TestWriteMemoryToolIsRegisteredAndAdvertisesItsSchema (0.01s)
+PASS
+ok  	synapse/internal/mcp	0.678s
+
+$ go test ./internal/mcp/...
+ok  	synapse/internal/mcp	3.547s
+
+$ go test ./...
+ok  	synapse/cmd/synapse	0.024s
+ok  	synapse/internal/api	(cached)
+ok  	synapse/internal/classifier	(cached)
+ok  	synapse/internal/compiler	(cached)
+ok  	synapse/internal/conflict	(cached)
+ok  	synapse/internal/dedup	(cached)
+ok  	synapse/internal/embedder	(cached)
+ok  	synapse/internal/integration	(cached)
+ok  	synapse/internal/mcp	3.160s
+ok  	synapse/internal/plane	(cached)
+ok  	synapse/internal/proxy	(cached)
+ok  	synapse/internal/retrieval	(cached)
+ok  	synapse/internal/scorer	(cached)
+ok  	synapse/internal/store	(cached)
+ok  	synapse/internal/supersession	(cached)
+ok  	synapse/internal/sync	(cached)
+ok  	synapse/internal/tenant	(cached)
+ok  	synapse/internal/trace	(cached)
+EXIT=0
+```
+
+### Findings, limitations, and what this phase did not do
+
+1. **On a standalone node, detection can only see one session.** The local backend's `Search` is
+   `WHERE session_id = ?` (`store.go:250`), so the cross-agent, cross-session contradiction
+   `internal/conflict` exists for — "we decided to use Postgres" on one node, "we decided to use MySQL"
+   on another — is undetectable on a node with no control plane. Fixing it means changing
+   `internal/store`'s `Search` or adding a cross-session candidate read, both v1 (out of scope for this
+   phase). Same shape as Phase 24's finding 1, and the same owner.
+2. **The reported verdict and the stored row's `conflict_status` are two different things on a
+   plane-backed node.** This tool labels nothing, because it cannot: the SQLite table has no conflict
+   columns and `PGStore` owns its own. If the node's `PGStore` happens to have a detector installed,
+   `Write` marks its verdict on the rows while this tool reports the one it computed. They agree in
+   algorithm and threshold but not in candidate set — `PGStore` compares against the 20 most recent
+   org-scoped memories, this compares against the 20 most similar ones the node may read — so the two
+   can disagree on the margin. A future phase that wants literally one verdict should return it from
+   `Write`, which is a v1 signature change and therefore not this phase's to make.
+3. **A memory written here is never queued for sync.** `SyncStatus` is left blank so each backend applies
+   its own default (`local_only` locally, `synced` on the plane), which is exactly what the proxy's and
+   the compile path's writes do — nothing on the edge ever sets `sync_pending`. So a write performed
+   through this tool on an edge node does not reach the control plane. Whoever owns the edge's push loop
+   should decide whether it should; it is a one-line change at the write site and a policy question
+   rather than a technical one.
+4. **The candidate read and the insert are not atomic.** Two concurrent writes with contradictory content
+   can both compare against a store that does not yet hold the other, and neither is flagged. This is
+   the store's own shape too (`detectConflict` runs before the insert there as well), and the failure
+   mode is a missing label rather than a lost or corrupted memory.
+5. **Twenty candidates, chosen by similarity.** `writeConflictCandidatePool` mirrors
+   `store.conflictCandidateLimit`, so a contradiction with a memory outside the 20 nearest is missed — by
+   design and by precedent rather than by accident. Note the two pools are *ordered* differently
+   (similarity here, recency there), which is what finding 2 turns on.
+6. **No rate limit.** Unchanged from Phase 24's finding 5: every call is one embedding pass plus one
+   candidate search, and a local process looping on `tools/call` is unbounded.
+7. **A `team`-scoped write on a node with no team id is not rejected here.** `PGStore.visibilityForWrite`
+   narrows it to `private` and logs; the SQLite backend ignores visibility entirely. This tool validates
+   the three scope names and passes the value through, deliberately leaving the normalization to the
+   store, which documents itself as the one place a write's scope is decided — so a caller asking for
+   team scope on a standalone node gets neither an error nor the scope it named. If that is the wrong
+   call, the fix belongs in `write.go`'s validation rather than in three places.
+8. **The DoD asks for the tests in `server_test.go`, and they live in `write_test.go`.** `server_test.go`
+   is the transport file (227 lines: the stdio and TCP seams), and the five tests here would have carried
+   it past the 300-line cap. Every tool since Phase 23 has its own test file (`compile_test.go`,
+   `search_test.go`) and this one keeps that shape. The DoD's command, `-run TestWriteMemory`, is
+   unaffected — all five run under it.
+
+### Next phase
+
+The MCP surface now has all three verbs — compile, read, and write — and the differentiator the
+`.clinerules` describe holds across them: the two tools that surface a memory show its S/R/I/T
+breakdown and a trace id, and the one that stores a memory answers with the id and the conflict verdict
+that are the only two facts a write can be explained by. The obvious next items: a listing/recall tool
+for a known session (which would owe the same breakdown and the same reader scope), the
+`candidates_considered` field Phase 24 finding 2 asked for, the rate limit from Phase 24 finding 5, and
+finding 3 above — whether a write performed on an edge node should reach the plane — which is small and
+belongs to whoever owns the push loop. Finding 1 belongs to whoever next touches `internal/store`'s
+standalone `Search`, and finding 2 to whoever decides whether `Write` should return its verdict.
+
+Nothing carried over from Phases 17-24 has moved: the external anchor for each tenant's chain head
+(Phase 17 finding 2, Phase 18 finding 6, Phase 20 finding 8) is still what makes "the chain was
+deleted" and "nothing was ever appended" the same answer; `tenant.RunMigrations`' advisory lock
+(Phase 20 finding 1) is still the smallest; metering is still the phase that would make the compliance
+report's summary honest; the compliance-tier provisioning field still belongs with whichever phase
+touches `POST /v2/tenants` next; recording `GET /v2/compliance/chain-integrity`'s successful reads
+(Phase 21 finding 1) is still small enough to ride along; and Phase 23's finding 3 (a compile with no
+memories is indistinguishable from a compile that failed to retrieve) is unchanged, now with its
+search-side twin (Phase 24 finding 2) and its write-side counterpart above (finding 5).

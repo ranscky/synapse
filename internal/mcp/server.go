@@ -14,14 +14,28 @@
 // ranking, and every result carrying score_s/score_r/score_i/score_t/score_total
 // plus the fields that explain a demotion. It never writes.
 //
+// Phase 25 adds the direct write, synapse_write_memory (write.go), which stores
+// one memory the caller hands it and answers with the two things the caller cannot
+// know from its own side: whether the sanitization pipeline had to rewrite the
+// content, and whether the memory contradicts one the node already holds. That
+// second answer is why the tool is not a plain insert, and why write_conflict.go
+// exists: store.Write reports only an error, so this layer runs the same
+// contradiction detector the control plane installs and reports its verdict.
+//
 // Three .clinerules for this package are visible in the code rather than only in
 // prose: the tools accept memory content and therefore share the REST write
 // path's sanitization pipeline (compile goes through the store's write, which
-// sanitizes, and both tools go through internal/api's own input validators); the
-// search tool builds a reader scope from this node's configured identity and
-// never from the request, so no argument can widen what it reads; and both tools
-// return the per-memory 4-factor score breakdown plus a trace id, so a caller can
-// see why a memory was surfaced rather than only that it was.
+// sanitizes; search and write go through internal/api's own input validators, and
+// the write tool additionally runs the store's exported Sanitize itself so it can
+// report what the pipeline did); the search tool builds a reader scope from this
+// node's configured identity and never from the request, so no argument can widen
+// what it reads, and the write tool takes the agent and team it stores under from
+// that same configuration for the same reason; and both tools that surface a
+// memory return the per-memory 4-factor score breakdown plus a trace id, so a
+// caller can see why a memory was surfaced rather than only that it was. The write
+// tool answers with neither score nor trace because it surfaces nothing -- it
+// reports a stored memory's id and its conflict verdict, the only two facts a
+// write can be explained by.
 package mcp
 
 import (
@@ -141,12 +155,15 @@ func NewServer(memStore Store, cfg config.Config, pipeline Compiler, emb Embedde
 //
 // Each tool's definition and handler live in their own file, so this list stays
 // a table of what the server offers rather than a place where tool logic
-// accumulates: see compile.go for synapse_compile and search.go for
+// accumulates: see compile.go for synapse_compile, search.go for
 // synapse_search_memories, whose result shape lives beside it in
-// search_result.go.
+// search_result.go, and write.go for synapse_write_memory, whose contradiction
+// check and response shape live beside it in write_conflict.go and
+// write_result.go.
 func (s *Server) registerTools() {
 	s.registerCompileTool()
 	s.registerSearchTool()
+	s.registerWriteTool()
 }
 
 // Serve runs the MCP server over transport until ctx is cancelled.

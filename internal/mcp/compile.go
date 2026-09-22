@@ -175,6 +175,13 @@ const (
 	// failed. It is separate from invalid_params so a caller can tell "fix your
 	// arguments" apart from "this server cannot answer that"; see search.go.
 	errorTypeSearchFailed = "search_failed"
+	// errorTypeWriteFailed is a write that could not be performed -- a
+	// deployment built without a store or an embedder, a content the embedder
+	// refused, or a store that refused the insert. Kept apart from invalid_params
+	// for the same reason search_failed is, and because the write is the one tool
+	// here whose failure leaves nothing behind to interpret: the caller has to
+	// know that nothing was stored. See write.go.
+	errorTypeWriteFailed = "write_failed"
 )
 
 // errorEnvelope is the JSON body of a tool error.
