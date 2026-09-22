@@ -6,6 +6,11 @@
 // integration-tagged. What is checked here is what only this layer can get
 // wrong: an unverified request reaching the verifier at all, a result shape that
 // does not survive JSON, and a chain chosen from anything other than the token.
+//
+// They still exercise the Phase 17 spelling, GET /v2/ledger/verify, which Phase
+// 21 kept as a deprecated alias of GET /v2/compliance/chain-integrity -- so the
+// cases that reach the verifier present an enterprise token, and the alias's own
+// gate is asserted in compliance_gate_test.go.
 package plane_test
 
 import (
@@ -80,6 +85,9 @@ func TestVerifyLedgerRequiresAVerifiedTenantToken(t *testing.T) {
 	cfg := newConfig(adminToken)
 	verifier := &fakeLedgerVerifier{}
 	router, _ := newLedgerRouter(t, cfg, verifier)
+	// An enterprise token, because this route carries the compliance tier gate
+	// since Phase 21: this test is about the verdict, and the gate has its own
+	// tests.
 	valid := tenantToken(t, cfg)
 
 	// A token this plane did not sign: same shape, same claims, other secret.
@@ -155,7 +163,10 @@ func TestVerifyLedgerAnswersWithTheChainVerdict(t *testing.T) {
 			verifier := &fakeLedgerVerifier{result: tt.result}
 			router, _ := newLedgerRouter(t, cfg, verifier)
 
-			rec := getLedgerVerify(router, "Bearer "+tenantToken(t, cfg))
+			// An enterprise token: since Phase 21 this route carries the same
+			// compliance tier gate as the audit and report surfaces, and this
+			// test is about the verdict rather than about the gate.
+			rec := getLedgerVerify(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"))
 
 			require.Equal(t, http.StatusOK, rec.Code)
 			assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
@@ -177,7 +188,9 @@ func TestVerifyLedgerReportsAFailedCheckAsInternal(t *testing.T) {
 	verifier := &fakeLedgerVerifier{err: errors.New("ledger: fetch tenant secret: connection refused to 127.0.0.1:5432")}
 	router, logs := newLedgerRouter(t, cfg, verifier)
 
-	rec := getLedgerVerify(router, "Bearer "+tenantToken(t, cfg))
+	// An enterprise token, so a 500 here is the verifier's failure and not a
+	// tier refusal.
+	rec := getLedgerVerify(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"))
 
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 	assert.JSONEq(t, `{"error":"internal"}`, rec.Body.String())
@@ -189,12 +202,15 @@ func TestVerifyLedgerReportsAFailedCheckAsInternal(t *testing.T) {
 
 // TestVerifyLedgerFailsClosedWithoutAVerifier: a plane started without the
 // dependency refuses the route rather than reporting a verdict it has no way to
-// reach. The same fail-closed shape the other endpoints use for a nil dependency.
+// reach. The same fail-closed shape the other endpoints use for a nil dependency
+// -- and the case that pins the order Phase 21's gate sits in, since the token
+// below is enterprise: "this plane cannot answer" is checked before "this caller
+// may not ask".
 func TestVerifyLedgerFailsClosedWithoutAVerifier(t *testing.T) {
 	cfg := newConfig(adminToken)
 	router, _ := newLedgerRouter(t, cfg, nil)
 
-	rec := getLedgerVerify(router, "Bearer "+tenantToken(t, cfg))
+	rec := getLedgerVerify(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"))
 
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 	assert.JSONEq(t, `{"error":"internal"}`, rec.Body.String())

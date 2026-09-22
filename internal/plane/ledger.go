@@ -1,10 +1,21 @@
-// The audit-ledger chain verification endpoint: GET /v2/ledger/verify.
+// The audit-ledger chain verification endpoint: GET
+// /v2/compliance/chain-integrity, with GET /v2/ledger/verify kept as its
+// deprecated Phase 17 alias.
 //
 // Split out of handlers.go for the same reason the sync, search, and tenant
 // provisioning endpoints live in their own files: handlers.go holds the server,
 // the routes, and the shared HTTP helpers, and every file in this project is
 // held to the 300-line ceiling. This endpoint is the smallest of the four -- one
 // dependency, no request body, one result type.
+//
+// Phase 21 renamed the surface to match Phase 19's audit page and Phase 20's
+// report -- all three answer questions about the same ledger, and a path under
+// /v2/compliance/ is what says so -- and put the enterprise-tier gate the other
+// two already had in front of it. The Phase 17 path is still routed, because it
+// shipped to deployments and a client written against it must not break; both
+// paths reach this one handler, so neither can answer differently, and the gate
+// lives in the handler rather than on a route so neither can be gated
+// differently either.
 //
 // That result type is declared *here*, in the HTTP package, rather than in
 // internal/ledger, and the import graph is what decides that: internal/ledger
@@ -23,12 +34,21 @@ import (
 	"time"
 )
 
-// ledgerVerifyRoute is the chain verification endpoint's path, referenced by
-// both the route registration and the handler's own documentation.
+// complianceChainIntegrityRoute is the chain verification endpoint's canonical
+// path, referenced by both the route registration and the handler's own
+// documentation. It is also the endpoint name an access record for a refused
+// call carries, so the route and the audit row cannot drift apart.
+const complianceChainIntegrityRoute = "/v2/compliance/chain-integrity"
+
+// ledgerVerifyRoute is the same endpoint's Phase 17 path, kept as a deprecated
+// alias: a client written against it keeps working, and it is registered to the
+// same handler as the canonical path so the two cannot disagree about what they
+// answer or about which tier they require.
 const ledgerVerifyRoute = "/v2/ledger/verify"
 
 // ChainIntegrityResult is the answer to "is this tenant's audit ledger intact?":
-// the body of GET /v2/ledger/verify on both a clean chain and a broken one.
+// the body of GET /v2/compliance/chain-integrity on both a clean chain and a
+// broken one.
 //
 // Both timestamps are emitted as RFC 3339 UTC. first_break_id is empty when the
 // chain is valid, and first_break_at is then the zero time -- deliberately sent
@@ -60,8 +80,9 @@ type ChainIntegrityResult struct {
 	CheckedAt time.Time `json:"checked_at"`
 }
 
-// LedgerVerifier is everything GET /v2/ledger/verify needs from the ledger's
-// read path: verify one tenant's hash chain and report what the walk found.
+// LedgerVerifier is everything GET /v2/compliance/chain-integrity needs from the
+// ledger's read path: verify one tenant's hash chain and report what the walk
+// found.
 //
 // Like MemoryWriter and MemorySearcher it is declared on the consumer side,
 // because internal/ledger cannot be imported here (see the file header), so this
@@ -82,8 +103,9 @@ type LedgerVerifier interface {
 	VerifyChain(ctx context.Context, tenantID string) (ChainIntegrityResult, error)
 }
 
-// handleVerifyLedger serves GET /v2/ledger/verify: verify the caller's chain,
-// answer with what the walk found.
+// handleVerifyLedger serves GET /v2/compliance/chain-integrity -- and, through
+// the deprecated alias, GET /v2/ledger/verify: verify the caller's chain, answer
+// with what the walk found.
 //
 // The chain is chosen by the verified token and nothing else: there is no path,
 // query, body, or header parameter naming a tenant, which is what keeps this
@@ -92,6 +114,18 @@ type LedgerVerifier interface {
 // empty one -- the middleware rejects a token that names no tenant, so an empty
 // id here means the route was wired without it, and a fail-closed 401 is the
 // only safe reading of that.
+//
+// Phase 21 put the compliance tier gate the audit and report surfaces already
+// had in front of this one, so a token that is not enterprise is refused before
+// the chain is walked. The order is the one those endpoints document -- identity,
+// then dependency, then the gate, then the read -- which is why the gate sits
+// after the nil-verifier check: "this plane cannot answer" comes before "this
+// caller may not ask". The refusal carries the same body as its siblings' and,
+// when this plane has an auditor wired, the same access-log record; the window
+// half of that record is empty because this route has no query parameters to
+// record. There is no read here to withhold from a refused caller -- the walk
+// itself is the thing being gated -- so the gate's only job is to keep the
+// verdict and the chain's row ids out of an unentitled caller's hands.
 //
 // A broken chain is a 200, because the check itself succeeded. An error status
 // would collapse "your ledger no longer verifies" into "the check could not
@@ -110,6 +144,17 @@ func (s *Server) handleVerifyLedger(w http.ResponseWriter, r *http.Request) {
 
 	if s.ledger == nil {
 		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+
+	// The gate sits here, after the two checks above and before the walk: a
+	// caller this plane cannot identify or cannot answer at all is told so
+	// first, and a caller that may not ask never reaches the walk. The
+	// canonical route name is recorded rather than the path that was
+	// requested, because the record names the compliance surface that was
+	// asked for and not the spelling the caller happened to use -- and because
+	// a route constant is not caller input.
+	if !s.requireComplianceTier(w, r, complianceChainIntegrityRoute, tenantID, "") {
 		return
 	}
 

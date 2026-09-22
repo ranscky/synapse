@@ -23,7 +23,9 @@
 //     dependency, tier, parameters, read -- and reads the verified
 //     compliance_tier claim rather than the registry row, for the reason Phase 19
 //     documented: the claim is what the plane signed for the token the caller is
-//     actually holding.
+//     actually holding. Phase 21 moved the implementation of that gate into
+//     requireComplianceTier (compliance_tier.go), where the chain-integrity
+//     surface reads it too.
 //   - Every call that reaches a verified tenant is recorded in
 //     synapse_global.compliance_access_log before it is answered, refusals
 //     included, and a read that cannot be recorded is refused. A report is the
@@ -95,15 +97,11 @@ func (s *Server) handleComplianceReport(w http.ResponseWriter, r *http.Request) 
 
 	params, reason := parseReportParams(r)
 
-	if ComplianceTierFromCtx(r.Context()) != complianceTierEnterprise {
-		if !s.requireAccessRecord(w, r, complianceReportRoute, tenantID, params.redacted, http.StatusForbidden) {
-			return
-		}
-
-		writeJSON(w, http.StatusForbidden, complianceTierRequiredResponse{
-			Error:      "compliance_tier_required",
-			UpgradeURL: complianceUpgradeURL,
-		})
+	// The gate before the caller's parameters, as on the audit endpoint: a
+	// non-enterprise caller is refused before its window is validated, and the
+	// parsed parameters travel with the refusal into the access record. See
+	// requireComplianceTier.
+	if !s.requireComplianceTier(w, r, complianceReportRoute, tenantID, params.redacted) {
 		return
 	}
 

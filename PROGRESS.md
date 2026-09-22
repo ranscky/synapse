@@ -5395,3 +5395,258 @@ breakdown plus `trace_id` on the plane's memory-search surface is still queued f
 the shape `.clinerules` requires of MCP responses, and now the third surface (after the audit page
 and this report) where those fields would be read.
 
+## Phase 21 — the compliance tier gate on every compliance surface (complete)
+
+Phases 19 and 20 each built a compliance endpoint and each put the same gate in front of
+it. Phase 17's `GET /v2/ledger/verify` — the chain verdict, which is the third thing a
+compliance officer asks the same ledger — had no gate at all: a `team` or `business` JWT
+could walk its own chain, read its own entry ids and break timestamps, and get a verdict
+that Phase 19 and Phase 20 would have refused to read the same rows for. This phase closes
+that, and closes it by making the gate one thing instead of three:
+
+- `GET /v2/compliance/chain-integrity` is the chain verdict's canonical path. Phase 17's
+  `/v2/ledger/verify` is still routed, as a deprecated alias of the *same handler*.
+- `requireComplianceTier` (`internal/plane/compliance_tier.go`) is the one place the tier
+  is compared, the one place the `403` body is written, and the one place a refusal is
+  recorded. All three surfaces call it, so they cannot drift apart.
+- Every refusal answers exactly
+  `{"error":"compliance_tier_required","upgrade_url":"https://synapse.ai/enterprise"}`,
+  from enterprise, business, and team tokens alike.
+
+No v1 internal package was touched. `internal/ledger` and `internal/tenant` were read and
+*not* changed: `compliance_access_log.endpoint` is plain `text` (Phase 19's migration), so
+the third surface name needed no schema work, and `openapi.yaml` documents `/v1/*` and
+`/health` only, which is Phase 19's reason for leaving it alone again rather than making
+it asymmetric. `internal/plane` was the only package that changed.
+
+Commit `feat: Phase 21 - 403 enforcement on all compliance endpoints`
+
+New files:
+
+- `internal/plane/compliance_tier.go` — 81 lines: `requireComplianceTier`, plus the two
+  arguments that are worth writing down — why it is a handler helper and not chi
+  middleware (the refusal's access record is written *with* the answer's status code, and
+  middleware runs before the handler that knows the tenant and the parsed window), and why
+  the gate lives in the handler rather than on a route (two paths reach one handler, so a
+  route-attached gate would leave whichever spelling was registered without it open).
+- `internal/plane/compliance_gate_test.go` — 233 lines: `TestComplianceGate`, the 3×3
+  matrix (three surfaces × enterprise/business/team = the nine cases the definition of
+  done names), and `TestLedgerVerifyAliasIsGatedByComplianceTier` for the alias, whose
+  name deliberately does *not* match `-run TestComplianceGate` so the definition-of-done
+  command keeps reporting exactly nine.
+
+Changed:
+
+- `internal/plane/ledger.go` — 136 → 181 lines: `complianceChainIntegrityRoute` added,
+  `ledgerVerifyRoute` kept and documented as the deprecated alias, the gate inserted after
+  the identity and dependency checks, and the file, type, interface, and handler docs
+  rewritten to name both paths.
+- `internal/plane/handlers.go` — 219 → 227 lines: both paths registered to
+  `s.handleVerifyLedger`, and the `Routes` comment rewritten for three compliance surfaces.
+- `internal/plane/compliance.go` — 245 → 249 lines: the inline gate block (ten lines)
+  replaced by one `requireComplianceTier` call; the tier and upsell constants' docs widened
+  from one endpoint to the surfaces they now gate.
+- `internal/plane/compliance_report.go` — 285 → 283 lines: the same replacement, and the
+  tier-gate bullet in the file header now points at the shared implementation.
+- `internal/plane/compliance_types.go` — 201 → 207 lines: `AccessRecord.Endpoint` names all
+  three surfaces and says the record carries the canonical name rather than the spelling
+  the caller used; `ComplianceAuditor` is "the compliance surfaces'" dependency now.
+- `internal/plane/ledger_test.go` — 222 → 238 lines: the three cases that reach the
+  verifier present an enterprise token, and the dependency-before-tier order is pinned in
+  a comment on `TestVerifyLedgerFailsClosedWithoutAVerifier`. The two 401 cases are
+  untouched, because the middleware still refuses them before any gate runs.
+
+Renamed:
+
+- `internal/plane/compliance_gate_test.go` → `compliance_audit_gate_test.go` (225 lines,
+  contents unchanged, `git mv`). That file is the audit endpoint's refusal suite; the
+  name the brief asked for now holds the matrix that covers all three surfaces, and the
+  rename makes it symmetric with `compliance_report_gate_test.go`, which it already sat
+  beside.
+
+### The breaking change, stated plainly
+
+A `team` or `business` token presented to `GET /v2/ledger/verify` got `200` with a chain
+verdict from Phase 17 through Phase 20, and gets `403` now. That was verified rather than
+assumed before the change: on `bca0303`, `TestVerifyLedgerAnswersWithTheChainVerdict`
+passed while presenting `tenantToken` (plan `team`, tier `team`) to that route, and it is
+updated in this phase to present an enterprise token instead. The path itself was kept —
+precisely so the break is the tier requirement and not a `404` for every deployed client
+holding the old URL — and the requirement is the point of the phase: the same chain rows
+that the audit page refuses to page for a `team` tenant were readable as a verdict.
+
+### Decisions
+
+1. **Alias, not a rename.** There are no callers of `/v2/ledger/verify` left in this
+   repository (`grep '/v2/ledger'` finds the route, its tests, and prose comments), so a
+   rename would have been mechanically safe *here* — but the route shipped in Phase 17 to
+   deployments this repository cannot see. Keeping it costs one `router.Get` line and one
+   constant, and it turns a client-breaking change into a tier requirement.
+2. **The gate is in the handler, not on the route.** Two paths reach one handler, so a
+   gate attached to a route would have to be attached twice and would be one edit away
+   from being attached once. It also preserves what Phases 19 and 20 documented: the
+   refusal is *recorded before it is answered*, which a pre-handler middleware could not
+   do — it has no verified window to record, because the handler that parses one has not
+   run yet.
+3. **A helper, not middleware, for the audit and report surfaces too.** Collapsing the two
+   existing inline blocks into the same helper is what makes "all three surfaces refuse
+   identically" a property rather than a coincidence; the 403 body and the reason string
+   now exist in exactly one place in the codebase.
+4. **The refusal is recorded, and the record names the surface rather than the spelling.**
+   A refusal reached through the alias writes `complianceChainIntegrityRoute` into
+   `compliance_access_log.endpoint`, because the record answers "which compliance surface
+   was asked for", and because a route constant is not caller input.
+5. **Identity, then dependency, then tier.** The gate sits *after* the nil-verifier check,
+   which is the order the audit and report handlers already document. So a plane started
+   without a chain verifier answers `500` to an enterprise caller rather than `403` to
+   everyone, and `TestVerifyLedgerFailsClosedWithoutAVerifier` pins that with an
+   enterprise token.
+6. **The matrix moves plan and tier together; the claim-versus-plan distinction is pinned
+   elsewhere.** A real business tenant has plan `business` *and* tier `business`, so the
+   nine cases read that way. That a gate written against `plan` would be wrong is asserted
+   by the alias test's `plan=enterprise, tier=team` case, and by Phases 19/20's existing
+   `no tier`, `hipaa`, and `Enterprise` cases on the audit and report surfaces.
+
+### Test output
+
+The definition of done, run against the working tree (`-count=1` only disables the test
+cache, so what is pasted is what ran):
+
+```text
+$ go test ./internal/plane/... -run TestComplianceGate -v -count=1
+=== RUN   TestComplianceGate
+=== RUN   TestComplianceGate/compliance_audit/enterprise
+=== RUN   TestComplianceGate/compliance_audit/business
+=== RUN   TestComplianceGate/compliance_audit/team
+=== RUN   TestComplianceGate/compliance_chain_integrity/enterprise
+=== RUN   TestComplianceGate/compliance_chain_integrity/business
+=== RUN   TestComplianceGate/compliance_chain_integrity/team
+=== RUN   TestComplianceGate/compliance_report/enterprise
+=== RUN   TestComplianceGate/compliance_report/business
+=== RUN   TestComplianceGate/compliance_report/team
+--- PASS: TestComplianceGate (0.00s)
+    --- PASS: TestComplianceGate/compliance_audit/enterprise (0.00s)
+    --- PASS: TestComplianceGate/compliance_audit/business (0.00s)
+    --- PASS: TestComplianceGate/compliance_audit/team (0.00s)
+    --- PASS: TestComplianceGate/compliance_chain_integrity/enterprise (0.00s)
+    --- PASS: TestComplianceGate/compliance_chain_integrity/business (0.00s)
+    --- PASS: TestComplianceGate/compliance_chain_integrity/team (0.00s)
+    --- PASS: TestComplianceGate/compliance_report/enterprise (0.00s)
+    --- PASS: TestComplianceGate/compliance_report/business (0.00s)
+    --- PASS: TestComplianceGate/compliance_report/team (0.00s)
+PASS
+ok  	synapse/internal/plane	0.008s
+```
+
+Nine of nine. The alias's own case, deliberately outside that filter:
+
+```text
+$ go test ./internal/plane/... -run TestLedgerVerifyAlias -v -count=1
+=== RUN   TestLedgerVerifyAliasIsGatedByComplianceTier
+=== RUN   TestLedgerVerifyAliasIsGatedByComplianceTier/enterprise_tier
+=== RUN   TestLedgerVerifyAliasIsGatedByComplianceTier/enterprise_plan,_team_tier
+--- PASS: TestLedgerVerifyAliasIsGatedByComplianceTier (0.00s)
+    --- PASS: TestLedgerVerifyAliasIsGatedByComplianceTier/enterprise_tier (0.00s)
+    --- PASS: TestLedgerVerifyAliasIsGatedByComplianceTier/enterprise_plan,_team_tier (0.00s)
+PASS
+ok  	synapse/internal/plane	0.006s
+```
+
+Regression, run with this phase's tree:
+
+```text
+$ go test ./internal/plane/... -count=1
+ok  	synapse/internal/plane	0.115s
+
+$ go test ./... -count=1
+?   	synapse/cmd/benchmark	[no test files]
+?   	synapse/cmd/counttokens	[no test files]
+?   	synapse/cmd/mergesessions	[no test files]
+?   	synapse/cmd/plane	[no test files]
+ok  	synapse/cmd/synapse	0.011s
+ok  	synapse/internal/api	1.040s
+ok  	synapse/internal/budget	0.278s
+ok  	synapse/internal/classifier	0.008s
+ok  	synapse/internal/compiler	0.758s
+ok  	synapse/internal/config	0.004s
+ok  	synapse/internal/conflict	0.007s
+ok  	synapse/internal/dedup	0.006s
+ok  	synapse/internal/embedder	3.949s
+ok  	synapse/internal/integration	1.964s
+?   	synapse/internal/ledger	[no test files]
+ok  	synapse/internal/plane	0.505s
+ok  	synapse/internal/proxy	0.569s
+ok  	synapse/internal/retrieval	0.018s
+ok  	synapse/internal/scorer	0.012s
+?   	synapse/internal/session	[no test files]
+ok  	synapse/internal/store	6.314s
+ok  	synapse/internal/supersession	0.010s
+ok  	synapse/internal/sync	6.472s
+ok  	synapse/internal/tenant	0.775s
+ok  	synapse/internal/trace	0.200s
+
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+    go test ./internal/plane/... -tags integration -count=1
+ok  	synapse/internal/plane	17.194s
+```
+
+The integration run (91 PASS lines, 0 FAIL) is the one that matters most here: it wires the
+real `ledger.Auditor`, the real chain verifier, and a real PostgreSQL, and it includes
+Phase 19's and Phase 20's assertions about `compliance_access_log` itself — the row a
+refused read must leave, carrying its endpoint, response code, window, and hashed address —
+plus `TestComplianceReportPrefersMeteringAndRefusesATeamTenant`, which asserts the report's
+`403` against a real team token. All of them pass unchanged, which is the evidence that
+collapsing the two inline gates into `requireComplianceTier` was behaviour-preserving.
+`gofmt -l internal/plane` is empty, and the longest file this phase touched is
+`compliance_report.go` at 283 lines.
+
+### Findings this phase surfaced (not fixed here — this phase is a gate)
+
+1. **The chain verdict's *success* path is still not access-logged, while its refusals now
+   are.** A refused chain-integrity call writes a `403` row when an auditor is wired; a
+   successful one writes nothing, because Phase 17's handler had no access record and this
+   phase did not add one. That asymmetry is deliberate — a gate is not a feature, and
+   adding a record to the success path means deciding what an "endpoint read" means for a
+   route with no query parameters and no body — but it is a real gap: "tenant X read its
+   chain verdict at T" is not recoverable from the access log today, and it is the one
+   compliance surface where that is true.
+2. **A failed access-log write turns a chain-integrity `403` into a `500`.** This follows
+   from recording the refusal at all, and it is the same coupling the audit and report
+   endpoints have always had: refuse rather than answer unrecorded. The weaker alternative
+   — log the failure and refuse anyway with `403` — was rejected because it makes "every
+   refusal is recorded" a best effort. What it costs is now explicit: a chain-integrity
+   refusal is the answer whose *shape* depends on the access-log database.
+3. **Tier staleness, inherited and now three surfaces wide.** The gate reads the signed
+   `compliance_tier` claim, never the registry row (Phase 19's decision, kept), so a tenant
+   downgraded from enterprise keeps reading the audit page, the chain verdict, and the
+   report until its token is replaced. Phase 19 stated this for one surface; it is now the
+   same statement for all three, and there is still no token-revocation path.
+4. **`GET /v2/ledger/verify` is now a compliance surface that is not named like one.** The
+   alias keeps deployed clients working, but it also means the compliance surface set is
+   larger than the `/v2/compliance/*` prefix suggests — a reader auditing "which routes
+   require enterprise" cannot answer it by reading route paths alone. `handlers.Routes`'
+   comment and `compliance_tier.go` both say so, and a future phase that dares a
+   deprecation window could remove the alias and make the prefix the whole answer.
+5. **The three surfaces refuse with one body and one link.** `403`
+   `{"error":"compliance_tier_required","upgrade_url":"https://synapse.ai/enterprise"}` is
+   now identical everywhere by construction, which is what the brief asked for. It also
+   means the body cannot tell a client which surface it was refused on — the access log
+   can, the response cannot. That is the price of uniformity and it is stated rather than
+   discovered later.
+
+### Next phase
+
+Nothing about the gate is left queued; what is queued is the same list the last three
+phases ended with, plus one item this phase made sharper. The largest is still the external
+anchor for each tenant's chain head (Phase 17 finding 2, Phase 18 finding 6, Phase 20
+finding 8), without which "the whole chain was deleted" and "nothing was ever appended"
+remain the same answer. The smallest is `tenant.RunMigrations`' advisory lock (Phase 20
+finding 1). Metering is the phase that would make Phase 20's summary honest rather than
+merely explicit. The compliance-tier provisioning field belongs with whichever phase
+touches `POST /v2/tenants` next. And item 1 above is new and small enough to travel with
+any of them: record the chain verdict's successful reads, so the one compliance surface
+whose successes are invisible stops being the exception.
+
+
+
+

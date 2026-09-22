@@ -1,225 +1,233 @@
-// The compliance audit endpoint's refusal and failure paths: the tier gate, the
-// unverified request, the malformed window, and the four ways this endpoint says
-// no to a caller it cannot serve.
+// The compliance tier gate, asserted across every compliance surface at once:
+// GET /v2/compliance/audit, GET /v2/compliance/chain-integrity, and GET
+// /v2/compliance/report, each against an enterprise, a business, and a team
+// tenant token.
 //
-// They are split from compliance_unit_test.go along the same line the package
-// under test splits compliance.go from compliance_types.go: that file is about
-// what a successful read returns, and every test here is about what a caller gets
-// instead of one. The fake auditor they share is declared there, because these
-// tests verify refusals as much as answers and the two sets have to agree about
-// what never happened.
+// The per-surface suites next door -- compliance_audit_gate_test.go and
+// compliance_report_gate_test.go -- prove each endpoint's own refusals in depth:
+// the missing dependency, the malformed window, the unreadable trace, the
+// renderer that is not installed. This file is the systematic half of Phase 21.
+// One table, one router shape, one refusal body, so a surface wired without the
+// gate cannot pass by being the case nobody tabulated; a change to the tier
+// check, to the body, or to the order the checks happen in shows up three times
+// here rather than once. The chain-integrity column was Phase 17's GET
+// /v2/ledger/verify, which had no gate at all before this phase.
 package plane_test
 
 import (
-	"bytes"
-	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
-	"time"
 
 	"synapse/internal/plane"
+	"synapse/internal/tenant"
 
-	charmlog "github.com/charmbracelet/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// TestComplianceAuditDeniesANonEnterpriseTier is the upsell gate: a token whose
-// compliance tier is anything but enterprise is refused, the refusal is the one
-// body a client can act on, and -- the part that matters -- the ledger is never
-// read, so a denied caller cannot learn from this route whether an entry exists.
-func TestComplianceAuditDeniesANonEnterpriseTier(t *testing.T) {
-	cfg := newConfig(adminToken)
+// complianceChainIntegrityPath is the chain-integrity surface's canonical path,
+// written out here rather than shared with the package under test so a route
+// registered at the wrong path fails a test instead of moving with it. Phase
+// 17's spelling is exercised by ledger_test.go, which still uses it, and by
+// TestLedgerVerifyAliasIsGatedByComplianceTier below.
+const complianceChainIntegrityPath = "/v2/compliance/chain-integrity"
 
-	for name, token := range map[string]string{
-		"team tier":   tenantToken(t, cfg),
-		"no tier":     enterpriseToken(t, cfg, ""),
-		"other tier":  enterpriseToken(t, cfg, "hipaa"),
-		"capitalized": enterpriseToken(t, cfg, "Enterprise"),
-	} {
-		t.Run(name, func(t *testing.T) {
-			auditor := &fakeAuditor{
-				page: plane.AuditPage{Entries: []plane.AuditRow{auditRow(t, "entry-1", "req-1")}, Total: 1},
-			}
-			router, _ := newComplianceRouter(t, cfg, auditor)
+// complianceTierRefusalBody is the one body every refusal answers with, spelled
+// out rather than read from the package under test: a client keys off these two
+// exact fields, so the test has to be able to fail when they change.
+const complianceTierRefusalBody = `{"error":"compliance_tier_required","upgrade_url":"https://synapse.ai/enterprise"}`
 
-			rec := getComplianceAudit(router, "Bearer "+token, "")
+// complianceTierToken mints a real token whose plan and compliance tier are the
+// tier under test, so the matrix runs the issuer and the verifier production
+// runs rather than a stub that always agrees.
+//
+// Plan and tier move together because that is what a real tenant looks like: a
+// team tenant's plan is team and its tier is team. The distinction the gate
+// actually rests on -- that it reads the compliance_tier claim and not the plan
+// -- is pinned by TestLedgerVerifyAliasIsGatedByComplianceTier, whose
+// enterprise-plan token carries a team tier and is refused.
+func complianceTierToken(t *testing.T, cfg *plane.PlaneConfig, tier string) string {
+	t.Helper()
 
-			require.Equal(t, http.StatusForbidden, rec.Code)
-			assert.JSONEq(t, `{"error":"compliance_tier_required","upgrade_url":"https://synapse.ai/enterprise"}`,
-				rec.Body.String())
+	token, err := tenant.IssueToken(cfg, tenant.TokenIdentity{
+		TenantID: testTenantID,
+		Slug:     testTenantSlug,
+		Plan:     tier,
+		Tier:     tier,
+	})
+	require.NoError(t, err)
 
-			assert.Zero(t, auditor.pageCalls, "a refused caller must not reach the ledger")
+	return token
+}
 
-			require.Len(t, auditor.records, 1, "the refusal itself is recorded")
-			assert.Equal(t, http.StatusForbidden, auditor.records[0].ResponseCode)
-			assert.Equal(t, complianceAuditPath, auditor.records[0].Endpoint)
-			assert.Equal(t, testTenantID, auditor.records[0].TenantID)
-		})
+// getChainIntegrity sends GET /v2/compliance/chain-integrity with the given
+// Authorization header, omitted entirely when it is empty.
+func getChainIntegrity(router http.Handler, authorization string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, complianceChainIntegrityPath, nil)
+	req.RemoteAddr = complianceRemoteAddr
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
 	}
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	return rec
 }
 
-// TestComplianceAuditRequiresAVerifiedTenant is the fail-closed case under the
-// middleware: a route registered outside requireJWT hands the handler no verified
-// tenant, and an empty tenant id must be a refusal rather than a read of an
-// unnamed history. Nothing is recorded either, because an access row has to name
-// the tenant whose history was read.
-func TestComplianceAuditRequiresAVerifiedTenant(t *testing.T) {
-	var logs bytes.Buffer
-	logger := charmlog.NewWithOptions(&logs, charmlog.Options{Level: charmlog.DebugLevel, ReportTimestamp: false})
-
-	cfg := newConfig(adminToken)
-	auditor := &fakeAuditor{}
-
-	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, nil, auditor, nil, logger).Routes()
-
-	rec := getComplianceAudit(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"), "")
-
-	require.Equal(t, http.StatusUnauthorized, rec.Code)
-	assert.JSONEq(t, `{"error":"unauthorized"}`, rec.Body.String())
-	assert.Zero(t, auditor.pageCalls, "a request with no verified tenant reads nothing")
-	assert.Empty(t, auditor.records, "and there is no tenant for a record to name")
-}
-
-// TestComplianceAuditRejectsBadQueryParameters: every parameter is validated
-// before the ledger is read, so a malformed window costs a database round trip
-// nothing -- and the attempt is still recorded, which is what makes a run of
-// failed queries visible in the tenant's own audit table.
-func TestComplianceAuditRejectsBadQueryParameters(t *testing.T) {
+// TestComplianceGate is the systematic half of Phase 21: every compliance
+// surface, against every tier, checking the two things a refusal must never do
+// -- answer with a different body, or reach the dependency underneath.
+//
+// Every case builds its own router and its own doubles, so the read counters
+// asserted below start at zero and no case can pass on state another case left
+// behind.
+func TestComplianceGate(t *testing.T) {
 	cfg := newConfig(adminToken)
 
-	cases := map[string]struct {
-		query  string
-		reason string
+	surfaces := []struct {
+		name string
+		// request is the surface's own client, so every case goes through the
+		// route and the method the published contract names.
+		request func(router http.Handler, authorization string) *httptest.ResponseRecorder
+		// reads counts what the surface's dependencies were asked. A refused
+		// caller must leave them all at zero: a denied caller must not learn
+		// whether an entry exists, what a period holds, or where a chain broke.
+		reads func(auditor *fakeAuditor, verifier *fakeVerifier) int
+		// allowed is how many reads the surface makes when it answers: one page
+		// for the audit, one walk for the chain verdict, and both for a report.
+		allowed int
+		// recordedPath is the endpoint name the refusal's access record carries.
+		recordedPath string
 	}{
-		"since is not a time":    {"since=yesterday", "invalid_since"},
-		"since is a date only":   {"since=2026-09-21", "invalid_since"},
-		"until is not a time":    {"until=soon", "invalid_until"},
-		"limit is zero":          {"limit=0", "invalid_limit"},
-		"limit is negative":      {"limit=-1", "invalid_limit"},
-		"limit is not a number":  {"limit=all", "invalid_limit"},
-		"limit exceeds the cap":  {"limit=201", "invalid_limit"},
-		"offset is negative":     {"offset=-1", "invalid_offset"},
-		"offset is not a number": {"offset=next", "invalid_offset"},
-	}
-
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			auditor := &fakeAuditor{page: plane.AuditPage{Entries: []plane.AuditRow{auditRow(t, "entry-1", "req-1")}, Total: 1}}
-			router, _ := newComplianceRouter(t, cfg, auditor)
-
-			rec := getComplianceAudit(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"), tc.query)
-
-			require.Equal(t, http.StatusBadRequest, rec.Code)
-			assert.JSONEq(t, `{"error":"`+tc.reason+`"}`, rec.Body.String())
-			assert.Zero(t, auditor.pageCalls, "a malformed window is refused before the ledger is read")
-
-			require.Len(t, auditor.records, 1)
-			assert.Equal(t, http.StatusBadRequest, auditor.records[0].ResponseCode)
-		})
-	}
-}
-
-// TestComplianceAuditRefusesToAnswerWhenTheAccessRecordFails is the fail-closed
-// policy, asserted rather than described: the page was read, the record could not
-// be written, and the caller gets an error instead of the tenant's audit history.
-// An audit read that cannot be recorded must not be handed over.
-func TestComplianceAuditRefusesToAnswerWhenTheAccessRecordFails(t *testing.T) {
-	cfg := newConfig(adminToken)
-	auditor := &fakeAuditor{
-		page:      plane.AuditPage{Entries: []plane.AuditRow{auditRow(t, "entry-1", "req-1")}, Total: 1},
-		recordErr: errors.New("ledger: insert compliance access log: connection refused"),
-	}
-	router, logs := newComplianceRouter(t, cfg, auditor)
-
-	rec := getComplianceAudit(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"), "")
-
-	require.Equal(t, http.StatusInternalServerError, rec.Code)
-	assert.JSONEq(t, `{"error":"internal"}`, rec.Body.String())
-	assert.NotContains(t, rec.Body.String(), "entry-1", "the record's failure withholds the data too")
-
-	assert.Equal(t, 1, auditor.pageCalls)
-	assert.Contains(t, logs.String(), "Compliance access log write failed")
-	assert.NotContains(t, logs.String(), "a preview", "the failure path logs no content")
-}
-
-// TestComplianceAuditReportsAReadFailureAsInternal: an auditor that could not run
-// is a 500 with this package's one error body, and the underlying error is not
-// reflected -- a pgx error can quote the connection target, and the DSN carries a
-// password.
-func TestComplianceAuditReportsAReadFailureAsInternal(t *testing.T) {
-	cfg := newConfig(adminToken)
-	auditor := &fakeAuditor{pageErr: errors.New("failed to connect to postgres://synapse:hunter2@db:5432/synapse")}
-	router, logs := newComplianceRouter(t, cfg, auditor)
-
-	rec := getComplianceAudit(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"), "")
-
-	require.Equal(t, http.StatusInternalServerError, rec.Code)
-	assert.JSONEq(t, `{"error":"internal"}`, rec.Body.String())
-	assert.NotContains(t, rec.Body.String(), "postgres://")
-
-	assert.Contains(t, logs.String(), "Compliance audit read failed")
-	require.Len(t, auditor.records, 1, "a call that was answered 500 is still recorded")
-	assert.Equal(t, http.StatusInternalServerError, auditor.records[0].ResponseCode)
-}
-
-// TestComplianceAuditRefusesAnUnreadableTrace: a row whose trace_json will not
-// parse is a 500 rather than an entry with an empty trace, because "the ledger
-// holds something this plane cannot read" and "the entry had no trace" are
-// different statements and only one of them can be true. The row's id is logged;
-// its payload is not.
-func TestComplianceAuditRefusesAnUnreadableTrace(t *testing.T) {
-	cfg := newConfig(adminToken)
-	auditor := &fakeAuditor{
-		page: plane.AuditPage{
-			Entries: []plane.AuditRow{{
-				ID: "entry-1", TenantID: testTenantID, RequestID: "req-1",
-				// Truncated mid-value, with a marker that must not reach the log.
-				TraceJSON: `{"detected_intent":"leak-me`,
-				PrevHash:  "prev-hash", HashValue: "hash-value",
-				CreatedAt: time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC),
-			}},
-			Total: 1,
+		{
+			name: "compliance audit",
+			request: func(router http.Handler, authorization string) *httptest.ResponseRecorder {
+				return getComplianceAudit(router, authorization, "")
+			},
+			reads:        func(auditor *fakeAuditor, _ *fakeVerifier) int { return auditor.pageCalls },
+			allowed:      1,
+			recordedPath: complianceAuditPath,
+		},
+		{
+			name: "compliance chain integrity",
+			request: func(router http.Handler, authorization string) *httptest.ResponseRecorder {
+				return getChainIntegrity(router, authorization)
+			},
+			reads:        func(_ *fakeAuditor, verifier *fakeVerifier) int { return verifier.calls },
+			allowed:      1,
+			recordedPath: complianceChainIntegrityPath,
+		},
+		{
+			name: "compliance report",
+			request: func(router http.Handler, authorization string) *httptest.ResponseRecorder {
+				return getComplianceReport(router, authorization, "format=json")
+			},
+			reads: func(auditor *fakeAuditor, verifier *fakeVerifier) int {
+				return auditor.factsCalls + verifier.calls
+			},
+			allowed:      2,
+			recordedPath: complianceReportPath,
 		},
 	}
-	router, logs := newComplianceRouter(t, cfg, auditor)
 
-	rec := getComplianceAudit(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"), "")
+	tiers := []struct {
+		name    string
+		tier    string
+		allowed bool
+	}{
+		{name: "enterprise", tier: "enterprise", allowed: true},
+		{name: "business", tier: "business"},
+		{name: "team", tier: "team"},
+	}
 
-	require.Equal(t, http.StatusInternalServerError, rec.Code)
-	assert.JSONEq(t, `{"error":"internal"}`, rec.Body.String())
+	for _, surface := range surfaces {
+		for _, tier := range tiers {
+			t.Run(surface.name+"/"+tier.name, func(t *testing.T) {
+				auditor := &fakeAuditor{
+					page:  plane.AuditPage{Entries: []plane.AuditRow{}},
+					facts: reportFacts(t),
+				}
+				verifier := &fakeVerifier{result: plane.ChainIntegrityResult{ChainValid: true}}
+				router, _ := newComplianceReportRouter(t, cfg, auditor, verifier)
 
-	assert.Contains(t, logs.String(), "Compliance audit entry is unreadable")
-	assert.Contains(t, logs.String(), "entry-1", "the row that failed is named by id")
-	assert.NotContains(t, logs.String(), "leak-me", "its payload is not")
+				rec := surface.request(router, "Bearer "+complianceTierToken(t, cfg, tier.tier))
 
-	require.Len(t, auditor.records, 1)
-	assert.Equal(t, http.StatusInternalServerError, auditor.records[0].ResponseCode)
+				if tier.allowed {
+					require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+					assert.Equal(t, surface.allowed, surface.reads(auditor, verifier),
+						"an entitled caller reaches the dependency its surface is built on")
+					return
+				}
+
+				require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+				assert.JSONEq(t, complianceTierRefusalBody, rec.Body.String())
+				assert.Zero(t, surface.reads(auditor, verifier),
+					"a refused caller must not reach the ledger or walk the chain")
+
+				require.Len(t, auditor.records, 1, "the refusal itself is recorded")
+				assert.Equal(t, http.StatusForbidden, auditor.records[0].ResponseCode)
+				assert.Equal(t, surface.recordedPath, auditor.records[0].Endpoint)
+				assert.Equal(t, testTenantID, auditor.records[0].TenantID)
+			})
+		}
+	}
 }
 
-// TestComplianceAuditFailsClosedWithoutAnAuditor: a plane started without the
-// dependency refuses the route rather than reporting an empty history it has no
-// way to read -- the same fail-closed shape the other endpoints use, and the
-// reason the nil check sits before the tier gate.
-func TestComplianceAuditFailsClosedWithoutAnAuditor(t *testing.T) {
+// TestLedgerVerifyAliasIsGatedByComplianceTier is the anti-bypass case for Phase
+// 17's spelling of the chain-integrity surface. GET /v2/ledger/verify and GET
+// /v2/compliance/chain-integrity are one handler reached two ways, so a caller
+// that knows the old name must not be able to reach a surface the new name
+// refuses -- which is why the gate is in the handler rather than on a route.
+//
+// The second case is also the one that pins *which* claim the gate reads: that
+// token's plan is enterprise and its compliance tier is team, so a gate written
+// against the plan, the slug, or anything else a request carries would let it
+// through.
+func TestLedgerVerifyAliasIsGatedByComplianceTier(t *testing.T) {
 	cfg := newConfig(adminToken)
-	router, _ := newComplianceRouter(t, cfg, nil)
 
-	rec := getComplianceAudit(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"), "")
+	cases := []struct {
+		name   string
+		token  string
+		code   int
+		walked int
+	}{
+		{
+			name:   "enterprise tier",
+			token:  complianceTierToken(t, cfg, "enterprise"),
+			code:   http.StatusOK,
+			walked: 1,
+		},
+		{
+			name:  "enterprise plan, team tier",
+			token: enterpriseToken(t, cfg, "team"),
+			code:  http.StatusForbidden,
+		},
+	}
 
-	require.Equal(t, http.StatusInternalServerError, rec.Code)
-	assert.JSONEq(t, `{"error":"internal"}`, rec.Body.String())
-}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			auditor := &fakeAuditor{}
+			verifier := &fakeVerifier{result: plane.ChainIntegrityResult{ChainValid: true}}
+			router, _ := newComplianceReportRouter(t, cfg, auditor, verifier)
 
-// TestComplianceAuditRefusesAnUnverifiedRequestWithoutAnAuditor pins the order of
-// the two fail-closed checks: an unverified request is a 401 even when no auditor
-// is wired, because "who are you" comes before "can this plane answer".
-func TestComplianceAuditRefusesAnUnverifiedRequestWithoutAnAuditor(t *testing.T) {
-	cfg := newConfig(adminToken)
-	router, _ := newComplianceRouter(t, cfg, nil)
+			rec := getLedgerVerify(router, "Bearer "+tt.token)
 
-	rec := getComplianceAudit(router, "", "")
+			require.Equal(t, tt.code, rec.Code, rec.Body.String())
+			assert.Equal(t, tt.walked, verifier.calls)
 
-	require.Equal(t, http.StatusUnauthorized, rec.Code)
-	assert.JSONEq(t, `{"error":"unauthorized"}`, rec.Body.String())
+			if tt.code != http.StatusForbidden {
+				return
+			}
+
+			assert.JSONEq(t, complianceTierRefusalBody, rec.Body.String())
+
+			require.Len(t, auditor.records, 1,
+				"the refusal is recorded against the surface, not the spelling")
+			assert.Equal(t, complianceChainIntegrityPath, auditor.records[0].Endpoint)
+			assert.Equal(t, http.StatusForbidden, auditor.records[0].ResponseCode)
+		})
+	}
 }

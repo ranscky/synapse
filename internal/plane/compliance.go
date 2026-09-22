@@ -51,9 +51,12 @@ const complianceAuditRoute = "/v2/compliance/audit"
 
 const (
 	// complianceTierEnterprise is the only compliance tier that may read a
-	// tenant's audit history through this endpoint. It is compared against the
-	// verified claim the JWT middleware published, never against anything a
-	// request carries.
+	// tenant's compliance surfaces: the audit page, the chain-integrity
+	// verdict, and the report. It is compared against the verified claim the
+	// JWT middleware published, never against anything a request carries -- and
+	// the comparison is made in one place, requireComplianceTier
+	// (compliance_tier.go), so the three surfaces cannot disagree about who may
+	// read them.
 	//
 	// compiler.EnterprisePlan is the same literal on the write side of the
 	// ledger, and the two are separate constants on purpose: one gates a
@@ -65,9 +68,11 @@ const (
 	complianceTierEnterprise = "enterprise"
 
 	// complianceUpgradeURL is the link a refusal carries. It is a constant
-	// rather than configuration because the response's shape is part of this
-	// endpoint's published contract and a client keys off the field, not the
-	// value; a deployment that needs its own URL changes it here, in one place.
+	// rather than configuration because the response's shape is part of the
+	// compliance surfaces' published contract and a client keys off the field,
+	// not the value; a deployment that needs its own URL changes it here, in
+	// one place -- which is what requireComplianceTier reads, so all three
+	// surfaces answer with the same link.
 	complianceUpgradeURL = "https://synapse.ai/enterprise"
 
 	// defaultCompliancePageLimit is the page size a request that names no limit
@@ -96,7 +101,10 @@ const (
 // parameters, then the read. A caller that is not enterprise is refused before
 // its window is validated, so this route cannot be used to probe what a valid
 // query looks like, and a plane started without an auditor refuses outright
-// rather than answering from a dependency it does not have.
+// rather than answering from a dependency it does not have. The gate itself is
+// requireComplianceTier (compliance_tier.go), shared with the chain-integrity
+// and report surfaces since Phase 21, so all three refuse in the same words and
+// on the same claim.
 //
 // Every answer but the 401 is preceded by its own access record. See
 // requireAccessRecord for why a record that cannot be written refuses the read
@@ -124,15 +132,11 @@ func (s *Server) handleComplianceAudit(w http.ResponseWriter, r *http.Request) {
 
 	params, reason := parseAuditParams(r)
 
-	if ComplianceTierFromCtx(r.Context()) != complianceTierEnterprise {
-		if !s.requireAccessRecord(w, r, complianceAuditRoute, tenantID, params.redacted, http.StatusForbidden) {
-			return
-		}
-
-		writeJSON(w, http.StatusForbidden, complianceTierRequiredResponse{
-			Error:      "compliance_tier_required",
-			UpgradeURL: complianceUpgradeURL,
-		})
+	// The gate before the caller's parameters: a token that is not enterprise is
+	// refused before its window is validated, so this route cannot be used to
+	// probe what a valid query looks like. The parsed window travels with the
+	// refusal into the access record. See requireComplianceTier.
+	if !s.requireComplianceTier(w, r, complianceAuditRoute, tenantID, params.redacted) {
 		return
 	}
 

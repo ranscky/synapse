@@ -16,9 +16,10 @@ import (
 	"synapse/internal/trace"
 )
 
-// ComplianceAuditor is everything the two compliance endpoints need from
+// ComplianceAuditor is everything the compliance surfaces need from
 // synapse_global: one page of a tenant's signed ledger entries, one window's worth
-// of raw report material, and the record that either was read.
+// of raw report material, and the record that either was read -- or that a caller
+// was refused before it could be.
 //
 // Like MemoryWriter, MemorySearcher, and LedgerVerifier it is declared on the
 // consumer side, so this package depends on a behaviour rather than on a
@@ -125,8 +126,12 @@ type AccessRecord struct {
 	// TenantID is the verified token's tenant, and the column the row is keyed
 	// by.
 	TenantID string
-	// Endpoint is the path that was called -- complianceAuditRoute or
-	// complianceReportRoute.
+	// Endpoint is the compliance surface that was called --
+	// complianceAuditRoute, complianceChainIntegrityRoute, or
+	// complianceReportRoute -- and it is the surface's canonical name rather
+	// than the spelling the caller used, so a refusal reached through the
+	// deprecated GET /v2/ledger/verify alias records the same value as one
+	// reached through the canonical path.
 	Endpoint string
 	// QueryParamsRedacted is the caller's window and paging, re-rendered. See
 	// parseAuditParams for what is and is not in it.
@@ -186,7 +191,8 @@ type complianceTierRequiredResponse struct {
 // other than the signed claim would turn a self-declared string into an
 // entitlement. Absent is not a value: the reader below returns "" for it, which
 // is not complianceTierEnterprise, so a route wired without the middleware
-// refuses.
+// refuses. The comparison is made once, in requireComplianceTier
+// (compliance_tier.go), which every compliance surface calls.
 func WithComplianceTier(ctx context.Context, tier string) context.Context {
 	return context.WithValue(ctx, complianceTierKey, tier)
 }
