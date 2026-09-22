@@ -1,6 +1,9 @@
 # Build the Synapse v2 control plane. Build context is the repository root:
 #   docker build -f deploy/Dockerfile.plane -t synapse-plane .
-FROM golang:1.22-alpine AS builder
+# Go 1.25 is a floor rather than a preference: go.mod declares 1.25.5, which
+# github.com/mark3labs/mcp-go v1.1.0 (an edge-node dependency, not the plane's)
+# is what requires.
+FROM golang:1.25-alpine AS builder
 WORKDIR /app
 COPY . .
 # CGO_ENABLED=0 is required, not cosmetic: golang:alpine ships no C toolchain

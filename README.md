@@ -151,7 +151,8 @@ Then:
 
 ### Option 3 — Manual build
 
-Requires Go 1.22+, a C toolchain (the project uses cgo for both SQLite and ONNX Runtime bindings), and ONNX Runtime 1.27.0 available on your system library path (or set via `SYNAPSE_ORT_LIB_PATH`, see below).
+Requires Go 1.25.5+ (that floor is set by github.com/mark3labs/mcp-go v1.1.0, the MCP
+server dependency added in Phase 22, and declared in go.mod), a C toolchain (the project uses cgo for both SQLite and ONNX Runtime bindings), and ONNX Runtime 1.27.0 available on your system library path (or set via `SYNAPSE_ORT_LIB_PATH`, see below).
 
 ```bash
 go build -o synapse ./cmd/synapse

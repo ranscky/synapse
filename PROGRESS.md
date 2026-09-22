@@ -5647,6 +5647,334 @@ touches `POST /v2/tenants` next. And item 1 above is new and small enough to tra
 any of them: record the chain verdict's successful reads, so the one compliance surface
 whose successes are invisible stops being the exception.
 
+## Phase 22 — MCP server boots (complete)
 
+Phase 22 is the first phase of the MCP surface, and it deliberately ships no tools: the server,
+two transports, one placeholder tool (`synapse_ping`), and the plumbing that starts it. What it
+proves is that a request reaches this process and an answer comes back, over both transports,
+without an MCP-aware client in between.
+
+Commit `feat: Phase 22 - MCP server boots`
+
+The dependency is `github.com/mark3labs/mcp-go v1.1.0`, and it moves this project's Go floor.
+`go.mod`'s `go 1.22.5` is now `go 1.25.5`: every published mcp-go version requires at least Go
+1.23 (v0.10.0 through v0.48.0 declare `go 1.23`) and v0.49.0 onward declares `go 1.25.5`, so
+there was no version to pin that avoided the jump. The floor is declared rather than left
+implicit (`go get go@1.25.5`) and the six other places that pinned 1.22 moved with it —
+`ci.yml` (all three jobs), `release.yml`, `deploy/Dockerfile.plane`, `README.md`, `setup.sh`,
+and `.clinerules`' own stack line, since a future session reading "Go 1.22+" would be reading
+something false.
+
+New files:
+
+- `internal/mcp/server.go` — 224 lines: `Server` (store seam + config + the mcp-go server),
+  `NewServer`, `registerTools`, and `Serve(ctx, transport, port)` with its two transports.
+  `Store` names `store.Backend`, the contract `internal/store/factory.go` already declares and
+  that nothing consumed until now: `*store.Store` — what `main` holds — satisfies it as it
+  stands, so the wiring needed no adapter, and no v1 file changed to make it fit. The brief's
+  literal `store store.Store` could not compile: every `Store` method has a pointer receiver at
+  `internal/store/store.go:113-517`, and `*Store` is not assignable to `Store`.
+- `internal/mcp/server_test.go` — 262 lines: five tests, all through mcp-go's own client
+  (in-process and Streamable HTTP), plus a compile-time assertion that `*store.Store` satisfies
+  this package's seam.
+- `.cursor/mcp.json` — the editor template the brief names, written verbatim:
+  `{"mcpServers":{"synapse":{"command":"synapse","args":["--mcp"]}}}`, mode `0600` per the
+  v1 file-permission rule (git records only the exec bit, so this is a local-mode statement).
+
+Changed:
+
+- `cmd/synapse/main.go` — 641 → 713 lines: `--mcp` and `--mcp-port`, the flag merge, the boot
+  block placed after every other initialisation, and a shutdown wait for the MCP transports.
+- `internal/config/config.go` — 339 → 364: `MCPEnabled`/`MCPPort` with defaults `false`/`0`,
+  and one `Validate` rule (`mcp-port` must be 0-65535, zero meaning stdio).
+- `internal/config/config_test.go` — 204 → 259: four validation cases and
+  `TestDefaultConfigMCPKnobs`.
+- `synapse.yaml.example` — `mcp-enabled: false` and `mcp-port: 0`, with the reasoning for the
+  default in the comment above them.
+- `go.mod`/`go.sum`, `ci.yml`, `release.yml`, `deploy/Dockerfile.plane`, `README.md`,
+  `setup.sh`, `.clinerules` — the Go 1.25.5 floor, as above.
+- `bin/synapse` was rebuilt for the manual verification below and is **not** staged: it was
+  already dirty in the working tree before this phase (`M bin/synapse`, last committed in
+  `371186d`), and Phase 21's commit touched source plus PROGRESS.md only. It grew from 17.0 MB
+  to 24.8 MB; CI's 50 MB gate still passes, and the growth is mcp-go's code (jsonschema
+  validation, uritemplate, cast) rather than anything this phase wrote.
+
+### The two transports, and why stdio is what `--mcp` alone gets
+
+`Serve` accepts exactly `"stdio"` and `"tcp"`; anything else is an error rather than a fallback,
+so a typo cannot silently pick a transport.
+
+- **stdio** — `NewStdioServer(...).Listen(ctx, os.Stdin, os.Stdout)`, not mcp-go's convenience
+  `ServeStdio`: `ServeStdio` installs its own signal handler *and* its own context, so it could
+  never stop for the context `main` cancels. `Listen` takes both, reads through a goroutine that
+  selects on `ctx.Done()` (`server/stdio.go:480-498`), and returns the context's error when
+  cancelled — which `serveStdioWith` treats as a clean stop, alongside EOF.
+- **tcp** — Streamable HTTP (`NewStreamableHTTPServer`, endpoint `/mcp`), the current spec
+  transport rather than the deprecated SSE one, bound through `listenAddr`, which hard-codes
+  `127.0.0.1` and rejects any port outside 1-65535. There is no configuration that widens the
+  bind: this server has no authentication of its own yet, so a routable interface would be a
+  memory-readable-by-anyone surface.
+
+`--mcp-port`'s own default (8765) is the port TCP *would* use, not a request for TCP. Writing it
+into `cfg.MCPPort` unconditionally would make the brief's own rule (`cfg.MCPPort > 0` selects
+TCP) unreachable for stdio, and every editor integration would start an HTTP listener nobody
+asked for. So the flag is merged only when it was explicitly passed (`flag.Visit`), and
+`mcp-enabled: true` in the config file works on its own. Three runs pin that behaviour: the flag
+alone (stdio), the flag plus an explicit port (tcp), and the config file with no flags at all
+(both).
+
+### Verification — real output
+
+Build, vet, formatting:
+
+```text
+$ go build ./cmd/synapse && go build -o bin/synapse ./cmd/synapse
+(no output)
+
+$ go vet ./internal/mcp/...
+(no output)
+
+$ gofmt -l internal/mcp
+(no output)
+```
+
+`gofmt -l internal/config cmd/synapse` still lists `config.go`, `config_test.go` and `main.go`,
+and did before this phase: the same three files are already unformatted in HEAD (trailing
+whitespace on blank lines in v1 code, e.g. `main.go:255`). Checked rather than assumed — no line
+this phase added appears in `gofmt -d` for any of them, so nothing here is smuggled in behind a
+reformat that was deliberately not done.
+
+The new tests, through mcp-go's own clients:
+
+```text
+$ go test ./internal/mcp/... -v -count=1
+=== RUN   TestPingToolIsRegisteredAndAnswersPing
+--- PASS: TestPingToolIsRegisteredAndAnswersPing (0.00s)
+=== RUN   TestServeStdioListsPingTool
+--- PASS: TestServeStdioListsPingTool (0.00s)
+=== RUN   TestServeStdioStopsWhenContextIsCancelled
+--- PASS: TestServeStdioStopsWhenContextIsCancelled (0.10s)
+=== RUN   TestServeRejectsUnknownTransport
+--- PASS: TestServeRejectsUnknownTransport (0.00s)
+=== RUN   TestServeTCPBindsLoopbackOnlyAndAnswers
+2026/09/22 09:44:48 INFO MCP server listening transport=tcp addr=127.0.0.1:35073 path=/mcp
+--- PASS: TestServeTCPBindsLoopbackOnlyAndAnswers (0.03s)
+PASS
+ok  	synapse/internal/mcp	0.152s
+
+$ go test ./internal/config/... -v -count=1
+--- PASS: TestConfigValidation/MCP_port_above_the_TCP_range_rejected (0.00s)
+--- PASS: TestConfigValidation/Negative_MCP_port_rejected (0.00s)
+--- PASS: TestConfigValidation/Zero_MCP_port_is_permissive (0.00s)
+--- PASS: TestConfigValidation/MCP_enabled_on_the_default_TCP_port_validates (0.00s)
+--- PASS: TestDefaultConfigMCPKnobs (0.00s)
+PASS
+ok  	synapse/internal/config	0.008s
+```
+
+Regression, run with this phase's tree (the Go directive is 1.25.5 and the toolchain is 1.26.2):
+
+```text
+$ go test ./... -count=1
+?   	synapse/cmd/benchmark	[no test files]
+?   	synapse/cmd/counttokens	[no test files]
+?   	synapse/cmd/mergesessions	[no test files]
+?   	synapse/cmd/plane	[no test files]
+ok  	synapse/cmd/synapse	0.025s
+ok  	synapse/internal/api	0.766s
+ok  	synapse/internal/budget	0.279s
+ok  	synapse/internal/classifier	0.010s
+ok  	synapse/internal/compiler	1.014s
+ok  	synapse/internal/config	0.015s
+ok  	synapse/internal/conflict	0.016s
+ok  	synapse/internal/dedup	0.007s
+ok  	synapse/internal/embedder	2.873s
+ok  	synapse/internal/integration	2.684s
+?   	synapse/internal/ledger	[no test files]
+ok  	synapse/internal/mcp	0.160s
+ok  	synapse/internal/plane	0.465s
+ok  	synapse/internal/proxy	0.466s
+ok  	synapse/internal/retrieval	0.018s
+ok  	synapse/internal/scorer	0.008s
+?   	synapse/internal/session	[no test files]
+ok  	synapse/internal/store	6.384s
+ok  	synapse/internal/supersession	0.020s
+ok  	synapse/internal/sync	6.441s
+ok  	synapse/internal/tenant	0.824s
+ok  	synapse/internal/trace	0.305s
+```
+
+
+
+
+
+
+### The brief's probe, and the handshake behind it
+
+The probe the brief specifies, verbatim except for `timeout` (the process keeps serving the proxy
+after its stdin ends, so it has to be killed) and `--port 8098` (this machine already runs a
+proxy on 8080; without the override the second instance would exit on that bind failure before
+answering, which is finding 2):
+
+```text
+$ printf '%s\n' '{"jsonrpc":"2.0","method":"tools/list","id":1}' | timeout 5 ./bin/synapse --mcp --config synapse.yaml --port 8098 2>/dev/null
+{"jsonrpc":"2.0","id":1,"result":{"tools":[{"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"description":"Liveness probe: answers {\"pong\":true} when the Synapse MCP server is reachable.","inputSchema":{"properties":{},"required":[],"type":"object"},"name":"synapse_ping"}]}}
+--- exit code: 124
+```
+
+`synapse_ping` is listed. This answers without a preceding `initialize` because mcp-go v1.1.0 gates
+exactly one method on session initialization (`setLevel`, `server/server.go:1414`) — worth knowing
+before concluding from a hand-typed probe that the handshake is optional in general. The full
+handshake, including a tool call, on the same transport:
+
+```text
+$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"synapse_ping","arguments":{}}}' \
+  | timeout 5 ./bin/synapse --mcp --config synapse.yaml --port 8098 2>/dev/null
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"synapse","version":"0.1.0"}}}
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"annotations":{...},"description":"Liveness probe: answers {\"pong\":true} when the Synapse MCP server is reachable.","inputSchema":{"properties":{},"required":[],"type":"object"},"name":"synapse_ping"}]}}
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"pong\":true}"}],"structuredContent":{"pong":true}}}
+```
+
+The TCP transport, from `--mcp --mcp-port 8765` to a SIGTERM:
+
+```text
+$ ss -ltnp | grep 8765
+LISTEN 0 4096 127.0.0.1:8765 0.0.0.0:* users:(("synapse",pid=627867,fd=8))
+
+$ curl -sS -D - -o body -X POST http://127.0.0.1:8765/mcp \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-probe","version":"0"}}}'
+HTTP/1.1 200 OK
+Content-Type: application/json
+Mcp-Session-Id: mcp-session-e720fbc4-9e78-4bc1-a4cc-7f17261f6f89
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"synapse","version":"0.1.0"}}}
+
+$ curl -sS -o /dev/null -w 'http %{http_code}\n' -X POST .../mcp -H "Mcp-Session-Id: $SID" \
+    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+http 202
+
+$ curl -sS -X POST .../mcp -H "Mcp-Session-Id: $SID" \
+    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"synapse_ping","arguments":{}}}'
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"pong\":true}"}],"structuredContent":{"pong":true}}}
+
+$ kill -TERM $PID; wait $PID
+exit status: 0
+9:45AM INFO synapse: MCP server started transport=tcp port=8765
+9:45AM INFO synapse: MCP server listening transport=tcp addr=127.0.0.1:8765 path=/mcp
+9:45AM INFO synapse: Shutting down server...
+9:45AM INFO synapse: MCP server stopped
+9:45AM INFO synapse: Server stopped
+
+$ ss -ltn | grep 8765 || echo 'port 8765 released'
+port 8765 released
+```
+
+The listener is `127.0.0.1:8765`: no `0.0.0.0` line appears for it in `ss`, and
+`TestServeTCPBindsLoopbackOnlyAndAnswers` additionally proves the port is **refused** on this
+host's routable address, which is the assertion a `ss` reading alone cannot make.
+
+The startup path itself, with logs where they belong — stderr, so stdout stays a clean JSON-RPC
+stream:
+
+```text
+$ timeout 3 ./bin/synapse --mcp --config synapse.yaml --port 8096 >/tmp/mcp_stdio.out 2>/tmp/mcp_stdio.err
+exit status: 124
+--- stdout ---
+(empty)
+--- stderr ---
+9:45AM INFO synapse: Store initialized db_path=/home/ranscky/.local/share/synapse/synapse.db
+9:45AM INFO synapse: ONNX embedder initialized with real inference model=models/all-MiniLM-L6-v2/model.onnx vocab=models/all-MiniLM-L6-v2/vocab.txt
+9:45AM INFO synapse: Trace inspector available at http://127.0.0.1:8096/ui
+9:45AM INFO synapse: Synapse security: proxy bound to 127.0.0.1:8096, upstream 127.0.0.1:11434, trace persistence false, header redaction active, injection sanitization active
+9:45AM INFO synapse: MCP server started transport=stdio port=0
+9:45AM INFO synapse: Starting Synapse proxy address=127.0.0.1:8096 upstream=http://127.0.0.1:11434
+9:45AM INFO synapse: MCP server listening transport=stdio
+9:45AM INFO synapse: Shutting down server...
+9:45AM INFO synapse: MCP server stopped
+9:45AM INFO synapse: Server stopped
+```
+
+And the config-file half of the switch, with no flags at all (the yaml tags `mcp-enabled` and
+`mcp-port` are therefore proven to be read, not merely documented):
+
+```text
+$ timeout 3 ./bin/synapse --config /tmp/mcp_yaml_test.yaml --port 8095   # mcp-enabled: true, mcp-port: 8766
+9:46AM INFO synapse: MCP server started transport=tcp port=8766
+9:46AM INFO synapse: MCP server listening transport=tcp addr=127.0.0.1:8766 path=/mcp
+9:46AM INFO synapse: MCP server stopped
+
+$ timeout 3 ./bin/synapse --config /tmp/mcp_yaml_stdio.yaml --port 8094 # mcp-enabled: true, mcp-port: 0
+9:46AM INFO synapse: MCP server started transport=stdio port=0
+9:46AM INFO synapse: MCP server listening transport=stdio
+9:46AM INFO synapse: MCP server stopped
+```
+
+### Findings this phase surfaced
+
+1. **One compiled-in v1 dependency moved, and it could not be pinned back.** `go.mod` now needs
+   `github.com/dlclark/regexp2 v1.11.0` where it had v1.10.0: `santhosh-tekuri/jsonschema/v6`
+   (an mcp-go dependency) requires v1.11.0 while `pkoukk/tiktoken-go v0.1.8` requires v1.10.0, so
+   minimal version selection picks the higher one and no `replace` could honestly lower it.
+   regexp2 is the regex engine behind tiktoken's BPE splitter, so this is the one place where
+   "nothing about v1 changed" needed evidence rather than assertion: `internal/budget` and
+   `internal/compiler` (whose assertions are token counts) pass unchanged, as does the whole
+   suite above. The same `go mod tidy` also re-pruned two indirect entries (`kr/text`,
+   `rogpeppe/go-internal`) that are now reachable only through mcp-go's own graph; nothing in the
+   tree imports either.
+2. **`--mcp` does not replace the proxy, so a second instance dies on the bind clash.** The brief
+   is explicit that the MCP server starts after every other initialisation, and that is what the
+   code does — but `main.go`'s existing `ListenAndServe` failure path is `os.Exit(1)`, so an
+   editor-spawned `synapse --mcp` (exactly what `.cursor/mcp.json` asks for) exits immediately if
+   a proxy already owns `127.0.0.1:8080`, taking the MCP server with it. The manual verification
+   above works around it with `--port 8098`/`--port 8097`. Deciding between "skip the HTTP
+   listener in stdio MCP mode" and "document a distinct listen-addr" is a real design choice and
+   belongs to the phase that makes MCP useful, not this one.
+3. **MCP boot still requires the rest of a valid config**, `upstream-url` included, because
+   `Validate` runs before anything MCP-related. `.cursor/mcp.json` is therefore a template that
+   only works where `./synapse.yaml` (or the OS-standard config) already exists. Same phase as
+   finding 2.
+4. **The process outlives its MCP client.** An editor that closes the pipe gets `Listen` to
+   return, the goroutine closes `mcpDone`, and `main` goes back to waiting for a signal — the
+   proxy is still serving, which is the point, but it does mean the editor has to SIGTERM the
+   child to reap it. Shutdown itself is clean and ordered: transports stop on context cancel, the
+   exit path waits for them (two seconds), and the TCP port is released before the process is.
+5. **The `.clinerules` MCP rules are still unexercised, on purpose.** No tool here returns a
+   memory, so there is no score breakdown to carry and nothing to sanitize: `synapse_ping`
+   answers with a constant. The next phase's tools owe both (S/R/I/T + `trace_id` on everything
+   surfaced; the REST write path's sanitization pipeline for anything accepted). One shape
+   consequence is already visible: a real recall tool needs an embedding, so `NewServer` will grow
+   an embedder argument — the store seam is in place, the embedder is not.
+6. **`internal/config` was touched, which the v1 freeze nominally forbids.** Two additive fields,
+   defaults unchanged (`false`/`0`), one `Validate` rule, and four test cases pinning that a config
+   which never mentions MCP validates exactly as before. The brief asked for the fields by name;
+   the alternative — reading `mcp-enabled` outside the config package — would have meant a second
+   YAML parser for one boolean.
+7. **Go 1.25.5 is now a hard floor for anyone building this tree**, not just for CI: a developer on
+   1.22-1.24 needs `GOTOOLCHAIN=auto` (the default) and network access, or the build stops with
+   "requires go >= 1.25.5". CI and the Docker image were moved to 1.25 rather than left to
+   auto-switch, which is the difference between a deterministic build and a silent download.
+8. **The loopback bind is not authentication, and should not be read as any.** Any local process
+   can call whatever this server exposes; only the port range (1-65535) and the host are
+   constrained. That is acceptable for a liveness probe and is why the first memory-returning tool
+   should arrive with the MCP surface's own tenant check, not just a bind address.
+
+### Next phase
+
+The largest item is the one this phase sets up: the first real MCP tools (recall and list over the
+local store), which owe the score breakdown, the trace id, and the shared sanitization pipeline,
+and which will widen `NewServer` with an embedder. Findings 2, 3 and 4 are the MCP-shaped half of
+the queue; finding 8 is a gate on the tool that returns memory content rather than a follow-up.
+Nothing carried over from Phases 17-21 has moved: the external anchor for each tenant's chain head
+(Phase 17 finding 2, Phase 18 finding 6, Phase 20 finding 8) is still the one whose absence makes
+"the chain was deleted" and "nothing was ever appended" the same answer; `tenant.RunMigrations`'
+advisory lock (Phase 20 finding 1) is still the smallest; metering is still the phase that would
+make the compliance report's summary honest; the compliance-tier provisioning field still belongs
+with whichever phase touches `POST /v2/tenants` next; and recording `GET /v2/compliance/chain-integrity`'s
+*successful* reads (Phase 21 finding 1) is still small enough to travel with any of them. And
+finding 1 above is new and worth carrying: from this phase on, `go.mod` is only as green as a
+toolchain at or above 1.25.5.
 
 

@@ -3,7 +3,7 @@
 
 ## Tech stack
 # v1 (do not modify):
-- Go 1.22+
+- Go 1.25.5+  (mcp-go v1.1.0 raises the floor; go.mod declares it)
 - sqlite-vec v0.1.x  (github.com/asg017/sqlite-vec-go-bindings)
 - onnxruntime-go v1.31.0 (github.com/yalue/onnxruntime_go)
   model pinned: ca2c6b84644f6c2f4b7c879851ad9d364ae375f6

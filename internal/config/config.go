@@ -88,6 +88,16 @@ type Config struct {
 	DefaultVisibility   string `yaml:"default-visibility"`
 	SyncBatchSize       int    `yaml:"sync-batch-size"`
 	SyncIntervalSeconds int    `yaml:"sync-interval-seconds"`
+
+	// Phase 22 MCP server (internal/mcp). MCPEnabled is the config file's half
+	// of the --mcp flag, so a deployment can turn the server on without a flag;
+	// MCPPort > 0 selects the TCP transport (Streamable HTTP on
+	// 127.0.0.1:<port>/mcp) and 0 keeps stdio, which is the shape editor MCP
+	// clients spawn. Neither field is consulted anywhere in this package: the
+	// flag merge and the transport choice happen in cmd/synapse, because they
+	// decide what this process runs rather than how it is configured.
+	MCPEnabled bool `yaml:"mcp-enabled"`
+	MCPPort    int  `yaml:"mcp-port"`
 }
 
 // defaultDataDir resolves the stable, per-OS data directory used as the
@@ -237,6 +247,11 @@ func DefaultConfig() *Config {
 		DefaultVisibility:   "org",
 		SyncBatchSize:       20,
 		SyncIntervalSeconds: 30,
+		// Phase 22 MCP server: off, and stdio when it is turned on. Both are
+		// deliberately the values that leave a config file which never mentions
+		// MCP behaving exactly as it did before this phase.
+		MCPEnabled: false,
+		MCPPort:    0,
 	}
 }
 
@@ -292,6 +307,15 @@ func (c *Config) Validate() error {
 	// sensible range for a multiplier whose job is still being defined.
 	if c.ConflictJaccardThreshold < 0 {
 		return fmt.Errorf("conflict-jaccard-threshold must not be negative")
+	}
+
+	// Phase 22: a port outside the TCP range can never be bound, so it is
+	// rejected here rather than discovered at bind time. Zero stays permissive
+	// and means "stdio" -- the same treatment RetrievalCandidateK and the
+	// conflict threshold get, so a hand-built Config in a test does not have to
+	// set it.
+	if c.MCPPort < 0 || c.MCPPort > 65535 {
+		return fmt.Errorf("mcp-port must be between 0 and 65535")
 	}
 
 	// Upstream URL is required

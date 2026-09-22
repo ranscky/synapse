@@ -122,6 +122,48 @@ func TestConfigValidation(t *testing.T) {
 			},
 			expectError: false,
 		},
+		{
+			name: "MCP port above the TCP range rejected",
+			config: &Config{
+				UpstreamURL:  "http://localhost:11434",
+				ListenAddr:   "127.0.0.1:8080",
+				EmbedderType: "onnx",
+				MCPPort:      70000,
+			},
+			expectError: true,
+			errorMsg:    "mcp-port must be between 0 and 65535",
+		},
+		{
+			name: "Negative MCP port rejected",
+			config: &Config{
+				UpstreamURL:  "http://localhost:11434",
+				ListenAddr:   "127.0.0.1:8080",
+				EmbedderType: "onnx",
+				MCPPort:      -1,
+			},
+			expectError: true,
+			errorMsg:    "mcp-port must be between 0 and 65535",
+		},
+		{
+			name: "Zero MCP port is permissive",
+			config: &Config{
+				UpstreamURL:  "http://localhost:11434",
+				ListenAddr:   "127.0.0.1:8080",
+				EmbedderType: "onnx",
+			},
+			expectError: false,
+		},
+		{
+			name: "MCP enabled on the default TCP port validates",
+			config: &Config{
+				UpstreamURL:  "http://localhost:11434",
+				ListenAddr:   "127.0.0.1:8080",
+				EmbedderType: "onnx",
+				MCPEnabled:   true,
+				MCPPort:      8765,
+			},
+			expectError: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -200,5 +242,18 @@ func TestDefaultConfigConflictKnobs(t *testing.T) {
 	negative.ConflictJaccardThreshold = -0.1
 	if err := negative.Validate(); err == nil {
 		t.Errorf("Expected a negative ConflictJaccardThreshold to fail validation")
+	}
+}
+
+// TestDefaultConfigMCPKnobs covers the Phase 22 MCP fields: off, and stdio (port
+// 0) when they are left alone. Those two values are what keep a config file that
+// never mentions MCP behaving exactly as it did before this phase.
+func TestDefaultConfigMCPKnobs(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.MCPEnabled {
+		t.Errorf("Expected the MCP server to default to disabled")
+	}
+	if cfg.MCPPort != 0 {
+		t.Errorf("Expected the default MCPPort to be 0 (stdio), got %d", cfg.MCPPort)
 	}
 }

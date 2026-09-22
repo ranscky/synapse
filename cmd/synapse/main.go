@@ -21,6 +21,7 @@ import (
 	"synapse/internal/budget"
 	"synapse/internal/config"
 	"synapse/internal/embedder"
+	"synapse/internal/mcp"
 	"synapse/internal/proxy"
 	"synapse/internal/session"
 	"synapse/internal/store"
@@ -37,11 +38,22 @@ var (
 )
 
 var (
-	configPath     = flag.String("config", "", "Path to configuration file (default: ./synapse.yaml, falling back to the OS-standard config location)")
-	upstream       = flag.String("upstream", "", "Override upstream URL")
-	port           = flag.String("port", "", "Override port")
-	persistTraces  = flag.Bool("persist-traces", false, "Persist memory traces to disk")
+	configPath    = flag.String("config", "", "Path to configuration file (default: ./synapse.yaml, falling back to the OS-standard config location)")
+	upstream      = flag.String("upstream", "", "Override upstream URL")
+	port          = flag.String("port", "", "Override port")
+	persistTraces = flag.Bool("persist-traces", false, "Persist memory traces to disk")
+	mcpEnabled    = flag.Bool("mcp", false, "Serve the MCP (Model Context Protocol) server: stdio by default, Streamable HTTP on 127.0.0.1 when --mcp-port is given")
+
+	// mcpPort's default is the port the TCP transport uses when it is asked for,
+	// not a request for TCP: only an explicitly passed --mcp-port switches the
+	// transport away from stdio, which is what an editor-spawned server needs.
+	mcpPort = flag.Int("mcp-port", mcp.DefaultTCPPort, "Port the MCP TCP transport binds on 127.0.0.1 (only an explicit flag selects TCP; the server still needs --mcp or mcp-enabled)")
 )
+
+// mcpShutdownGrace bounds how long the shutdown path waits for the MCP
+// transports to stop: long enough for a listener to drain, short enough that a
+// stuck one cannot hold the process open.
+const mcpShutdownGrace = 2 * time.Second
 
 // resolveConfigPath decides which config file to load when --config wasn't
 // given explicitly: check the current directory first (preserves the
@@ -132,6 +144,21 @@ func main() {
 			}
 		}
 		cfg.ListenAddr = host + ":" + *port
+	}
+
+	// MCP flags, merged the same way. --mcp-port's default is deliberately not
+	// written into cfg: it names the port TCP would use, and applying it
+	// unconditionally would make the stdio transport unreachable (cfg.MCPPort > 0
+	// is what selects TCP below). flag.Visit is how "explicitly passed" is asked
+	// for, so `synapse --mcp` stays stdio and `synapse --mcp --mcp-port 8765`
+	// does not.
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "mcp-port" {
+			cfg.MCPPort = *mcpPort
+		}
+	})
+	if *mcpEnabled {
+		cfg.MCPEnabled = true
 	}
 
 	// Validate configuration
@@ -339,6 +366,38 @@ func main() {
 		}
 	}()
 
+	// Phase 22: the MCP server, when asked for (--mcp or mcp-enabled: true). It
+	// runs alongside the proxy for the life of this process -- an editor spawns
+	// it over stdio, or a client connects to 127.0.0.1:<mcp-port>/mcp -- and it
+	// deliberately does not replace the HTTP API this binary has always served.
+	//
+	// The context is this process's own, cancelled on the shutdown path below, so
+	// the transports stop instead of being torn down by process exit. A failed
+	// Serve is logged rather than fatal: this process still has a proxy to
+	// serve, and a TCP bind failure is the one MCP failure worth surviving.
+	var (
+		stopMCP context.CancelFunc
+		mcpDone chan struct{}
+	)
+	if cfg.MCPEnabled {
+		mcpServer := mcp.NewServer(storeInstance, *cfg)
+		transport := "stdio"
+		if cfg.MCPPort > 0 {
+			transport = "tcp"
+		}
+
+		mcpCtx, cancelMCP := context.WithCancel(context.Background())
+		stopMCP, mcpDone = cancelMCP, make(chan struct{})
+		go func() {
+			defer close(mcpDone)
+			if err := mcpServer.Serve(mcpCtx, transport, cfg.MCPPort); err != nil {
+				slog.Error("mcp server error", "error", err)
+			}
+		}()
+
+		slog.Info("MCP server started", "transport", transport, "port", cfg.MCPPort)
+	}
+
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -352,6 +411,19 @@ func main() {
 
 	if err := server.Shutdown(ctx); err != nil {
 		slog.Error("Server shutdown failed", "error", err)
+	}
+
+	// Stop the MCP transports too, and wait for them: a TCP listener still
+	// draining on a port the next instance wants to bind is the one thing a
+	// clean shutdown should not leave behind.
+	if stopMCP != nil {
+		stopMCP()
+		select {
+		case <-mcpDone:
+			slog.Info("MCP server stopped")
+		case <-time.After(mcpShutdownGrace):
+			slog.Warn("MCP server did not stop within the grace period")
+		}
 	}
 
 	slog.Info("Server stopped")

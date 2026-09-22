@@ -89,7 +89,7 @@ check_prereqs() {
     fi
 
     GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
-    REQUIRED="1.22"
+    REQUIRED="1.25.5"
     if [[ "$(printf '%s\n' "$REQUIRED" "$GO_VERSION" | sort -V | head -n1)" != "$REQUIRED" ]]; then
         error "Go $REQUIRED+ required, found $GO_VERSION"
     fi

@@ -118,3 +118,17 @@ conflict-jaccard-threshold: 0.4
 # or retrieval path consumes it (0.5 halves its score). Defined here, read by
 # nothing yet.
 conflict-score-penalty: 0.5
+
+# Phase 22 MCP server (internal/mcp). mcp-enabled is the config file's half of the
+# --mcp flag, and the two are OR'd at startup, so a deployment can serve MCP
+# without passing flags.
+#
+# mcp-port > 0 selects the TCP transport (Streamable HTTP on
+# http://127.0.0.1:<port>/mcp -- this server never binds 0.0.0.0), and 0 keeps
+# stdio, which is the transport an editor's MCP client spawns and the reason the
+# default is 0 rather than 8765. Either way the process also serves its usual HTTP
+# proxy on listen-addr: the MCP server runs alongside it, not instead of it, so a
+# second instance pointed at the same listen-addr will exit on the bind failure.
+mcp-enabled: false
+mcp-port: 0
+
