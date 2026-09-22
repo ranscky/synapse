@@ -158,7 +158,7 @@ func TestCompileToolCompilesSessionThroughSharedPipeline(t *testing.T) {
 	cfg := config.DefaultConfig()
 	pipeline := api.NewAPIServer(storeInstance, basisEmbedder(384), cfg, false, session.NewManager(30*time.Minute))
 
-	srv := NewServer(storeInstance, *cfg, pipeline)
+	srv := NewServer(storeInstance, *cfg, pipeline, basisEmbedder(384))
 
 	// Memories of this session, written through the store -- so they went
 	// through the same sanitization pass the REST write path applies. The first
@@ -261,7 +261,7 @@ func TestCompileToolCompilesSessionThroughSharedPipeline(t *testing.T) {
 // included, with no reshaping in between.
 func TestCompilePassesArgumentsThroughUnchanged(t *testing.T) {
 	stub := newStubCompiler()
-	srv := NewServer(nil, *config.DefaultConfig(), stub)
+	srv := NewServer(nil, *config.DefaultConfig(), stub, basisEmbedder(384))
 
 	res, err := srv.handleCompile(context.Background(), compileCallRequest(map[string]any{
 		"messages": []any{
@@ -309,7 +309,7 @@ func TestCompileRejectsInvalidParams(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			stub := newStubCompiler()
-			srv := NewServer(nil, *config.DefaultConfig(), stub)
+			srv := NewServer(nil, *config.DefaultConfig(), stub, basisEmbedder(384))
 
 			res, err := srv.handleCompile(context.Background(), compileCallRequest(tt.args))
 			require.NoError(t, err, "a caller mistake is a typed tool error, not a transport failure")
@@ -335,7 +335,7 @@ func TestCompileRejectsInvalidParams(t *testing.T) {
 func TestCompileReportsPipelineFailureAsToolError(t *testing.T) {
 	stub := newStubCompiler()
 	stub.err = errors.New("failed to search memories: /var/lib/synapse/secret.db is locked")
-	srv := NewServer(nil, *config.DefaultConfig(), stub)
+	srv := NewServer(nil, *config.DefaultConfig(), stub, basisEmbedder(384))
 
 	res, err := srv.handleCompile(context.Background(), compileCallRequest(map[string]any{
 		"messages":   []any{map[string]any{"role": "user", "content": "hello"}},
@@ -353,7 +353,7 @@ func TestCompileReportsPipelineFailureAsToolError(t *testing.T) {
 // compile path at all: it has to answer, because the alternative is a process
 // that starts and then dies inside a tool call.
 func TestCompileWithoutPipelineFailsSafelyNotPanics(t *testing.T) {
-	srv := NewServer(nil, *config.DefaultConfig(), nil)
+	srv := NewServer(nil, *config.DefaultConfig(), nil, basisEmbedder(384))
 
 	res, err := srv.handleCompile(context.Background(), compileCallRequest(map[string]any{
 		"messages":   []any{map[string]any{"role": "user", "content": "hello"}},

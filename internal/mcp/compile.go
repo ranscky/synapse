@@ -170,6 +170,11 @@ func parseCompileArgs(req mcpgo.CallToolRequest) (compileArgs, error) {
 const (
 	errorTypeInvalidParams = "invalid_params"
 	errorTypeCompileFailed = "compile_failed"
+	// errorTypeSearchFailed is a search that could not be performed -- a
+	// deployment built without a store or an embedder, or a retrieval that
+	// failed. It is separate from invalid_params so a caller can tell "fix your
+	// arguments" apart from "this server cannot answer that"; see search.go.
+	errorTypeSearchFailed = "search_failed"
 )
 
 // errorEnvelope is the JSON body of a tool error.

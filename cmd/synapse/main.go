@@ -385,7 +385,17 @@ func main() {
 		// POST /v1/compile runs, so an editor's synapse_compile call and an
 		// HTTP compile share one store, one embedder, one control-plane
 		// candidate source (SetPlaneCandidates above), and one trace.
-		mcpServer := mcp.NewServer(storeInstance, *cfg, apiServer)
+		// embedderInstance is passed too, so synapse_search_memories embeds a
+		// query with the same model the proxy embeds with -- the same model
+		// that produced the vectors it is comparing against.
+		mcpServer := mcp.NewServer(storeInstance, *cfg, apiServer, embedderInstance)
+		// The same Syncer the two servers above hold: an edge node's search must
+		// see the org's memories, not only the rows in its own database, or it
+		// would surface a different half of the brain than the compile it is
+		// explaining.
+		if syncer != nil {
+			mcpServer.SetPlaneCandidates(syncer)
+		}
 		transport := "stdio"
 		if cfg.MCPPort > 0 {
 			transport = "tcp"

@@ -28,10 +28,12 @@ var _ Store = (*store.Store)(nil)
 // The transports are what these tests exercise, so the pipeline is never the
 // subject: a stub keeps a tools/list or a TCP handshake from depending on a
 // store, an embedder, or an ONNX session. The tests that care whether a compile
-// really compiled build the real pipeline instead -- see compile_test.go.
+// really compiled build the real pipeline instead -- see compile_test.go -- and
+// the tests that care whether a search really ranked build a real store and a
+// deterministic embedder -- see search_test.go.
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
-	return NewServer(nil, *config.DefaultConfig(), newStubCompiler())
+	return NewServer(nil, *config.DefaultConfig(), newStubCompiler(), basisEmbedder(384))
 }
 
 // initializeRequest is the handshake every MCP client opens with, in the shape

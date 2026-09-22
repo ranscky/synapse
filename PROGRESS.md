@@ -6268,3 +6268,283 @@ successful reads (Phase 21 finding 1) is still small enough to ride along with a
 22's Go 1.25.5 floor (its finding 7) now applies to any toolchain that builds this tree, MCP-aware or
 not.
 
+
+## Phase 24 — synapse_search_memories MCP tool (complete)
+
+Phase 23 gave the MCP surface a compiler; this phase gives it the read half. `synapse_search_memories`
+answers with the Global Brain's memories ranked by the same 4-Factor model the compiler scores with —
+retrieval for the candidates, `internal/scorer` for the ranking, the classifier for the query's intent
+— and every result carries `score_s`/`score_r`/`score_i`/`score_t`/`score_total` plus the provenance
+that explains a demoted total. It never writes, and it does not compile.
+
+Commit `feat: Phase 24 - synapse_search with 4-Factor score breakdown`
+
+New files:
+
+- `internal/mcp/search.go` — 274 lines: the `Embedder` seam, the tool definition and its schema, the
+  handler, the argument validation, the visibility→scope mapping, and the trace-id generator. It is a
+  separate file from `server.go` for the reason Phase 23 recorded: each tool's definition and handler
+  live in their own file so `registerTools` stays a table of what the server offers.
+- `internal/mcp/search_result.go` — 101 lines: the response shape and the mapping from
+  `scorer.ScoredMemory` into it. Split out of `search.go` on the same seam Phase 23 split
+  `compile.go` from `server.go` — by line count, not by taste: registration + handler + validation
+  is already 274 lines, and the payload types are another ~100.
+- `internal/mcp/search_test.go` — 243 lines: the DoD test plus `top_k`, registration/schema, and the
+  helpers the other two test files share (`newSearchStore`, `decodeSearchResult`, `scoreKeys`).
+- `internal/mcp/search_scope_test.go` — 234 lines: the `recordingStore` double, the
+  visibility→reader-scope table, the pool-width rule, invalid-argument rejection, and the two
+  failure paths.
+- `internal/mcp/search_plane_test.go` — 93 lines: the control-plane-first policy and its local
+  fallback.
+
+Changed:
+
+- `internal/mcp/server.go` — 207 → 246 lines. `Server` gains `embedder` and `plane`, `NewServer`
+  takes a fourth argument (`Embedder`), `registerTools` gains one line, and `SetPlaneCandidates` is
+  added with the same name and meaning it has on `*api.APIServer` and `*proxy.Proxy`. The package
+  doc comment now describes both tools and names the three `.clinerules` the code makes true.
+- `internal/mcp/compile.go` — +5 lines: the `errorTypeSearchFailed` constant, kept with the other two
+  tool-error types rather than beside its only user, because a reader looking for "what can a tool
+  report" should find all of them in one place.
+- `internal/mcp/server_test.go`, `internal/mcp/compile_test.go` — the constructor's new argument at
+  six call sites (a `basisEmbedder` where an embedder is not the subject). Mechanical, listed here
+  because a test file's shape is part of the record.
+- `cmd/synapse/main.go` — +7/-1: the MCP server is built with `embedderInstance` (the same model
+  instance the proxy and the compile pipeline hold) and is handed the same `*sync.Syncer` the other
+  two servers get when a control plane is configured.
+- `bin/synapse` — **not** staged. It was already dirty before this phase (`M bin/synapse`, last
+  written 10:05, before this session) and Phase 22 and 23 made the same call. Nothing here rebuilt
+  it: `go build ./...` discards binaries when the pattern matches several packages.
+
+
+### Same embedder, same weights, same intent — so a score means one thing
+
+The DoD is the score breakdown, and a breakdown is only worth reading if it is the same arithmetic the
+rest of the system uses. Three things were therefore borrowed rather than reimplemented:
+
+1. **The embedder.** `cmd/synapse` passes the instance the proxy already holds, so a query is embedded
+   by the model that indexed the memories it is compared against. Two models would make cosine
+   similarity a number about nothing.
+2. **The weights.** `scorer.GetWeights(cfg.Weight…)` with the same four config keys
+   `runCompilePipeline` reads — not another hard-coded 0.4/0.3/0.2/0.1.
+3. **The intent.** `classifier.Classify(query)`, the same call the pipeline makes on a conversation's
+   last user turn, so Task Alignment is computed from this search's own text.
+
+The chain is `retrieval.Candidates` → `scorer.Score` and stops there: no write (the compile tool's
+step 3b), no dedup, no token budget. A search reports; the compiler decides what fits.
+
+The candidate pool is `max(cfg.RetrievalCandidateK, top_k)`, not `top_k`. The store returns its
+nearest `poolK` by similarity; the 4-Factor total is what picks the answer. Asking for exactly `top_k`
+would let similarity pre-empt the scoring this tool exists to explain, which is the same mistake the
+`GetRecent(20)` → `Search()` consolidation fixed in Phase 6.
+
+
+
+### `visibility` is a reader scope, and `session_id` is optional on top of it
+
+The brief's schema was `query`, `top_k`, `visibility` (default `"org"`). `visibility` is not a search
+input anywhere in this codebase — it is a per-memory column (`internal/store/pgvisibility.go`) — and
+the brief's schema has no session at all, while the standalone backend can only search
+`WHERE session_id = ?`. The decision was put to the user rather than guessed, and the answer is what
+shipped:
+
+- **`visibility` selects the reader scope.** `org` names no agent and no team (the Postgres predicate
+  reduces to `visibility = 'org'` — the Global Brain's shared record), `team` adds this node's
+  configured team id, `private` adds this agent id. Agent and team always come from this node's
+  config and never from the request, so no argument can widen a read; a blank team id or a blank
+  session matches no row, which is the fail-closed direction.
+- **`session_id` is an optional fourth argument that always narrows and never widens.** On Postgres it
+  is inert outside the private branch (the predicate binds it, but an unnamed agent cannot match that
+  branch), so `org` stays org-only across every session — which is what a shared plane means. On a
+  standalone node the session is the *only* filter there is, so naming one is how a local node is
+  searched at all.
+- **The alternative was rejected on evidence, not on taste.** The first implementation built `org` as
+  a scope with no identity at all, and the DoD test failed with `[]`: a session-less search against
+  SQLite's `WHERE session_id = ?` matches nothing, so the tool would have returned an empty list for
+  every local caller — including the Cline user this phase is verified from.
+
+### Every result carries all five score fields, zero or not
+
+`searchMemoryScore` has no `omitempty` on any field, and the DoD test asserts the keys rather than
+decoding struct fields, because `score_s: 0` and no `score_s` key decode identically into a struct and
+only the former is a breakdown. The test also asserts the two non-matching memories score exactly
+`0.0` on the semantic factor, so a regression that dropped zero-valued fields fails on the semantics
+rather than on a technicality.
+
+Two normalizations are borrowed from `trace.TraceMemory` so one memory reads the same way here and in
+the trace of the compile that surfaced it: a blank `conflict_status` is `"none"`, and a blank
+`visibility` is the column's own default, `"org"`. `cross_agent` uses the trace's rule verbatim
+(`AgentID != "" && AgentID != localAgentID`): a blank agent is unattributed, never someone else's.
+`created_at` is emitted in UTC RFC3339Nano so Postgres and SQLite render the same instant identically.
+
+The response is `{"trace_id": ..., "memories": [...]}`. `trace_id` is per `.clinerules`' "score
+breakdown (S/R/I/T) and trace_id" requirement, and it is a random 8-byte id that appears in this
+process's log line for the call — a search records no trace manifest, so the id's job is to tie one
+answer to the one log entry naming its parameters and counts. The log carries counts and identifiers
+only: a query is memory content the moment it is embedded, and this process does not log memory
+content.
+
+### Errors: `invalid_params` for the caller, `search_failed` for the deployment
+
+Same shape as Phase 23's two types, for the same protocol reason (a handler cannot choose `-32602`;
+mcp-go maps every handler error to `-32603`, so a tool reports failure with `IsError` and a typed
+body). `invalid_params` covers the seven inputs the tests reject — missing/blank/null-byte query,
+negative `top_k`, `top_k` above the same 500 ceiling plane's search endpoint enforces, unknown
+`visibility`, illegal `session_id` — and the query is validated with `api.ValidateMessageContent`, the
+same rule the REST front end applies, which is the `.clinerules` sanitization-pipeline requirement
+expressed as a shared validator rather than a second copy. `search_failed` covers the rest: no store or
+no embedder configured (typed error, never a panic — the Phase 23 lesson), and a retrieval that
+failed, whose cause goes to the log because a store error can name a database path.
+
+### The plane seam was added, and it is not scope creep
+
+The brief's handler says "call `retrieval.Candidates()`", and the first draft passed `nil` for the
+plane source. Reading `cmd/synapse` shows why that would have been wrong: this binary always opens the
+SQLite store (`store.NewStore(cfg.DBPath)`), so a node with `control-plane-url` set is an *edge* node
+whose org-wide memories live on the plane and reach the compile path only through
+`syncer.PullCandidates`. A search reading only the local store would have surfaced a different half of
+the brain from the compile it is explaining, while its own description promised "the Global Brain".
+Ten lines close it: a `plane` field, a `SetPlaneCandidates` with the same spelling as its two
+siblings on `*api.APIServer` and `*proxy.Proxy`, `s.plane` in the `Candidates` call, and the wiring in
+`main` beside theirs. `search_plane_test.go` pins both halves — an answered plane *is* the candidate
+set (the local store is asserted not to have been searched), and a failing one falls back to it with no
+error to the caller, which is the policy `retrieval.Candidates` already documents.
+
+### Annotation hints are part of the tool's contract now
+
+`tools/list` has always advertised both tools with mcp-go's default annotations — `readOnlyHint:false`,
+`destructiveHint:true` — which was invisible while the only tool wrote a memory and is wrong for one
+that does not: a client that gates on hints would be told the read path is a write path. The search
+tool therefore declares `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`, and
+the registration test asserts all three, so the claim is checked rather than commented. `idempotentHint`
+is deliberately left at its default: the ranking depends on the clock (recency decay) and on the store
+it reads, so "calling it twice gives the same answer" is not a promise this tool can make, even though
+it has no side effects.
+
+### Verification (real output, this phase)
+
+```text
+$ gofmt -l internal/mcp/*.go                     # empty
+$ go vet ./internal/mcp ./cmd/synapse
+VET_OK
+$ go build ./...
+BUILD_OK
+
+$ go test ./internal/mcp/... -run TestSearch -v
+=== RUN   TestSearchMemoriesRanksNearestMemoryFirstWithItsScoreBreakdown
+--- PASS: TestSearchMemoriesRanksNearestMemoryFirstWithItsScoreBreakdown (1.13s)
+=== RUN   TestSearchMemoriesHonorsTopK
+--- PASS: TestSearchMemoriesHonorsTopK (0.54s)
+=== RUN   TestSearchMemoriesReadsAtTheVisibilityScopeItWasGiven
+    --- PASS: TestSearchMemoriesReadsAtTheVisibilityScopeItWasGiven/org_with_no_session_searches_the_cross-session_bucket
+    --- PASS: TestSearchMemoriesReadsAtTheVisibilityScopeItWasGiven/team_names_this_node's_team_and_still_no_agent
+    --- PASS: TestSearchMemoriesReadsAtTheVisibilityScopeItWasGiven/private_without_a_session_reaches_no_private_memory,_which_is_fail-closed
+--- PASS: TestSearchMemoriesReadsAtTheVisibilityScopeItWasGiven (0.00s)
+--- PASS: TestSearchMemoriesWidensThePoolForALargeTopK (0.00s)
+--- PASS: TestSearchMemoriesConsultsThePlaneBeforeTheLocalStore (0.00s)
+--- PASS: TestSearchMemoriesFallsBackToTheLocalStoreWhenThePlaneFails (0.00s)
+--- PASS: TestSearchMemoriesRejectsInvalidParams (0.00s)      # 7 subtests
+--- PASS: TestSearchMemoriesReportsAStoreFailureAsToolError (0.00s)
+--- PASS: TestSearchMemoriesWithoutItsDependenciesFailsSafelyNotPanics (0.00s)   # 3 subtests
+--- PASS: TestSearchMemoriesToolIsRegisteredAndAdvertisesItsSchema (0.00s)
+PASS
+ok  	synapse/internal/mcp	1.712s
+
+$ go test ./internal/... ./cmd/...
+ok  	synapse/internal/api	(cached)
+ok  	synapse/internal/budget	(cached)
+ok  	synapse/internal/classifier	(cached)
+ok  	synapse/internal/compiler	(cached)
+ok  	synapse/internal/config	(cached)
+ok  	synapse/internal/conflict	(cached)
+ok  	synapse/internal/dedup	(cached)
+ok  	synapse/internal/embedder	(cached)
+ok  	synapse/internal/integration	(cached)
+ok  	synapse/internal/mcp	(cached)
+ok  	synapse/internal/plane	(cached)
+ok  	synapse/internal/proxy	(cached)
+ok  	synapse/internal/retrieval	(cached)
+ok  	synapse/internal/scorer	(cached)
+ok  	synapse/internal/store	(cached)
+ok  	synapse/internal/supersession	(cached)
+ok  	synapse/internal/sync	(cached)
+ok  	synapse/internal/tenant	(cached)
+ok  	synapse/internal/trace	(cached)
+ok  	synapse/cmd/synapse	(cached)
+```
+
+The unit tests are not the only evidence this phase has, because the interesting question — does a real
+model's embedding rank a real memory, with a breakdown a caller can read — needed the real embedder. A
+throwaway config (`/tmp/phase24-live.yaml`, mode 0600, absolute model path, `db-path` in `/tmp`) and
+mcp-go's own stdio transport, exactly the shape Cline spawns:
+
+```text
+$ printf '%s\n' \
+    '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"synapse_compile","arguments":{"session_id":"sess-phase24-live","messages":[{"role":"user","content":"the retry budget for the order handler is three attempts"}]}}}' \
+  | timeout 60 /tmp/synapse-phase24 --mcp --config /tmp/phase24-live.yaml
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"compiled_messages\":[...\"[Memory: context] the retry budget for the order handler is three attempts\"...],\"tokens_used\":10,...,\"memories\":[{\"id\":\"req-...\",\"score_semantic\":0.9999999999999998,...
+
+$ printf '%s\n' '{"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"synapse_search_memories","arguments":{"query":"how many retry attempts does the order handler make","session_id":"sess-phase24-live","top_k":1}}}' \
+  | timeout 90 /tmp/synapse-phase24 --mcp --config /tmp/phase24-live.yaml
+{"trace_id":"search-c5b5dc3bf2c75d96","memories":[{"id":"req-1790073710807144074","content":"the retry budget for the order handler is three attempts","memory_type":"context","agent_id":"","cross_agent":false,"conflict_status":"none","created_at":"2026-09-22T10:41:50.807149756Z","session_id":"sess-phase24-live","visibility":"org","score_s":0.8322861649922297,"score_r":0.9983529959094402,"score_i":0.5,"score_t":0.5333333333333333,"score_total":0.6894164322545026}]}
+
+$ ... tools/list ...
+annotations: {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+required: ['query']
+properties: ['query', 'session_id', 'top_k', 'visibility']
+```
+
+`score_s` 0.832 is a real MiniLM cosine similarity between a paraphrase and the memory, not a 1.0
+artefact; `score_r` 0.998 is a memory four seconds old; `score_i` 0.5 and `score_t` 0.533 come from the
+type lookup and the classifier's `code` intent, and they are the same numbers the compile that surfaced
+that memory reported.
+
+
+
+### Findings (recorded, not fixed)
+
+1. **A standalone node cannot answer a session-less search.** The SQLite backend's `Search` is
+   `WHERE session_id = ?`, so `{"query": "..."}` alone returns `{"memories": []}` on a node with no
+   control plane — correct for the backend, and exactly the kind of empty answer a caller reads as
+   "broken". The `session_id` description tells the caller what to do, and a future phase that wants a
+   true cross-session read on a standalone node has to change `internal/store`'s Search, which is a v1
+   package this phase was told not to touch.
+2. **The response cannot say it was truncated.** With the default `top_k` of 10 and a pool of
+   `retrieval-candidate-k` (50), 40 scored candidates can be discarded with nothing in the answer to
+   say so — the same shape Phase 23's finding 3 recorded for compiles. A `candidates_considered` field
+   would fix it; it is not in this phase's response shape, so it was not invented here.
+3. **Superseded memories are not filtered.** The Postgres backend excludes them in SQL; the local one
+   does not, and this tool does not either. Retrieval hands back what the store answers, and the
+   scorer's conflict penalty is the only signal. Filtering here would make MCP's answer differ from the
+   REST answer to the same query, which is the drift this package exists to avoid.
+4. **`cross_agent` is always false on a standalone node**, because SQLite stores no agent id and a
+   blank one is unattributed rather than someone else's (the rule `trace.TraceMemory` already
+   documents). It is a field that only says something on a plane-backed node.
+5. **No rate limit.** Each call costs one embedding; the REST path has a per-IP limiter, this one has
+   nothing, and a local process looping on `tools/call` is unbounded — Phase 23's finding 4, unchanged.
+6. **mcp-go's stdio server answers concurrent requests concurrently.** The manual probe's first run
+   sent `synapse_compile` and `synapse_search_memories` in one piped session and the search answer
+   (`id: 3`) came back before the compile's (`id: 2`), so the search saw an empty store. Cline (and any
+   real client) awaits each response, so this is a fixture hazard rather than a product bug — but the
+   probe had to be split into two processes to test a write-then-read sequence, and that is worth
+   knowing before someone writes a shell-based end-to-end script.
+7. **`synapse_compile` still advertises `destructiveHint: true`.** That is correct (it writes the last
+   user message back) and is mcp-go's default, so nothing changed there; now that the surface has one
+   read tool and one write tool, the annotation difference is something a client can finally act on.
+
+### Next phase
+
+The MCP surface now has one write tool and one read tool, which is the shape the `.clinerules`
+differentiator describes. The obvious next items: a listing/recall tool for a known session (which
+would owe the same breakdown, the same shared validators, and the same reader scope), the
+`candidates_considered` field from finding 2, and the rate limit from finding 5. Finding 1 belongs to
+whoever next touches `internal/store`'s standalone `Search`, and finding 3 to whoever decides whether
+MCP may answer differently from REST. Nothing carried over from Phases 17-23 has moved: the external
+anchor for each tenant's chain head (Phase 17 finding 2, Phase 18 finding 6, Phase 20 finding 8) is
+still what makes "the chain was deleted" and "nothing was ever appended" the same answer;
+`tenant.RunMigrations`' advisory lock (Phase 20 finding 1) is still the smallest; metering is still the
+phase that would make the compliance report's summary honest; the compliance-tier provisioning field
+still belongs with whichever phase touches `POST /v2/tenants` next; recording
+`GET /v2/compliance/chain-integrity`'s successful reads (Phase 21 finding 1) is still small enough to
+ride along; and Phase 23's finding 3 (a compile with no memories is indistinguishable from a compile
+that failed to retrieve) is unchanged, now joined by its search-side twin, finding 2 above.
