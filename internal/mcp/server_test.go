@@ -23,13 +23,15 @@ import (
 // test file instead of the package main imports.
 var _ Store = (*store.Store)(nil)
 
-// newTestServer builds a server with no store: synapse_ping reads nothing, and
-// passing nil is the cheapest way to prove the handler does not touch it. A
-// phase that adds a memory-reading tool will have to pass a fake here, which is
-// exactly the signal it should be.
+// newTestServer builds a server whose compile pipeline is a stub.
+//
+// The transports are what these tests exercise, so the pipeline is never the
+// subject: a stub keeps a tools/list or a TCP handshake from depending on a
+// store, an embedder, or an ONNX session. The tests that care whether a compile
+// really compiled build the real pipeline instead -- see compile_test.go.
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
-	return NewServer(nil, *config.DefaultConfig())
+	return NewServer(nil, *config.DefaultConfig(), newStubCompiler())
 }
 
 // initializeRequest is the handshake every MCP client opens with, in the shape
@@ -41,53 +43,14 @@ func initializeRequest() mcpgo.InitializeRequest {
 	return req
 }
 
-// TestPingToolIsRegisteredAndAnswersPing drives the real protocol through
-// mcp-go's in-process client: everything except the transport is the production
-// path, so a tool that is registered but not callable (or vice versa) fails here
-// rather than in an editor.
-func TestPingToolIsRegisteredAndAnswersPing(t *testing.T) {
-	srv := newTestServer(t)
-	ctx := context.Background()
-
-	c, err := client.NewInProcessClient(srv.mcp)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = c.Close() })
-	require.NoError(t, c.Start(ctx))
-
-	_, err = c.Initialize(ctx, initializeRequest())
-	require.NoError(t, err)
-
-	tools, err := c.ListTools(ctx, mcpgo.ListToolsRequest{})
-	require.NoError(t, err)
-
-	names := make([]string, 0, len(tools.Tools))
-	for _, tool := range tools.Tools {
-		names = append(names, tool.Name)
-	}
-	require.Contains(t, names, pingToolName, "tools/list must advertise the ping tool")
-
-	// Listed and callable are two different maps inside mcp-go; only a call
-	// proves both are populated.
-	var call mcpgo.CallToolRequest
-	call.Params.Name = pingToolName
-	res, err := c.CallTool(ctx, call)
-	require.NoError(t, err)
-	require.False(t, res.IsError, "synapse_ping must not report an error")
-	require.Len(t, res.Content, 1)
-
-	text, ok := mcpgo.AsTextContent(res.Content[0])
-	require.True(t, ok, "the result must carry text content")
-	require.JSONEq(t, `{"pong":true}`, text.Text)
-}
-
-// TestServeStdioListsPingTool drives the stdio transport itself, but through
+// TestServeStdioListsCompileTool drives the stdio transport itself, but through
 // buffers instead of the process's descriptors. It is the automated form of
 //
 //	echo '{"jsonrpc":"2.0","method":"tools/list","id":1}' | synapse --mcp
 //
 // including the detail that matters: the request is answered without a preceding
 // initialize, which is the shape a hand-typed probe has.
-func TestServeStdioListsPingTool(t *testing.T) {
+func TestServeStdioListsCompileTool(t *testing.T) {
 	srv := newTestServer(t)
 
 	var out bytes.Buffer
@@ -104,7 +67,7 @@ func TestServeStdioListsPingTool(t *testing.T) {
 	}
 
 	require.Contains(t, out.String(), `"tools"`, "the reply must be a tools/list result")
-	require.Contains(t, out.String(), pingToolName)
+	require.Contains(t, out.String(), compileToolName)
 	require.NotContains(t, out.String(), "level=", "nothing but JSON-RPC may reach the stdio stream")
 }
 
@@ -201,7 +164,7 @@ func TestServeTCPBindsLoopbackOnlyAndAnswers(t *testing.T) {
 	for _, tool := range tools.Tools {
 		names = append(names, tool.Name)
 	}
-	require.Contains(t, names, pingToolName)
+	require.Contains(t, names, compileToolName)
 
 	cancel()
 	select {

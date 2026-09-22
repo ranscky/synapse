@@ -207,9 +207,9 @@ func TestValidateSessionID(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateSessionID(tt.input)
+			err := ValidateSessionID(tt.input)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("validateSessionID() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ValidateSessionID() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -227,7 +227,7 @@ func TestFuzzValidateSessionID(t *testing.T) {
 		// Create invalid session ID with special characters
 		sessionID := fmt.Sprintf("test%d%cinvalid", i, invalidChars[i%len(invalidChars)])
 		
-		err := validateSessionID(sessionID)
+		err := ValidateSessionID(sessionID)
 		if err != nil {
 			invalidCount++
 		}
@@ -248,7 +248,7 @@ func TestFuzzValidateSessionID(t *testing.T) {
 	}
 	
 	for _, sessionID := range edgeCases {
-		err := validateSessionID(sessionID)
+		err := ValidateSessionID(sessionID)
 		if err != nil {
 			invalidCount++
 		}
@@ -274,9 +274,9 @@ func TestValidateMessageContent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateMessageContent(tt.input)
+			err := ValidateMessageContent(tt.input)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("validateMessageContent() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ValidateMessageContent() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

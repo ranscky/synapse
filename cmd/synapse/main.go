@@ -380,7 +380,12 @@ func main() {
 		mcpDone chan struct{}
 	)
 	if cfg.MCPEnabled {
-		mcpServer := mcp.NewServer(storeInstance, *cfg)
+		// apiServer is passed as the compile pipeline, not as a second
+		// implementation of one: CompileContext is the same chain
+		// POST /v1/compile runs, so an editor's synapse_compile call and an
+		// HTTP compile share one store, one embedder, one control-plane
+		// candidate source (SetPlaneCandidates above), and one trace.
+		mcpServer := mcp.NewServer(storeInstance, *cfg, apiServer)
 		transport := "stdio"
 		if cfg.MCPPort > 0 {
 			transport = "tcp"

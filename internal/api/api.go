@@ -183,8 +183,13 @@ func (a *APIServer) Router() *chi.Mux {
 	return a.router
 }
 
-// validateSessionID validates the session ID format
-func validateSessionID(sessionID string) error {
+// ValidateSessionID validates the session ID format.
+//
+// Exported because more than one front end accepts a session_id: the REST
+// handlers below and the MCP surface, where an editor's tool call carries one
+// too. A second copy of these rules in internal/mcp would be a copy that
+// drifts, so the rule lives here and both callers apply it.
+func ValidateSessionID(sessionID string) error {
 	if sessionID == "" {
 		return fmt.Errorf("session_id is required")
 	}
@@ -203,8 +208,14 @@ func validateSessionID(sessionID string) error {
 	return nil
 }
 
-// validateMessageContent validates message content
-func validateMessageContent(content string) error {
+// ValidateMessageContent validates message content.
+//
+// Exported for the same reason as ValidateSessionID. Note what this does NOT
+// do: it is a shape check (no null bytes, no 32KB paste) and not the
+// sanitization pass -- prompt-injection stripping stays in the store's write
+// path, so every caller that stores a memory gets it whether or not it ran
+// this function first.
+func ValidateMessageContent(content string) error {
 	if strings.Contains(content, "\x00") {
 		return fmt.Errorf("message content contains null bytes")
 	}
@@ -365,6 +376,22 @@ func (a *APIServer) runCompilePipeline(ctx context.Context, sessionID string, me
 	return compileResult, nil
 }
 
+// CompileContext runs the compile pipeline POST /v1/compile runs: classify,
+// retrieve candidates, score them with the 4-factor model, dedup, apply the
+// token budget, and assemble the trace -- over the same store, embedder, plane,
+// and config this server was built with. tokenBudgetOverride of 0 means the
+// configured default.
+//
+// It exists so a second front end does not grow a second copy of that chain:
+// the MCP surface (internal/mcp) calls this, so an editor's compile and an HTTP
+// compile are the same compilation. persist is true here as it is for real
+// traffic -- the last user message is written as a memory and supersession is
+// checked -- which is exactly what /v1/compile does and what the playground
+// deliberately does not.
+func (a *APIServer) CompileContext(ctx context.Context, sessionID string, messages []Message, tokenBudgetOverride int) (*compiler.CompileResult, error) {
+	return a.runCompilePipeline(ctx, sessionID, messages, tokenBudgetOverride, true)
+}
+
 // handleCompile handles POST /v1/compile
 func (a *APIServer) handleCompile(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
@@ -382,14 +409,14 @@ func (a *APIServer) handleCompile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	if err := validateSessionID(req.SessionID); err != nil {
+	if err := ValidateSessionID(req.SessionID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	
 	// Validate message contents
 	for _, msg := range req.Messages {
-		if err := validateMessageContent(msg.Content); err != nil {
+		if err := ValidateMessageContent(msg.Content); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -469,13 +496,13 @@ func (a *APIServer) handlePlaygroundCompile(w http.ResponseWriter, r *http.Reque
 	if sessionID == "" {
 		sessionID = "default-session"
 	}
-	if err := validateSessionID(sessionID); err != nil {
+	if err := ValidateSessionID(sessionID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	for _, msg := range req.Messages {
-		if err := validateMessageContent(msg.Content); err != nil {
+		if err := ValidateMessageContent(msg.Content); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -510,7 +537,7 @@ func (a *APIServer) handleGetMemories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	if err := validateSessionID(sessionID); err != nil {
+	if err := ValidateSessionID(sessionID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -557,7 +584,7 @@ func (a *APIServer) handleDeleteMemories(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	
-	if err := validateSessionID(sessionID); err != nil {
+	if err := ValidateSessionID(sessionID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

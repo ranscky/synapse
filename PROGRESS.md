@@ -5978,3 +5978,293 @@ finding 1 above is new and worth carrying: from this phase on, `go.mod` is only 
 toolchain at or above 1.25.5.
 
 
+## Phase 23 — synapse_compile MCP tool (complete)
+
+Phase 22 proved a request could reach a handler; this phase gives the handler something to do. The
+MCP surface now advertises exactly one tool, `synapse_compile`, and it does not implement compiling:
+it hands the conversation it was given to the same function `POST /v1/compile` calls, so an editor's
+compile and an HTTP compile are one compilation with one store, one embedder, one control-plane
+candidate source, and one trace.
+
+Commit `feat: Phase 23 - synapse_compile MCP tool`
+
+New files:
+
+- `internal/mcp/compile.go` — 273 lines: the `Compiler` seam, the tool definition and its schema,
+  the handler, the error envelope, and the response types. Separate from `server.go` for a reason
+  the file rules make non-negotiable: `server.go` was 224 lines and the tool plus its types is
+  another ~180, so adding it there would have crossed the 300-line ceiling this project holds
+  itself to. `registerTools` stays in `server.go` as the table of what the server offers, and now
+  delegates to `s.registerCompileTool()`.
+- `internal/mcp/compile_test.go` — 447 lines: seven tests, the DoD one driving a real store and a
+  real `*api.APIServer` through mcp-go's in-process client.
+- `/home/ranscky/synapse-mcp-test/` — the Cline fixture, outside this tree: `synapse.yaml`
+  (absolute paths, scratch database, proxy on 8081), `.cursor/mcp.json` (absolute binary path,
+  `--mcp`, `--config`), and a `README.md` recording the manual probe. All three are mode 0600.
+
+Changed:
+
+- `internal/mcp/server.go` — 224 → 207 lines. `synapse_ping`, `pingResult`, `handlePing` and
+  `pingToolName` are deleted, `NewServer` takes a third argument (`Compiler`), and `Server` carries
+  the seam. The package doc comment was rewritten: it described the package as "boot path only, no
+  tool reads memory yet", which stopped being true in this phase.
+- `internal/mcp/server_test.go` — 262 → 225 lines. The ping test is replaced by
+  `TestCompileToolIsRegisteredAndDescribesTheSieve` (in `compile_test.go`); the stdio test is
+  renamed `TestServeStdioListsCompileTool`; the TCP test asserts `synapse_compile` is advertised.
+  `newTestServer` now injects a stub pipeline, so a handshake test never needs an embedder.
+- `internal/api/api.go` — 736 → 763 lines: `CompileContext` (the exported seam) and
+  `ValidateSessionID`/`ValidateMessageContent` renamed out of their unexported spellings.
+- `internal/api/api_test.go` — 6 call sites updated for that rename, nothing else. Listed here rather
+  than folded into "mechanical" because it is a v1 test file and a reader deserves to see it named.
+- `cmd/synapse/main.go` — the MCP boot block passes `apiServer` as the pipeline (+7/-1 lines).
+- `bin/synapse` was rebuilt for the verification below and is **not** staged: it was already dirty
+  in the working tree before this phase (`M bin/synapse`, last committed in `371186d`), and Phase 22
+  made the same call. 24.8 MB → 24.9 MB, well inside CI's 50 MB gate.
+
+
+### The shared pipeline, and the one exported method internal/api gained
+
+The brief's two rules point in opposite directions — "do not touch any v1 internal package except
+`internal/mcp`" and "call the same function that POST /v1/compile calls in `internal/api`" — because
+the function in question, `(*APIServer).runCompilePipeline`, is unexported and reachable only from
+inside `internal/api`. Three shapes were on the table and the decision was made explicitly rather
+than by drift: (a) export a wrapper around the existing private method, (b) move the pipeline body
+into `internal/compiler` and have both front ends call it, (c) have the MCP tool HTTP-POST to the
+local REST endpoint. (b) was rejected as the larger change to two frozen packages for the same
+result, and (c) as a self-call that adds a hop and a dependency on this process's own listener.
+(a) is what shipped:
+
+```go
+func (a *APIServer) CompileContext(ctx context.Context, sessionID string, messages []Message, tokenBudgetOverride int) (*compiler.CompileResult, error) {
+	return a.runCompilePipeline(ctx, sessionID, messages, tokenBudgetOverride, true)
+}
+```
+
+Two lines of behavior, no logic moved, no call site in `handleCompile` or `handlePlaygroundCompile`
+changed, and `persist=true` is deliberately hard-coded into it: "the same thing /v1/compile does" is
+the contract, and the playground's `persist=false` variant is not what an editor's compile should
+be. The validators were renamed out of `validateSessionID`/`validateMessageContent` (6 call sites in
+`api.go`, 6 references in `api_test.go`) rather than duplicated in `internal/mcp`, because two copies
+of an input rule are two rules the day one of them is edited.
+
+`internal/mcp` therefore imports `internal/api` and declares the dependency the other way round, as
+an interface it owns:
+
+```go
+type Compiler interface {
+	CompileContext(ctx context.Context, sessionID string, messages []api.Message, tokenBudgetOverride int) (*compiler.CompileResult, error)
+}
+```
+
+`*api.APIServer` satisfies it structurally, so nothing in `internal/api` knows MCP exists — and a
+test can inject a stub, which is how the five non-DoD tests stay fast.
+
+
+### `invalid_params` is a tool error here, and that is a protocol fact, not a shortcut
+
+The brief asks for "MCP error with type `invalid_params`". From inside a handler that cannot be a
+JSON-RPC `-32602`: mcp-go v1.1.0 maps *any* error a handler returns to `mcp.INTERNAL_ERROR`
+(`-32603`) at `server/server.go:2130-2136`, and the code constants are not a handler's to choose. The
+protocol's own route for a tool-reported failure is a `CallToolResult` with `IsError` set, so that is
+what this tool returns, carrying a machine-readable type:
+
+```json
+{"error":{"type":"invalid_params","message":"session_id is required"}}
+```
+
+`compile_failed` is the second type, for the cases that are not the caller's fault: a pipeline that
+ran and failed, and a server built with no pipeline at all. The pipeline's own error goes to the log
+and **not** to the caller — an error from that layer can name a database path or an upstream host,
+and this is the one place where "same treatment as REST" is also the safer treatment: the REST
+handlers log the cause and answer "Internal server error", and so does this.
+
+### What the response carries beyond the four fields the brief names
+
+The brief specifies `compiled_messages`, `tokens_used`, `reduction_pct`, `detected_intent`. The
+response also carries `trace_id` and a `memories` array of the four factor scores per memory,
+because `.clinerules` makes those mandatory for any MCP tool that surfaces a memory: "MCP responses
+MUST include score breakdown (S/R/I/T) and trace_id so users can see WHY a memory was surfaced
+(differentiation from OpenMemory MCP)". A compile surfaces memories, so the requirement applies, and
+the manual run below shows what that buys: the compiled context, and next to it the scoring that put
+one memory in and left two out.
+
+What it deliberately does **not** carry is `content_preview`. The memories that were compiled are
+already in `compiled_messages`; the ones that were not are not this caller's business, so an
+excluded memory is reported by score only. The tool also has no header input at all, and
+`session_id` is required, which is why `extractSessionID`'s Authorization-derived session id is
+unreachable from this path: there is no header to hash.
+
+### synapse_ping is gone
+
+The brief says "replace synapse_ping with synapse_compile", and that is what happened: the tool, its
+result type, its handler, and its constant are deleted, and the four test references now name the
+compile tool. The consequence is worth stating plainly: `tools/list` advertises one tool, and there
+is no longer a zero-dependency liveness probe inside this package. What still covers that role is
+`initialize` plus `tools/list` — neither of which touches a store, an embedder, or an ONNX session,
+since `NewServer` accepts a nil store and a stub pipeline — and `TestServeStdioListsCompileTool`
+drives exactly that through buffers.
+
+
+### Verification — real output
+
+Formatting, vet, build:
+
+```text
+$ gofmt -l internal/mcp
+(no output)
+
+$ go vet ./...
+(no output)
+
+$ go build ./... && go build -o bin/synapse ./cmd/synapse
+(no output)
+```
+
+`gofmt -l internal/api` still lists `api.go`, `api_test.go`, `header_sanitize.go`,
+`header_sanitize_test.go`, `integration_test.go`, `ratelimit.go`, and `gofmt -l cmd/synapse` still
+lists `main.go` — all of them were already unformatted at HEAD (the same trailing-whitespace v1
+habit Phase 22 documented for `internal/config` and `main.go`). Checked rather than assumed: no line
+this phase added appears in `gofmt -d` for any of them, so nothing here is smuggled in behind a
+reformat that was deliberately not done.
+
+The DoD command, verbatim:
+
+```text
+$ go test ./internal/mcp/... -run TestCompile -v -count=1
+=== RUN   TestCompileToolIsRegisteredAndDescribesTheSieve
+--- PASS: TestCompileToolIsRegisteredAndDescribesTheSieve (0.00s)
+=== RUN   TestCompileToolCompilesSessionThroughSharedPipeline
+2026/09/22 10:07:35 INFO Store initialized db_path=/tmp/TestCompileToolCompilesSessionThroughSharedPipeline3685994256/001/mcp-compile.db
+    compile_test.go:191: synapse_compile response: {"compiled_messages":[{"content":"[Memory: context] the order handler panics when the payload is empty\n\nthere is a stack trace in the order handler, it crashes on an empty payload","role":"user"}],"tokens_used":10,"reduction_pct":60,"detected_intent":"debug","trace_id":"req-1790071656098986218","memories":[{"id":"mem-0","memory_type":"context","score_semantic":1,"score_recency":0.9999999464442252,"score_importance":0.5,"score_task_alignment":0.48333333333333334,"score_total":0.7466666613110893,"included":true},{"id":"mem-1","memory_type":"context","score_semantic":0,"score_recency":0.97153188912246,"score_importance":0.5,"score_task_alignment":0.48333333333333334,"score_total":0.3438198555789127,"included":false},{"id":"mem-2","memory_type":"context","score_semantic":0,"score_recency":0.9438742621317734,"score_importance":0.5,"score_task_alignment":0.48333333333333334,"score_total":0.341054092879844,"included":false}]}
+--- PASS: TestCompileToolCompilesSessionThroughSharedPipeline (1.05s)
+=== RUN   TestCompilePassesArgumentsThroughUnchanged
+--- PASS: TestCompilePassesArgumentsThroughUnchanged (0.00s)
+=== RUN   TestCompileRejectsInvalidParams
+=== RUN   TestCompileRejectsInvalidParams/missing_session_id
+=== RUN   TestCompileRejectsInvalidParams/empty_session_id
+=== RUN   TestCompileRejectsInvalidParams/illegal_session_id
+=== RUN   TestCompileRejectsInvalidParams/missing_messages
+=== RUN   TestCompileRejectsInvalidParams/empty_messages
+=== RUN   TestCompileRejectsInvalidParams/message_is_not_an_object
+=== RUN   TestCompileRejectsInvalidParams/null_byte_in_content
+=== RUN   TestCompileRejectsInvalidParams/negative_token_budget
+--- PASS: TestCompileRejectsInvalidParams (0.00s)
+    --- PASS: TestCompileRejectsInvalidParams/missing_session_id (0.00s)
+    --- PASS: TestCompileRejectsInvalidParams/empty_session_id (0.00s)
+    --- PASS: TestCompileRejectsInvalidParams/illegal_session_id (0.00s)
+    --- PASS: TestCompileRejectsInvalidParams/missing_messages (0.00s)
+    --- PASS: TestCompileRejectsInvalidParams/empty_messages (0.00s)
+    --- PASS: TestCompileRejectsInvalidParams/message_is_not_an_object (0.00s)
+    --- PASS: TestCompileRejectsInvalidParams/null_byte_in_content (0.00s)
+    --- PASS: TestCompileRejectsInvalidParams/negative_token_budget (0.00s)
+=== RUN   TestCompileReportsPipelineFailureAsToolError
+2026/09/22 10:07:36 ERROR MCP compile failed error="failed to search memories: /var/lib/synapse/secret.db is locked"
+--- PASS: TestCompileReportsPipelineFailureAsToolError (0.00s)
+=== RUN   TestCompileWithoutPipelineFailsSafelyNotPanics
+--- PASS: TestCompileWithoutPipelineFailsSafelyNotPanics (0.00s)
+PASS
+ok  	synapse/internal/mcp	1.078s
+```
+
+
+That response is the whole phase in one line, and it is worth reading closely. `tokens_used` 10
+against a budget of 12 with `reduction_pct` 60 means the budget really did trim the pool rather than
+being reported after the fact; `detected_intent` "debug" is the classifier's verdict on a message
+about a stack trace; `mem-0` scores semantic 1.0 because the test stores it with the query's own
+embedding, and its `score_total` 0.7467 is exactly `0.4·1 + 0.3·0.5 + 0.2·0.4833 + 0.1·1.0` under the
+configured weights; and the two excluded memories are reported by score with no content. The
+`ERROR MCP compile failed` line is the other half of that: the stub's error text, which contains a
+database path, appears in the log and in the log only — the assertion that follows it is
+`require.NotContains(t, text, "secret.db")`.
+
+The whole package and the frozen package it now depends on:
+
+```text
+$ go test ./internal/mcp/... ./internal/api/... -count=1
+ok  	synapse/internal/mcp	1.200s
+ok  	synapse/internal/api	0.880s
+```
+
+`internal/api`'s suite passing unchanged is the evidence for the seam being additive: the rename and
+`CompileContext` altered no behavior, and the v1 tests that cover both are the ones that say so.
+
+The real binary, over stdio, against the fixture config an editor would use — `initialize`,
+`tools/list`, then a five-message `tools/call`, with everything on stderr and only JSON-RPC on
+stdout:
+
+```text
+$ cd /tmp/synapse-verify
+$ timeout -s INT 20 /home/ranscky/Dev/synapse/bin/synapse --mcp --config ./synapse.yaml < requests.jsonl
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"synapse","version":"0.1.0"}}}
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"description":"Compile conversation history into token-budgeted, task-aware context using the 4-Factor Sieve (Semantic 0.4, Importance 0.3, Task Alignment 0.2, Recency 0.1 with 24h half-life decay).","inputSchema":{"properties":{"messages":{...},"session_id":{...},"token_budget":{...}},"required":["messages","session_id"],"type":"object"},"name":"synapse_compile"}]}}
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"compiled_messages\":[{\"content\":\"[Memory: error] Now there is an error: the synapse_compile tool returns invalid_params for a session that exists, here is the stack trace from the MCP server.\\n\\nNow there is an error: the synapse_compile tool returns invalid_params for a session that exists, here is the stack trace from the MCP server.\",\"role\":\"user\"}],\"tokens_used\":30,\"reduction_pct\":0,\"detected_intent\":\"debug\",\"trace_id\":\"req-1790071576544894642\",\"memories\":[{\"id\":\"req-1790071552527909122\",\"memory_type\":\"error\",\"score_semantic\":1,\"score_recency\":0.9998073425217096,\"score_importance\":0.9,\"score_task_alignment\":0.6666666666666667,\"score_total\":0.9033140675855043,\"included\":true}]}"}],"structuredContent":{...}}
+```
+
+That output is the second run against the same scratch session: the first run compiled with no
+memories in the session yet (`tokens_used` 0, `memories` empty, `detected_intent` "debug"), and
+because the tool persists exactly as `/v1/compile` does, its last user message became the memory the
+second run surfaced — through the real ONNX embedder, hence semantic 1.0 and importance 0.9 for a
+memory the store typed "error". `reduction_pct` is 0 there because the candidate pool is that one
+memory and all of it fit, which is the same arithmetic `/v1/compile` does. Nothing but JSON-RPC
+reached stdout; the two warnings the process emitted (`Failed to load UI file`, `Failed to load
+session UI file`) are on stderr, which is where every logger in this process writes by design.
+
+For the editor half of the brief, `/home/ranscky/synapse-mcp-test/` holds a `.cursor/mcp.json` and
+the `synapse.yaml` it points at, and the probe above was run from that directory against that config,
+so the file an editor will read is a file that was exercised. What this session cannot do is restart
+Cline: reading its MCP panel and pasting the tool's output is the operator's step, and it is the one
+item on the brief's manual-verification list that stays open here.
+
+
+### Findings
+
+1. **The MCP surface still has no authentication, and it now writes.** Phase 22's finding 8 said the
+   loopback bind should not be read as authentication and that the first memory-returning tool should
+   arrive with a tenant check. This phase added the first tool that both *returns* session memories
+   and *writes* one (the last user message, exactly as `/v1/compile` does). The mitigating facts are
+   real but limited: the transport is stdio or 127.0.0.1, the tool accepts no header and requires an
+   explicit `session_id`, and this process is the same binary whose standalone REST API has no auth
+   either — so the exposure added is a local one, not a new network one. It is still the largest open
+   item on this surface, and it is a gate on the first tool that goes looking for memories the caller
+   did not name.
+2. **An MCP handler cannot emit JSON-RPC `-32602`.** mcp-go v1.1.0 hard-maps any handler error to
+   `INTERNAL_ERROR`, so "invalid params" from a tool is necessarily an `IsError` result, optionally
+   with a typed body as here. The alternative — declaring the schema and enabling
+   `WithInputSchemaValidation` — produces SEP-1303 tool execution errors with the validator's own
+   wording, which is a different message shape again. Recorded because a reviewer will ask why this
+   tool does not use the numeric code, and because the next tool has to make the same choice.
+3. **A compile with no memories is indistinguishable from a compile that failed to retrieve.** The
+   first probe run answered `compiled_messages` containing only the caller's own last message,
+   `tokens_used` 0, `memories` `[]` — correct, and exactly what `/v1/compile` returns for a fresh
+   session. A model reading that may reasonably conclude nothing was found *and* that retrieval
+   broke. A future phase could add something like `memories_considered` or a `state` field; it is not
+   in this phase's response shape, so it was not invented here.
+4. **The tool is not rate-limited.** The REST path has a per-IP `RateLimiter`; this path has none,
+   and each call costs one embedding plus one store write. A local process looping on `tools/call` is
+   not bounded by anything in this package.
+5. **Testing the real pipeline needed a deliberately non-degenerate stub embedder.** `basisEmbedder`
+   returns a unit vector rather than zeros, and the DoD test stores one memory with the query's own
+   vector. Zero vectors would have been "fine" — `store.CosineSimilarity` returns 0 when either norm
+   is 0 — which is precisely the problem: a broken scoring pass would have looked like a working one
+   that happened to score everything 0. The semantic 1.0 in the test output is what rules that out.
+6. **`Server.store` is still a seam no tool uses.** The compile tool reaches storage through the
+   pipeline, not through the field, so `NewServer`'s first argument is unused by this phase's tool
+   set. A recall tool would use it; if the surface never grows one, the field should be deleted
+   rather than left as decoration.
+
+### Next phase
+
+The largest item is the one Phase 22 queued: the recall/list tools, which owe the score breakdown,
+the trace id and the shared sanitization pipeline just as this one does — and which, unlike this one,
+are gated by finding 1 above, because a tool that returns memories the caller did not name is a
+tool that needs to know whose memories they are. Finding 3 and finding 4 are small and could travel
+with it. Nothing carried over from Phases 17-22 has moved: the external anchor for each tenant's
+chain head (Phase 17 finding 2, Phase 18 finding 6, Phase 20 finding 8) is still what makes "the
+chain was deleted" and "nothing was ever appended" the same answer; `tenant.RunMigrations`' advisory
+lock (Phase 20 finding 1) is still the smallest; metering is still the phase that would make the
+compliance report's summary honest; the compliance-tier provisioning field still belongs with
+whichever phase touches `POST /v2/tenants` next; and recording `GET /v2/compliance/chain-integrity`'s
+successful reads (Phase 21 finding 1) is still small enough to ride along with any of them. Phase
+22's Go 1.25.5 floor (its finding 7) now applies to any toolchain that builds this tree, MCP-aware or
+not.
+
