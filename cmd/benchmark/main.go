@@ -1,298 +1,186 @@
+// Command benchmark measures what Synapse's compile pipeline removes from a
+// conversation, in three scenarios printed side by side with the framing each
+// one deserves:
+//
+//	v1 established  an established multi-session conversation -- the headline number
+//	v1 cold-start   a brand-new session with no prior memories -- small by design
+//	v2 Global Brain two agents, one shared control plane -- needs --plane
+//
+// Scenarios 1 and 2 always run, against fixtures and a fresh in-memory store.
+// Scenario 3 runs only when --plane is given with a tenant credential, because
+// it talks to a real control plane over real HTTP; when it is not given, the run
+// stays completely local.
+//
+// Every number is measured rather than asserted: a scenario below its target
+// prints a warning naming what to check, and the framing lines say which
+// candidate pool the number came from.
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
 
-	"github.com/pkoukk/tiktoken-go"
-	"synapse/internal/budget"
-	"synapse/internal/classifier"
 	"synapse/internal/config"
-	"synapse/internal/dedup"
 	"synapse/internal/embedder"
-	"synapse/internal/scorer"
-	"synapse/internal/store"
 )
 
-// Message represents a chat message
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
+const (
+	// onnxModelPath is named so the hash-embedder fallback warning can point at
+	// the file it did not find.
+	onnxModelPath = "models/all-MiniLM-L6-v2/model.onnx"
 
-// Session represents a chat session
-type Session struct {
-	Messages []Message `json:"messages"`
-}
+	// v1EstablishedTarget is scenario 1's target: the number the README's
+	// headline claim rests on.
+	v1EstablishedTarget = 40.0
+
+	// expectedColdStartReduction is what scenario 2 is expected to show. It is a
+	// documented expectation rather than a target, because a session with no
+	// prior memories has almost nothing to compress yet.
+	expectedColdStartReduction = 15.0
+)
 
 func main() {
 	// budgetOverride: -1 means "not set, use config default"
 	budgetFlag := flag.Int("budget", -1, "Override token budget (defaults to config value)")
+	planeFlag := flag.String("plane", "", "Control plane URL, e.g. http://127.0.0.1:9090. Runs the Global Brain scenario when set.")
+	apiKeyFlag := flag.String("api-key", "", "Tenant credential (the jwt provisioning returned) presented to the control plane. Required with --plane; never printed.")
+	agentAFlag := flag.String("agent-a", "agent_a", "Agent id the Global Brain sessions are pushed as")
+	agentBFlag := flag.String("agent-b", "agent_b", "Agent id that compiles against the Global Brain")
+	coldFlag := flag.String("cold-session", "testdata/session_code.json", "Session fixture for the cold-start scenario")
+	sessionsFlag := flag.Int("global-sessions", 5, "Sequential agent_a sessions pushed to the Global Brain")
+	modeFlag := flag.String("global-brain", globalBrainDistilled,
+		`Global Brain push policy: "distilled" (one memory per session) or "full" (every memory of every session)`)
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatal("Usage: benchmark [--budget N] <session_file>")
+		log.Fatal("Usage: benchmark [--budget N] [--plane URL --api-key JWT] <session_file>")
 	}
 
-	sessionFile := args[0]
+	globalBrain, err := globalBrainOptionsFromFlags(*planeFlag, *apiKeyFlag, *agentAFlag, *agentBFlag, *modeFlag, *sessionsFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// Load session
-	session, err := loadSession(sessionFile)
+	established, err := loadSession(args[0])
 	if err != nil {
 		log.Fatalf("Failed to load session: %v", err)
 	}
 
-	// Count raw tokens
-	rawTokens := countTokens(session.Messages)
-	fmt.Printf("Raw messages: %d tokens\n", rawTokens)
-
-	// Run Synapse pipeline
-	compiledTokens, err := runSynapsePipeline(session.Messages, *budgetFlag)
+	cold, err := loadSession(*coldFlag)
 	if err != nil {
-		log.Fatalf("Failed to run Synapse pipeline: %v", err)
+		log.Fatalf("Failed to load cold-start session %s: %v", *coldFlag, err)
 	}
 
-	fmt.Printf("Compiled messages: %d tokens\n", compiledTokens)
-
-	// Calculate reduction
-	if rawTokens > 0 {
-		reduction := float64(rawTokens-compiledTokens) / float64(rawTokens) * 100
-		fmt.Printf("Reduction: %.1f%%\n", reduction)
-
-		// Check if reduction meets target
-		if reduction < 40.0 {
-			fmt.Printf("WARNING: Token reduction (%.1f%%) is below target (40%%). Consider tuning weights.\n", reduction)
-		} else {
-			fmt.Printf("SUCCESS: Token reduction (%.1f%%) meets target (≥40%%).\n", reduction)
-		}
-	}
-}
-
-func loadSession(filename string) (*Session, error) {
-	// Try to find the file in testdata directory
-	fullPath := filename
-	if _, err := os.Stat(filename); os.IsNotExist(err) {
-		// Try testdata directory
-		testdataPath := filepath.Join("testdata", filename)
-		if _, err := os.Stat(testdataPath); err == nil {
-			fullPath = testdataPath
-		}
-	}
-
-	data, err := os.ReadFile(fullPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
-	}
-
-	var session Session
-	if err := json.Unmarshal(data, &session); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %w", err)
-	}
-
-	return &session, nil
-}
-
-func countTokens(messages []Message) int {
-	// Initialize tiktoken for GPT-3.5/GPT-4 token counting
-	tke, err := tiktoken.EncodingForModel("gpt-3.5-turbo")
-	if err != nil {
-		// Fallback to cl100k_base encoding
-		tke, err = tiktoken.GetEncoding("cl100k_base")
-		if err != nil {
-			log.Printf("Warning: Failed to initialize tokenizer, using character approximation")
-			total := 0
-			for _, msg := range messages {
-				total += len(msg.Content) / 4 // Rough approximation
-			}
-			return total
-		}
-	}
-
-	totalTokens := 0
-	for _, msg := range messages {
-		tokens := tke.Encode(msg.Content, nil, nil)
-		totalTokens += len(tokens)
-	}
-
-	return totalTokens
-}
-
-// classifyMemType assigns a coarse memory type using keyword/phrase matching.
-// Still a heuristic, not real classification - but covers the vocabulary that
-// actually shows up in real debugging sessions (panics, stack traces, races),
-// not just generic words like "error" or "bug".
-func classifyMemType(content string) string {
-	lowerContent := strings.ToLower(content)
-
-	errorTerms := []string{
-		"error", "bug", "exception", "panic", "sigsegv", "stack trace",
-		"nil pointer", "null pointer", "segfault", "crash", "race detected",
-		"data race", "failed", "failure", "traceback",
-	}
-	decisionTerms := []string{
-		"implement", "function", "code", "refactor", "design", "structure",
-		"validation chain", "convention", "pattern",
-	}
-
-	for _, term := range errorTerms {
-		if strings.Contains(lowerContent, term) {
-			return "error"
-		}
-	}
-	for _, term := range decisionTerms {
-		if strings.Contains(lowerContent, term) {
-			return "decision"
-		}
-	}
-	return "context"
-}
-
-func runSynapsePipeline(messages []Message, budgetOverride int) (int, error) {
-	// Create temporary store
-	storeInstance, err := store.NewStore(":memory:")
-	if err != nil {
-		return 0, fmt.Errorf("failed to create store: %w", err)
-	}
-	defer storeInstance.Close()
-
-	// Create config with default weights
 	cfg := config.DefaultConfig()
 
 	// Apply budget override if the flag was explicitly set (-1 = not set)
-	if budgetOverride >= 0 {
-		cfg.TokenBudget = budgetOverride
+	if *budgetFlag >= 0 {
+		cfg.TokenBudget = *budgetFlag
 	}
 
-	// Real ONNX embedder - genuinely semantic, not hash-based. Falls back to
-	// the hash embedder (with a clear warning, not a silent swap) if the
-	// model file can't be found, matching the same graceful-degradation
-	// pattern internal/embedder.NewEmbedder itself uses.
-	onnxModelPath := "models/all-MiniLM-L6-v2/model.onnx"
-	// Initialize embedder
-	embedderInstance, err := embedder.NewEmbedder(cfg.EmbedderType, cfg.OpenAIAPIKey, cfg.ModelPath, "")
+	// One embedder for the whole run. Loading the ONNX model is the slow part,
+	// and every scenario has to score with the same model or the numbers are not
+	// comparable. Real ONNX embeddings, not hash-based: the fallback is announced
+	// out loud rather than swapped in silently.
+	emb, err := embedder.NewEmbedder(cfg.EmbedderType, cfg.OpenAIAPIKey, cfg.ModelPath, "")
 	if err != nil {
-		return 0, fmt.Errorf("failed to create embedder: %w", err)
+		log.Fatalf("Failed to create embedder: %v", err)
 	}
-	if _, ok := embedderInstance.(*embedder.ONNXEmbedder); !ok {
+	if _, ok := emb.(*embedder.ONNXEmbedder); !ok {
 		log.Printf("WARNING: ONNX model not found at %s, benchmark is running against hash-based embeddings, NOT real semantic similarity", onnxModelPath)
 	}
-	if onnxEmb, ok := embedderInstance.(*embedder.ONNXEmbedder); ok {
+	if onnxEmb, ok := emb.(*embedder.ONNXEmbedder); ok {
 		defer onnxEmb.Close()
 	}
 
+	p := &pipeline{cfg: cfg, embedder: emb}
 	ctx := context.Background()
 
-	// System messages are pinned context, not scored conversational history.
-	// They're always included and never compete for budget against the rest
-	// of the conversation, so they're tracked separately and excluded from
-	// the scored candidate pool entirely.
-	var systemTokens int
-	var scorableMessages []Message
-	for _, msg := range messages {
-		if msg.Role == "system" {
-			systemTokens += countTokens([]Message{msg})
-			continue
-		}
-		scorableMessages = append(scorableMessages, msg)
-	}
-
-	// Create mock memories from messages, with real per-message embeddings
-	var memories []store.MemoryEntry
-	for i, msg := range scorableMessages {
-		embedding, err := embedderInstance.Embed(ctx, msg.Content)
-		if err != nil {
-			return 0, fmt.Errorf("failed to embed message %d: %w", i, err)
-		}
-
-		memType := classifyMemType(msg.Content)
-
-		memories = append(memories, store.MemoryEntry{
-			ID:         fmt.Sprintf("mem-%d", i),
-			SessionID:  "benchmark-session",
-			Content:    msg.Content,
-			MemoryType: memType,
-			Embedding:  embedding,
-			Timestamp:  time.Now().Add(-time.Duration(i) * time.Hour), // Older memories get lower recency scores
-		})
-	}
-
-	// Classify intent from last few scorable messages (system prompt excluded,
-	// since it's not part of the conversational signal we're classifying)
-	intentText := ""
-	if len(scorableMessages) > 0 {
-		intentText = scorableMessages[len(scorableMessages)-1].Content
-		if len(scorableMessages) > 1 {
-			intentText = scorableMessages[len(scorableMessages)-2].Content + " " + intentText
-		}
-	}
-
-	classification := classifier.Classify(intentText)
-
-	// Create scorer with weights from config
-	weights := scorer.Weights{
-		SemanticSimilarity: cfg.WeightSemanticSimilarity,
-		Recency:            cfg.WeightRecency,
-		Importance:         cfg.WeightImportance,
-		TaskAlignment:      cfg.WeightTaskAlignment,
-	}
-
-	scorerInstance := scorer.NewScorer(weights, classification.Intent, classification.Confidence, time.Now())
-
-	// Real query embedding too — using the same intentText that drove
-	// classification, so semantic similarity is scored against something
-	// representative of what the user is actually asking right now, not an
-	// arbitrary constant.
-	queryEmbedding, err := embedderInstance.Embed(ctx, intentText)
+	establishedReduction, err := runEstablishedScenario(ctx, p, args[0], established)
 	if err != nil {
-		return 0, fmt.Errorf("failed to embed query: %w", err)
+		log.Fatalf("Scenario 1 failed: %v", err)
 	}
 
-	scoredMemories := scorerInstance.Score(ctx, queryEmbedding, memories)
-
-	// Deduplicate
-	dedupInstance := dedup.Deduplicate(scoredMemories, cfg.DeduplicationThreshold)
-
-	// Reserve budget for the pinned system prompt before filling the rest of
-	// the budget with scored conversational history.
-	remainingBudget := cfg.TokenBudget - systemTokens
-	if remainingBudget < 0 {
-		remainingBudget = 0
+	if err := runColdStartScenario(ctx, p, *coldFlag, cold); err != nil {
+		log.Fatalf("Scenario 2 failed: %v", err)
 	}
 
-	// Apply budget
-	selectedMemories, tokensUsed := budget.Fill(dedupInstance, remainingBudget)
-
-	for _, sm := range selectedMemories {
-		fmt.Printf("  selected: %s — %.40s...\n", sm.ID, sm.Content)
+	// The Global Brain scenario needs a control plane, a tenant credential, and a
+	// database behind them. Without --plane the run is exactly the local
+	// benchmark it has always been.
+	if globalBrain.enabled() {
+		if err := runPlaneScenario(ctx, p, established, establishedReduction, globalBrain); err != nil {
+			log.Fatalf("Scenario 3 failed: %v", err)
+		}
 	}
-	selectedIDs := make(map[string]bool)
-	for _, sm := range selectedMemories {
-    	selectedIDs[sm.ID] = true
+}
+
+// runEstablishedScenario is scenario 1: an established conversation compiled
+// against its own messages.
+//
+// It returns the reduction so scenario 3's uplift line can be measured against
+// this run rather than against a number remembered from a README.
+func runEstablishedScenario(ctx context.Context, p *pipeline, fixtureName string, fixture *Session) (float64, error) {
+	fmt.Printf("=== scenario 1: v1 established (%s, fresh store) ===\n", fixtureName)
+
+	result, err := p.runFixtureScenario(ctx, fixture.Messages)
+	if err != nil {
+		return 0, err
 	}
-	for _, sm := range dedupInstance {
-    	if !selectedIDs[sm.ID] {
-        	fmt.Printf("  excluded: %s (T=%.3f S=%.3f total=%.3f) — %.40s...\n",
-            	sm.ID, sm.ScoreT, sm.ScoreS, sm.Total, sm.Content)
-    	}
+	result.printDetail(-1)
+
+	fmt.Printf("framing: candidates are this fixture's own %d scorable messages, embedded with the real model — the stand-in for an established session whose memories are already stored and scored.\n", result.Candidates)
+	fmt.Println("framing: this is the steady-state number the README's headline quotes: what a long-running session compiles to.")
+
+	reduction := result.Reduction()
+	fmt.Printf("v1 established:  Raw: %d | Compiled: %d | Reduction: %.1f%% (target ≥%.0f%%)\n",
+		result.RawTokens, result.CompiledTokens, reduction, v1EstablishedTarget)
+	if reduction < v1EstablishedTarget {
+		fmt.Printf("WARNING: v1 established reduction (%.1f%%) is below target (≥%.0f%%) — check the scoring weights, the classifier's confidence, and the fixture\n",
+			reduction, v1EstablishedTarget)
+	} else {
+		fmt.Printf("SUCCESS: v1 established reduction (%.1f%%) meets target (≥%.0f%%).\n", reduction, v1EstablishedTarget)
 	}
 
-	totalTokensUsed := tokensUsed + systemTokens
+	return reduction, nil
+}
 
-	fmt.Printf("System prompt tokens (pinned): %d\n", systemTokens)
-	fmt.Printf("Candidates retrieved: %d\n", len(memories))
-	fmt.Printf("After deduplication: %d\n", len(dedupInstance))
-	fmt.Printf("Final selected: %d\n", len(selectedMemories))
-	fmt.Printf("Tokens used: %d\n", totalTokensUsed)
-	fmt.Printf("Token budget: %d\n", cfg.TokenBudget)
-	fmt.Printf("Detected intent: %s (confidence: %.2f)\n", classification.Intent, classification.Confidence)
+// runColdStartScenario is scenario 2: a brand-new session with nothing behind it.
+//
+// It measures the same pipeline as scenario 1 on a shorter fixture, and the
+// number is small for a structural reason rather than a tunable one -- so it
+// prints the explanation instead of the 40% warning a low number would otherwise
+// trip.
+func runColdStartScenario(ctx context.Context, p *pipeline, fixtureName string, fixture *Session) error {
+	fmt.Printf("\n=== scenario 2: v1 cold-start (%s, empty store) ===\n", fixtureName)
 
-	return totalTokensUsed, nil
+	result, err := p.runFixtureScenario(ctx, fixture.Messages)
+	if err != nil {
+		return err
+	}
+	result.printDetail(-1)
+
+	fmt.Println("note: no prior memories exist yet — the store is fresh, so the compile can only draw on this session's own messages.")
+	fmt.Println("note: cold-start reduction is lower by design and there is nothing to tune here; it grows as the conversation does, because there is more accumulated context to compress.")
+
+	reduction := result.Reduction()
+	fmt.Printf("v1 cold-start:   Raw: %d | Compiled: %d | Reduction: %.1f%% (expected ~%.0f%%)\n",
+		result.RawTokens, result.CompiledTokens, reduction, expectedColdStartReduction)
+	if reduction < expectedColdStartReduction-5 {
+		fmt.Printf("note: %.1f%% is below the ~%.0f%% a cold start usually shows — small is expected, near-zero is not; check the fixture and the budget\n",
+			reduction, expectedColdStartReduction)
+	}
+
+	return nil
+}
+
+// runPlaneScenario is scenario 3's wrapper: it prints the header and delegates
+// the measurement to globalbrain.go, which owns that scenario's framing.
+func runPlaneScenario(ctx context.Context, p *pipeline, fixture *Session, establishedReduction float64, opts globalBrainOptions) error {
+	fmt.Printf("\n=== scenario 3: v2 Global Brain (%s) ===\n", opts.URL)
+
+	return runGlobalBrain(ctx, p, fixture, establishedReduction, opts)
 }

@@ -267,13 +267,38 @@ Alongside the proxy itself, `cmd/` includes a few standalone tools:
 
 | Command | Purpose |
 |---|---|
-| `cmd/benchmark` | Run the scoring pipeline against a test-fixture session and report token reduction vs. raw history |
+| `cmd/benchmark` | Measure token reduction for an established session, a cold start, and — with a control plane — two agents sharing a Global Brain |
 | `cmd/counttokens` | Exact tiktoken-based token count for a session JSON file |
 | `cmd/mergesessions` | Merge multiple session JSON files into one, for constructing larger test fixtures |
 
+The benchmark runs three scenarios and prints each with the framing its number needs:
+
 ```bash
-go run ./cmd/benchmark testdata/session_code.json
+go run ./cmd/benchmark testdata/session_merged.json
 ```
+
+```text
+v1 established:  Raw: 5569 | Compiled: 2999 | Reduction: 46.1% (target ≥40%)
+v1 cold-start:   Raw: 3263 | Compiled: 2757 | Reduction: 15.5% (expected ~15%)
+```
+
+- **v1 established** is the headline scenario: an established multi-session conversation, compiled against its own messages.
+- **v1 cold-start** is a brand-new session against an empty store. The number is low by design and there is nothing to tune: with no prior memories, the compile can only draw on the session's own messages. Reduction grows as a conversation does, which is why the established scenario is the one the headline quotes.
+- **v2 Global Brain** runs only when a control plane is named:
+
+```bash
+go run ./cmd/benchmark testdata/session_merged.json \
+  --plane http://127.0.0.1:9090 --api-key "$SYNAPSE_TENANT_JWT"
+```
+
+It pushes five sequential sessions as `agent_a`, then compiles as `agent_b` against the memories the plane answers with. `--api-key` is the **JWT** that provisioning returned — the plaintext `api_key` is a bcrypt row, not a credential the sync and search routes accept.
+
+What `agent_a` pushes is a flag, because it decides what the number means:
+
+- `--global-brain=distilled` (default) pushes one memory per session — the same last-user-message write-back `synapse_compile` performs. Measured: `Raw: 5569 | Compiled: 381 | Reduction: 93.2% (target ≥55%)`: a small pool of cross-agent memory answering the same task.
+- `--global-brain=full` pushes every memory of every session, which is what a proxying edge node queues per turn. Measured: `Raw: 5569 | Compiled: 2999 | Reduction: 46.1%` — a pool larger than the token budget makes the compile fill the budget, so the reduction is budget-bound; the benchmark prints that explanation next to the number instead of leaving it to a README.
+
+What the Global Brain number is *not*: `Raw` is `agent_b`'s own session while `Compiled` is the context it builds from the shared brain, so the two sides are not the same text. It measures cross-agent recall with the same arithmetic as the two v1 scenarios — not "better compression of one conversation".
 
 ---
 

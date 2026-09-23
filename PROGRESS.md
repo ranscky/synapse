@@ -7832,3 +7832,99 @@ path queue its own writes (finding 6). Nothing in this phase blocks any of them.
 
 
 
+## Phase 30 — benchmark: established, cold-start, Global Brain (complete)
+
+### What this phase is
+
+The benchmark measured one scenario and printed one number with one warning. This phase makes it measure three,
+and — the part that matters — makes it print the framing each number needs, because two of the three are easy to
+misread. Measured, real output, on this machine:
+
+| scenario | Raw | Compiled | Reduction |
+|---|---|---|---|
+| v1 established (`session_merged.json`, target ≥40%) | 5569 | 2999 | **46.1%** |
+| v1 cold-start (`session_code.json`, empty store, expected ~15%) | 3263 | 2757 | **15.5%** |
+| v2 Global Brain, `distilled` pool (target ≥55%) | 5569 | 381 | **93.2%** (+47.0% vs established) |
+| v2 Global Brain, `full` pool | 5569 | 2999 | **46.1%** (+0.0%) |
+
+### The file split
+
+`cmd/benchmark/main.go` was 297 lines — three under the 300-line ceiling — so three scenarios could not be added
+to it. It is now four files: `main.go` (flags, scenario orchestration, the two v1 summary blocks), `session.go`
+(fixtures, token counting, the pure helpers: chunking, write-back selection, the reduction formula), `pipeline.go`
+(the classify → score → dedup → budget chain, extracted from the old single-scenario body so the three scenarios
+cannot drift apart), and `globalbrain.go` (scenario 3 and its framing). Two test files add sixteen unit tests over
+the pure parts: chunk coverage/ordering/clamping, write-back selection and its fallback, the reduction formula, and
+every way the Global Brain flags can be wrong — including the assertion that a rejected credential never appears in
+the error text.
+
+### The budget bound, which is the finding this phase is really about
+
+A compile can never print more than the token budget: `budget.Fill` packs into `TokenBudget − systemTokens` and the
+compiled figure is that plus the pinned prompt, so with the default budget of 3000 the ceiling is 3000 tokens.
+Reduction is therefore `1 − M/raw` with `M ≤ 3000`, and for the 5569-token established fixture the best number
+arithmetically available is **46.1%**. Scenario 3's ≥55% target is reachable only when the candidate pool is
+*smaller* than the budget. With `--global-brain=full` (26 pushed memories, top-k 50) the compile saturates the
+budget and lands on exactly the v1 established figure, an uplift of `+0.0%`, and the mandated warning — which is
+why the default is `--global-brain=distilled` (one memory per session: the last-user-message write-back
+`synapse_compile` itself performs), and why the framing line printed with a full-pool run says *"the pool is larger
+than the budget, so the compile fills the budget — reduction is budget-bound, not sync-bound"* instead of leaving
+an operator to conclude that sync is broken.
+
+### What the Global Brain number is not
+
+`Raw` is `agent_b`'s own session and `Compiled` is the context it builds from the shared brain, so the two sides
+are not the same text: 93.2% is cross-agent recall measured with scenarios 1 and 2's arithmetic, not compression of
+one conversation. Reading `+47.0%` as "the Global Brain compresses 47 points better than v1" would be wrong, and
+the output says so on purpose — that sentence is printed by the tool, not only written here.
+
+### Verified against a real plane
+
+The plane was built from `cmd/plane`, started on `127.0.0.1:9090` against the compose database with
+`SYNAPSE_DB_DSN`/`SYNAPSE_JWT_SECRET`/`SYNAPSE_ADMIN_TOKEN`/`SYNAPSE_MASTER_KEY` in the environment, and two
+tenants were provisioned through `POST /v2/tenants` (one per push policy, so neither pool was polluted by the
+other). The DoD command then ran with `--plane http://127.0.0.1:9090 --api-key <jwt>`. What that run proves end to
+end, rather than by argument: five batches accepted by `POST /v2/sync/memories`; the memories readable by a
+*different* agent id through `GET /v2/memories/search`; the compile scoring rows that live in the tenant's
+PostgreSQL schema rather than in the benchmark process's memory; and the whole thing failing loudly, with no
+credential in the message, when the plane is not there (`Scenario 3 failed: ... dial tcp 127.0.0.1:59599: connect:
+connection refused`).
+
+Scenarios 1 and 2 print byte-identical numbers to the pre-refactor run (46.1% and 15.5%), which is what makes the
+extraction into `pipeline.go` a refactor rather than a rewrite. `gofmt -l cmd/benchmark` clean, `go vet` clean,
+`go build ./...` clean, and the untagged suite (`go test ./... -count=1`) all `ok`, with `cmd/benchmark` itself now
+carrying tests where it previously had `[no test files]`.
+
+### Findings
+
+1. **The README's headline says 46.4%; the tool prints 46.1%** (Raw 5569, Compiled 2999). The published number is
+   the owner's call and was deliberately not changed here, but the reproduced number is now printed by the tool
+   with its own arithmetic rather than inferred from a README, and the two differ by 0.3 points.
+2. **Scenario 3's ≥55% target is unreachable for a full-fidelity pool** (the budget bound above). The warning the
+   brief asks for therefore fires by construction in that mode; `distilled` is the default precisely so the
+   headline scenario and the target are about the same thing, and `full` is kept as the honest stress test.
+3. **Scenario 2's 15.5% is what tripped the old 40% warning**, which is why the cold start needs its own framing
+   rather than a shared one: the 40% WARNING now belongs to scenario 1 alone and names it.
+4. **Scenarios 1 and 2 still build their candidates from the fixture's own messages**, not from the store: the
+   `:memory:` store is opened and closed unused, as it was in v1. That stand-in is unchanged, but the framing line
+   now says it out loud instead of implying a store was searched.
+5. **`--api-key` must be the tenant JWT.** Provisioning's `api_key` is a bcrypt row, not a credential the sync and
+   search routes accept — the same finding Phase 29 recorded, repeated here because the benchmark's flag name is
+   the older, ambiguous one.
+6. **Pushing only works because the benchmark calls `sync.Syncer.Push` itself.** The compile path's own write
+   (`api.NewAPIServer`, a frozen v1 signature) still leaves a memory `local_only` — Phase 29's finding 6, untouched
+   here and still true.
+7. **Every scenario-3 run leaves a tenant row, a schema, and its memories behind** — the Phase 29 finding 9
+   pattern, now with a second entry point. Two runs against one tenant also mix pools (the distilled write-backs
+   and the full memories have different ids), which is why the full-pool number above was measured against a fresh
+   tenant.
+
+### Next phase
+
+The most valuable follow-up is a way to scope a benchmark run to its own tenant and reset it, so the numbers stay
+reproducible and the development plane stops accumulating benchmark rows (finding 7). After it: making scenarios 1
+and 2 write their candidates into the store and search it, which removes the stand-in in finding 4 and would make
+the cold start real rather than simulated; a third push policy between distilled and full — the memories the
+session's own compile selected, bounded by the budget — which is the pool shape a real agent's write-back produces;
+and reconciling the README's quoted number with what the tool prints (finding 1).
+
