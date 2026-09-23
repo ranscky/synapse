@@ -7418,3 +7418,235 @@ are prerequisites for a self-serve billing flow, and the reverse proxy and TLS f
 of it reachable from Stripe at all.
 
 
+## Phase 28 — tenant status enforcement (402 for suspended) (complete)
+
+`RequireActiveStatus(pool)` is live in front of every tenant surface, and `synapse_global.tenants.status` —
+the column Phase 27's webhook writes — is now enforced rather than merely recorded. A `suspended` tenant is
+answered `402 {"error":"payment_required","upgrade_url":"https://synapse.ai/pricing"}` before any handler
+runs; a `grace_period` tenant is served normally and told how much of its window is left in
+`X-Synapse-Grace-Period: {days}days`; `active` — and any value this phase has never heard of — is served with
+nothing added. Three routes a billing status has no bearing on stay outside the gate: `GET /health`,
+`POST /v2/tenants` (the admin provisioning surface), and `POST /v2/billing/webhook`, the last one because a 402
+there would be self-defeating — the delivery that lifts a suspension is exactly the one a status-aware gate
+would refuse.
+
+Commit `feat: Phase 28 - tenant status enforcement (402 for suspended)`
+
+New files:
+
+- `internal/plane/status.go` — 202 lines: `RequireActiveStatus`, the 402 body, the `TenantStatus*` vocabulary,
+  the grace-period arithmetic, and the comments that explain the two spellings the import cycle forces.
+- `internal/plane/status_test.go` — 256 lines: the four tests this phase is defined by, plus two that pin the
+  exempt routes and the unknown-status branch.
+- `internal/plane/status_setup_test.go` — 190 lines: the pool, the provisioned tenants, `setTenantStatus`, the
+  router, and the request helper — split out at the 300-line ceiling, the arrangement
+  `compliance_setup_test.go` already makes.
+
+Changed:
+
+- `internal/plane/handlers.go` — 254 → 292 lines: the eleventh `NewServer` parameter plus its `Server` field,
+  and the tenant surfaces moved into one `router.Group` whose only middleware is
+  `s.requireJWT, RequireActiveStatus(s.statusPool)`.
+- `internal/billing/stripe.go` — the three `Status*` constants became aliases of `plane.TenantStatus*` (three
+  lines and a comment), so the package that writes a status and the package that enforces it cannot drift over
+  a spelling. Phase 27's own tests and callers are unchanged by construction.
+- `cmd/plane/main.go` — the pool passed as the new parameter, beside `billing.WebhookHandler(cfg, pool)`.
+- Thirteen test call sites in `internal/plane/*_test.go` — one trailing `nil` each, the arrangement Phase 27's
+  tenth parameter already established. The two compliance integration setups pass the **real** pool instead, so
+  Phases 19-21's tests now run through the gate exactly as a deployment does — which is how this phase finds out
+  that `active` really is transparent.
+- `bin/synapse` — **not** staged, and left dirty by an earlier demo build, as in Phases 22-27.
+
+### The gate has to be inside `requireJWT`, so the tenant routes became a group
+
+The middleware reads its tenant from `plane.TenantIDFromCtx`, which only `internal/tenant`'s JWT middleware
+fills — and chi runs `With(a, b)`/`Use(a, b)` in order, `a` outermost. The gate therefore has to be the second
+middleware, never the first, and the route table says so in one place:
+
+```go
+router.Group(func(r chi.Router) {
+	r.Use(s.requireJWT, RequireActiveStatus(s.statusPool))
+
+	r.Post(syncRoute, s.handleSyncMemories)
+	r.Get(searchRoute, s.handleSearchMemories)
+	r.Get(complianceAuditRoute, s.handleComplianceAudit)
+	r.Get(complianceChainIntegrityRoute, s.handleVerifyLedger)
+	r.Get(complianceReportRoute, s.handleComplianceReport)
+	r.Get(ledgerVerifyRoute, s.handleVerifyLedger)
+})
+```
+
+A `Group` rather than six `With(s.requireJWT, gate)` spellings because the claim being made is about *all*
+tenant surfaces: an endpoint added inside this group inherits the gate without its author having to remember
+it. The three exempt routes are registered outside the group for the same reason — the exemption list is the
+route table, and there is no path string anywhere in the middleware for a future route to match by accident.
+The order is not left to trust either: with the gate outermost, a suspended tenant's request would carry no
+verified tenant id, and the first test below would see 401 instead of 402.
+
+### A nil pool installs no gate, and the pool arrives as a constructor parameter
+
+`NewServer` grew an eleventh parameter (`statusPool *pgxpool.Pool`) rather than reaching for the
+`Database{Ping}` handle it already holds: the gate needs `QueryRow`, the health probe needs `Ping`, and the one
+thing they share is that `cmd/plane` holds the pool both are built from. This is the same shape as Phase 27's
+tenth parameter, and it cost the same thirteen one-token test edits.
+
+A nil pool means the gate is not installed at all (`RequireActiveStatus` returns `next`), which is a
+pass-through and therefore a fail-open — so it is worth being precise about why that cannot happen in
+production. `cmd/plane` fatals before `ListenAndServe` when `SYNAPSE_DB_DSN` is empty, and pings and migrates
+the database before it serves anything, so the only constructors that can pass nil are the plane's own unit
+tests, which inject fake provisioners and fake searchers and would have no status to read anyway. The
+alternative design — mounting the gate in `cmd/plane` around `srv.Routes()` and matching the three exempt paths
+by string — was rejected precisely because it hides the exemption list in the one place the route table is not,
+and because it would leave the gate untestable through the real router.
+
+### The status vocabulary moved into `internal/plane`, and `internal/billing` aliases it
+
+Phase 27 exported `StatusActive` / `StatusGracePeriod` / `StatusSuspended` with a comment saying whoever
+enforces them should not be spelling those strings a second time. Enforcing them from here was impossible as
+written: `internal/billing` reads the schema name from `internal/tenant`, which imports `internal/plane` for
+`PlaneConfig`, so `plane -> billing -> tenant -> plane`. The strings therefore live in `status.go` as
+`TenantStatusActive` / `TenantStatusGracePeriod` / `TenantStatusSuspended`, and `internal/billing`'s exported
+names became aliases of them (that package already imports `plane`, one direction only). Phase 27's comment is
+now true rather than aspirational, and nothing in Phase 27's tests moved. The same cycle forces `synapse_global`
+to be written as a literal in `status.go`, with a comment naming `tenant.SchemaName` as its single owner.
+
+### Failure paths: a status that cannot be read is never a status that passes
+
+Three refusals sit beside the two decisions, and each is a deliberate choice:
+
+- No verified tenant id — a request that never passed through `requireJWT` — answers `401 unauthorized`,
+  matching what every handler in the package already does for the same impossible case rather than treating an
+  empty id as a tenant that owns nothing.
+- `pgx.ErrNoRows` — a signature-valid token naming a tenant the registry no longer holds — answers `401`, not
+  `200`. The row is the source of the status, so a missing row has no status, and the fail-closed reading is
+  the one `requireJWT` takes for a token with no `tenant_id`.
+- Any other query error answers `500 {"error":"internal"}`. This is the rule that must not bend: a database
+  that cannot answer must not let a suspended tenant through, and the pgx error — which can quote the
+  connection target — is never reflected to the client. The read is bounded by a two-second context, so a hung
+  lookup becomes a fast 500 rather than a hung request.
+
+The grace header has two edge cases, both documented in `remainingGraceDays`: a `NULL` start time on a
+`grace_period` row reports the full seven days (the only way that state exists is a row written before the
+column did, and "0 days left" would cut access off on the strength of a missing value), and a window that has
+run out reports `0days` rather than a negative count. The window itself is `gracePeriodDays = 7` in `plane`
+rather than in `billing`, because `billing` only stamps the start time; the number is a property of the
+enforcement decision.
+
+### Evidence
+
+The definition of done, verbatim, against the compose database:
+
+```text
+$ go test ./internal/plane/... -run TestTenantStatus -v -tags integration
+=== RUN   TestTenantStatusSuspendedTenantIsRefusedWith402
+--- PASS: TestTenantStatusSuspendedTenantIsRefusedWith402 (0.16s)
+=== RUN   TestTenantStatusGracePeriodTenantIsServedWithTheWarningHeader
+=== RUN   TestTenantStatusGracePeriodTenantIsServedWithTheWarningHeader/just_entered_the_grace_period
+=== RUN   TestTenantStatusGracePeriodTenantIsServedWithTheWarningHeader/two_days_into_it
+--- PASS: TestTenantStatusGracePeriodTenantIsServedWithTheWarningHeader (0.30s)
+    --- PASS: TestTenantStatusGracePeriodTenantIsServedWithTheWarningHeader/just_entered_the_grace_period (0.14s)
+    --- PASS: TestTenantStatusGracePeriodTenantIsServedWithTheWarningHeader/two_days_into_it (0.16s)
+=== RUN   TestTenantStatusActiveTenantIsServedWithoutTheWarning
+--- PASS: TestTenantStatusActiveTenantIsServedWithoutTheWarning (0.17s)
+=== RUN   TestTenantStatusSuspendedTenantCanStillReadHealth
+--- PASS: TestTenantStatusSuspendedTenantCanStillReadHealth (0.15s)
+=== RUN   TestTenantStatusRoutesWithoutATenantStatusStayOpen
+--- PASS: TestTenantStatusRoutesWithoutATenantStatusStayOpen (0.36s)
+=== RUN   TestTenantStatusUnknownStatusIsServed
+--- PASS: TestTenantStatusUnknownStatusIsServed (0.18s)
+PASS
+ok  	synapse/internal/plane	1.322s
+```
+
+The regressions the change could have caused, each re-run after it: the untagged plane suite
+(`ok synapse/internal/plane 0.157s`), Phase 27's billing suite against the same database
+(`SYNAPSE_TEST_DB_DSN=… go test ./internal/billing/... -count=1` → `ok synapse/internal/billing 1.579s`, which
+is the alias change and the vocabulary staying put), Phases 19-21's two compliance integration tests through
+the now-gated router (`-run 'TestComplianceAudit|TestComplianceReport' -tags integration` →
+`ok synapse/internal/plane 15.365s`), and `go vet -tags integration ./...` across the module, which is what
+proves all sixteen `NewServer` call sites compile at the new arity.
+
+**The live demo**, because the tests exercise the middleware through a router this repo builds and a
+deployment builds its own. A real plane was booted on `127.0.0.1:9198` against the compose database (env-only
+config, so no file on disk), a tenant was provisioned through `POST /v2/tenants` — its JWT minted by the real
+issuer, the same token a customer would hold — and its status was moved with `psql` while the plane kept
+serving:
+
+```text
+tenant phase28demo10498 (03db74d7-d1bf-417e-97f9-94d5b0bac675)
+  db: active | NULL
+  active (default)       -> HTTP 200  header=none       {"memories":[]}
+  db: suspended | NULL
+  suspended              -> HTTP 402  header=none       {"error":"payment_required","upgrade_url":"https://synapse.ai/pricing"}
+  db: grace_period | 2026-09-21 10:00:00.514293+00
+  grace_period (2d ago)  -> HTTP 200  header=5days      {"memories":[]}
+  grace_period (fresh)   -> HTTP 200  header=7days      {"memories":[]}
+  health (suspended tok) -> HTTP 200  {"status":"ok","version":"2.0.0","db":"connected"}
+  stripe webhook         -> HTTP 503  {"error":"billing_unavailable"}
+```
+
+Six things that transcript shows and a unit test cannot: a freshly booted plane reads the column it was
+written to read; the 402 body is byte-for-byte the published shape; suspension really is immediate, on the next
+request rather than on a restart; the header counts a real interval down (a stamp two days old reads `5days`;
+the two-day case is 5 and not 6, so the arithmetic floors rather than rounds); a suspended tenant's `/health`
+still answers, because an orchestrator must not read a suspension as an outage; and the webhook's own route is
+not behind the gate (`503 billing_unavailable` is this plane having no
+`STRIPE_WEBHOOK_SECRET`, which is the point — anything but 402). The plane's startup line for the same boot
+reported `database_dsn=set jwt_secret=set admin_token=set master_key=set stripe_webhook_secret=unset` and
+nothing else, which is the redaction doing its job on the one line that prints the whole config.
+
+### Findings
+
+1. **The gate is enforced, but nothing in production can trip it yet.** Phase 27's finding 4 still stands: no
+   code writes `stripe_customer_id`, so no real Stripe delivery matches a tenant and no real tenant is ever
+   suspended. This phase closed the enforcement half of that gap — the half a customer would experience — and
+   the linking half (checkout, or a provisioning field) is what makes the whole path reachable. It is the
+   smallest next thing and the only one that changes behaviour for a real account rather than for a test.
+2. **The middleware cannot log, by construction.** Its signature is `pool` and nothing else, so the plane's
+   structured logger never reaches it: a status read that fails is a silent 500 server-side while the client
+   sees `{"error":"internal"}`, where every handler in this package logs its own failures. Threading the logger
+   through would cost the one-argument shape the brief specified, so it was left alone — but an operator with a
+   500-only symptom has nothing to grep for, which is a real operational gap rather than a style note.
+3. **Suspension is per tenant, not per credential.** There is no way to disable one leaked agent key without
+   disabling the whole tenant: `status` lives on the tenant row, and the JWT's `agent_id` never reaches the
+   gate. A key-revocation path is a different mechanism (a `revoked_at` on the key, or a jti denylist) and
+   nothing in this phase precludes it, but "suspend" today has one granularity and it is the billing one.
+4. **Only the control plane is gated; the MCP server is not.** Phases 22-25 put `synapse_compile`,
+   `synapse_search_memories`, and `synapse_write_memory` in the edge binary, working against a local
+   sqlite-vec store, and nothing in that path asks the plane for a status. A suspended tenant's edge node
+   therefore keeps compiling and searching locally, and its writes queue for the next successful sync. That is
+   defensible — an edge is supposed to survive the network, and the plane refuses the sync that would persist
+   anything — but it should be a decision on the record: suspension today means "the control plane refuses",
+   not "the product stops working".
+5. **The status is read on every request, uncached, with a two-second bound.** Correctness first: the read is
+   one indexed primary-key lookup, so the cost is a round trip rather than a scan, and "suspended" takes effect
+   on the next request instead of on the next restart. A cache is where a revocation delay would first appear,
+   which is why there is not one yet — worth naming because per-request status reads are exactly the kind of
+   thing that gets cached later for the wrong reason.
+6. **The grace window is split across two packages.** `internal/billing` writes `grace_period_started_at`;
+   `internal/plane` decides that the stamp buys seven days. Both halves are honest — one stamps the fact, the
+   other owns the policy — but nothing but a comment connects them, and the test pins `7days` against this
+   package's own constant, so a change of intent in either file would be a release-time discovery. A
+   `grace-period-days` config key is the follow-up, and it is small.
+7. **The 402's `upgrade_url` is a constant baked into a release.** The pricing page moving, or a per-plan
+   checkout URL appearing, means a new binary. That is acceptable while billing is half-wired (finding 1) and
+   user-facing the moment it is not: the body is the one response in this package a human reads.
+8. **The tests provision tenants and never delete them**, which is internal/billing's convention too. Each run
+   adds six or seven rows to `synapse_global.tenants` and a schema each; harmless for correctness — every test
+   is scoped to its own slug — and eventually noisy for a database shared with a development plane. The
+   registry is, in effect, accumulating a log of every test run since Phase 4.
+
+### Next phase
+
+The customer-id link is first, because it is what turns this phase's enforcement from a tested property into
+one a real account can experience (finding 1) — and Phase 27's finding 4 named it too, so two phases now point
+at the same gap. After it, in rough order of value: a status-to-policy mapping rather than the `if status ==
+suspended` this phase ships, so a fourth status (a paused plan, a read-only state) is a table entry rather than
+a code change; per-key revocation, which is the granularity suspension cannot express (finding 3); a decision
+about whether an edge node should learn its tenant's status and what it should do about it (finding 4); and the
+grace window as configuration (finding 6). Nothing in this phase blocks any of them, and the route group means
+a new tenant surface inherits the gate without being asked.
+
+
+
+

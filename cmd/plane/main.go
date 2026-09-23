@@ -184,6 +184,7 @@ func main() {
 		tenant.JWTMiddleware(cfg),
 		logger,
 		billingWebhook,
+		pool,
 	)
 
 	server := &http.Server{

@@ -49,18 +49,22 @@ const (
 	updateTimeout = 5 * time.Second
 )
 
-// Tenant status values, as stored in synapse_global.tenants.status. Exported
-// because they are the vocabulary a later phase reads: this package is where the
-// values are written, and whoever enforces them should not be spelling those
-// strings a second time.
+// Tenant status values, as stored in synapse_global.tenants.status.
+//
+// The strings themselves live in internal/plane, which is where they are enforced
+// (Phase 28's RequireActiveStatus) and which cannot import this package: this one
+// reads internal/tenant, internal/tenant imports internal/plane, so the cycle
+// runs the other way. These names are aliases so the package that writes a status
+// and the package that acts on it cannot drift apart over a spelling, and they
+// stay exported so Phase 27's own callers and tests are unchanged.
 const (
 	// StatusActive is a tenant in good standing: nothing to enforce.
-	StatusActive = "active"
+	StatusActive = plane.TenantStatusActive
 	// StatusGracePeriod is a tenant whose payment failed but whose access has not
 	// been cut off yet.
-	StatusGracePeriod = "grace_period"
+	StatusGracePeriod = plane.TenantStatusGracePeriod
 	// StatusSuspended is a tenant whose subscription was deleted.
-	StatusSuspended = "suspended"
+	StatusSuspended = plane.TenantStatusSuspended
 )
 
 // The three statements this package runs, one per event type. Each is keyed by

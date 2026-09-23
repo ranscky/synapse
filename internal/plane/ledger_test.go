@@ -64,7 +64,7 @@ func newLedgerRouter(t *testing.T, cfg *plane.PlaneConfig, verifier plane.Ledger
 	var logs bytes.Buffer
 	logger := charmlog.NewWithOptions(&logs, charmlog.Options{Level: charmlog.DebugLevel, ReportTimestamp: false})
 
-	return plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, verifier, nil, tenant.JWTMiddleware(cfg), logger, nil).Routes(), &logs
+	return plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, verifier, nil, tenant.JWTMiddleware(cfg), logger, nil, nil).Routes(), &logs
 }
 
 // getLedgerVerify sends GET /v2/ledger/verify with the given Authorization
@@ -228,7 +228,7 @@ func TestVerifyLedgerRefusesAnUnverifiedRequest(t *testing.T) {
 	cfg := newConfig(adminToken)
 	verifier := &fakeLedgerVerifier{}
 
-	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, verifier, nil, nil, logger, nil).Routes()
+	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, verifier, nil, nil, logger, nil, nil).Routes()
 
 	rec := getLedgerVerify(router, "Bearer "+tenantToken(t, cfg))
 

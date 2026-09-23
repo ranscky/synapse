@@ -41,7 +41,7 @@ func TestBillingWebhookRouteIsOpenAndDelegates(t *testing.T) {
 		_, _ = w.Write([]byte(`{"received":true}`))
 	}
 
-	router := plane.NewServer(newConfig(""), fakeDB{}, &fakeProvisioner{}, nil, nil, nil, nil, nil, nil, handler).Routes()
+	router := plane.NewServer(newConfig(""), fakeDB{}, &fakeProvisioner{}, nil, nil, nil, nil, nil, nil, handler, nil).Routes()
 
 	// No Authorization and no x-api-key: Stripe sends neither, and a middleware that
 	// demanded one would 401 every real delivery.
@@ -58,7 +58,7 @@ func TestBillingWebhookRouteIsOpenAndDelegates(t *testing.T) {
 // for billing: the route exists and answers 503, rather than disappearing into a 404
 // that would tell Stripe the endpoint is gone.
 func TestBillingWebhookRouteRefusesWithNoHandler(t *testing.T) {
-	router := plane.NewServer(newConfig(""), fakeDB{}, &fakeProvisioner{}, nil, nil, nil, nil, nil, nil, nil).Routes()
+	router := plane.NewServer(newConfig(""), fakeDB{}, &fakeProvisioner{}, nil, nil, nil, nil, nil, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, billingWebhookPath, strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()

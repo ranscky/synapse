@@ -75,7 +75,7 @@ func newComplianceReportRouter(t *testing.T, cfg *plane.PlaneConfig, auditor pla
 	var logs bytes.Buffer
 	logger := charmlog.NewWithOptions(&logs, charmlog.Options{Level: charmlog.DebugLevel, ReportTimestamp: false})
 
-	return plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, verifier, auditor, tenant.JWTMiddleware(cfg), logger, nil).Routes(), &logs
+	return plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, verifier, auditor, tenant.JWTMiddleware(cfg), logger, nil, nil).Routes(), &logs
 }
 
 // getComplianceReport sends GET /v2/compliance/report with the given Authorization

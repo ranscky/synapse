@@ -10,6 +10,7 @@ import (
 
 	charmlog "github.com/charmbracelet/log"
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Version is reported by GET /health and in the control plane's startup log
@@ -57,6 +58,14 @@ type Server struct {
 	// package, so importing it here would be a cycle -- and a nil value makes
 	// the route refuse every delivery rather than disappear.
 	billingWebhook http.HandlerFunc
+	// statusPool is Phase 28's handle on the billing-status gate: the pool the
+	// middleware in status.go reads synapse_global.tenants through. It is a
+	// separate field from db rather than the same one because db is only a
+	// health probe (Ping and nothing else), while the gate needs QueryRow;
+	// cmd/plane passes the same pool for both. A nil value installs no gate --
+	// see RequireActiveStatus -- which is a test-only wiring, since cmd/plane
+	// refuses to boot without a database.
+	statusPool *pgxpool.Pool
 }
 
 // NewServer returns a Server serving the control plane routes. db, tenants,
@@ -96,6 +105,12 @@ type Server struct {
 // both in hand -- and passes it in, which is what keeps the route in this
 // package's route table without the cycle. A nil value makes
 // POST /v2/billing/webhook answer 503 rather than not exist.
+//
+// statusPool is the sixth injected capability, added by Phase 28: the pool its
+// billing-status gate reads a tenant's status through. Nil installs no gate (see
+// RequireActiveStatus), which is the wiring the plane's own unit tests use; it is
+// a separate parameter from db rather than the same value because db is a health
+// probe and the gate needs a concrete pool cmd/plane already holds.
 func NewServer(
 	cfg *PlaneConfig,
 	db Database,
@@ -107,6 +122,7 @@ func NewServer(
 	auth func(http.Handler) http.Handler,
 	logger *charmlog.Logger,
 	billingWebhook http.HandlerFunc,
+	statusPool *pgxpool.Pool,
 ) *Server {
 	return &Server{
 		cfg:            cfg,
@@ -119,6 +135,7 @@ func NewServer(
 		auth:           auth,
 		logger:         logger,
 		billingWebhook: billingWebhook,
+		statusPool:     statusPool,
 	}
 }
 
@@ -149,17 +166,38 @@ func NewServer(
 // is registered beside it as a deprecated alias: a client written against the
 // old path keeps working, and it is gated identically, because the gate lives in
 // the handler rather than on a route.
+//
+// Every route registered in the group below is also behind RequireActiveStatus
+// (Phase 28): a suspended tenant is refused with 402 before the handler runs, and
+// a tenant in its grace period is served with a warning header. The three routes
+// registered outside the group are the ones a billing status has no bearing on,
+// and the group is what keeps that list from having to be restated per route.
 func (s *Server) Routes() http.Handler {
 	router := chi.NewRouter()
 	router.Get("/health", s.handleHealth)
 	router.With(s.requireAdmin).Post("/v2/tenants", s.handleCreateTenant)
-	router.With(s.requireJWT).Post(syncRoute, s.handleSyncMemories)
-	router.With(s.requireJWT).Get(searchRoute, s.handleSearchMemories)
-	router.With(s.requireJWT).Get(complianceAuditRoute, s.handleComplianceAudit)
-	router.With(s.requireJWT).Get(complianceChainIntegrityRoute, s.handleVerifyLedger)
-	router.With(s.requireJWT).Get(complianceReportRoute, s.handleComplianceReport)
-	router.With(s.requireJWT).Get(ledgerVerifyRoute, s.handleVerifyLedger)
 	router.Post(billingWebhookRoute, s.handleBillingWebhook)
+
+	// Phase 28: every tenant-token surface is gated on the tenant's billing
+	// status too. The gate sits inside requireJWT because it reads the verified
+	// tenant id, and it is applied to this group rather than beside each route so
+	// that a tenant endpoint added here cannot be added without it. The routes
+	// above are outside the group deliberately: /v2/tenants is the admin
+	// provisioning surface, whose caller is an operator rather than a tenant with
+	// a status; /v2/billing/webhook is Stripe's own entry point, which carries no
+	// tenant token for the gate to read and whose authentication is the
+	// Stripe-Signature header inside its handler; and /health is not a /v2 route
+	// at all -- it reports the database, not a tenant.
+	router.Group(func(r chi.Router) {
+		r.Use(s.requireJWT, RequireActiveStatus(s.statusPool))
+
+		r.Post(syncRoute, s.handleSyncMemories)
+		r.Get(searchRoute, s.handleSearchMemories)
+		r.Get(complianceAuditRoute, s.handleComplianceAudit)
+		r.Get(complianceChainIntegrityRoute, s.handleVerifyLedger)
+		r.Get(complianceReportRoute, s.handleComplianceReport)
+		r.Get(ledgerVerifyRoute, s.handleVerifyLedger)
+	})
 
 	return router
 }
