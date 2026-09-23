@@ -1,6 +1,7 @@
 package plane
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,18 +18,19 @@ database-dsn: "postgres://from-file/db"
 jwt-secret: "0123456789abcdef0123456789abcdef"
 admin-token: "admin-from-file"
 master-key: "master-from-file"
+stripe-webhook-secret: "whsec-from-file"
 log-level: "debug"
 ledger-retention-days: 30
 `
 
-// clearSecretEnv unsets the four secret environment variables for the duration
-// of a test and restores whatever was there afterwards, so a developer's
-// exported values cannot change the outcome. t.Setenv cannot unset a variable,
-// hence the manual save/restore.
+// clearSecretEnv unsets the secret environment variables for the duration of a
+// test and restores whatever was there afterwards, so a developer's exported
+// values cannot change the outcome. t.Setenv cannot unset a variable, hence the
+// manual save/restore.
 func clearSecretEnv(t *testing.T) {
 	t.Helper()
 
-	for _, name := range []string{EnvDatabaseDSN, EnvJWTSecret, EnvAdminToken, EnvMasterKey} {
+	for _, name := range []string{EnvDatabaseDSN, EnvJWTSecret, EnvAdminToken, EnvMasterKey, EnvStripeWebhookSecret} {
 		old, had := os.LookupEnv(name)
 		require.NoError(t, os.Unsetenv(name))
 		t.Cleanup(func() {
@@ -105,8 +107,48 @@ func TestLoadConfigFromFile(t *testing.T) {
 	assert.Equal(t, "0123456789abcdef0123456789abcdef", cfg.JWTSecret)
 	assert.Equal(t, "admin-from-file", cfg.AdminToken)
 	assert.Equal(t, "master-from-file", cfg.MasterKey)
+	assert.Equal(t, "whsec-from-file", cfg.StripeWebhookSecret)
 	assert.Equal(t, "debug", cfg.LogLevel)
 	assert.Equal(t, 30, cfg.LedgerRetentionDays)
+	assert.NoError(t, cfg.Validate())
+}
+
+// TestLoadConfigReadsTheStripeWebhookSecretFromTheEnvironment pins the one
+// environment variable that is not SYNAPSE_-prefixed -- it is Stripe's own name,
+// the one every deployment, dashboard instruction, and secret store already uses
+// -- and the precedence every other secret has: the environment wins over the file.
+// Both halves matter, because a secret read from the wrong variable looks exactly
+// like a secret nobody set.
+func TestLoadConfigReadsTheStripeWebhookSecretFromTheEnvironment(t *testing.T) {
+	clearSecretEnv(t)
+
+	require.Equal(t, "STRIPE_WEBHOOK_SECRET", EnvStripeWebhookSecret)
+
+	// Set after writing the file: LoadConfig reads the environment itself.
+	path := writeConfig(t, sampleConfig)
+	t.Setenv(EnvStripeWebhookSecret, "whsec-test-from-the-environment")
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, "whsec-test-from-the-environment", cfg.StripeWebhookSecret)
+
+	// And the value still never reaches a log line.
+	rendered := fmt.Sprint(cfg.RedactedFields()...)
+	assert.NotContains(t, rendered, cfg.StripeWebhookSecret)
+	assert.NotContains(t, rendered, "whsec")
+}
+
+// TestValidateDoesNotRequireTheStripeWebhookSecret is the documented fail-closed
+// choice rather than a fail-at-boot one: a plane without a signing secret boots and
+// answers every delivery with a retryable refusal, which is AdminToken's precedent.
+// Making it fatal would refuse to start every existing deployment on an upgrade.
+func TestValidateDoesNotRequireTheStripeWebhookSecret(t *testing.T) {
+	clearSecretEnv(t)
+
+	cfg := validConfig()
+	require.Empty(t, cfg.StripeWebhookSecret)
+
 	assert.NoError(t, cfg.Validate())
 }
 

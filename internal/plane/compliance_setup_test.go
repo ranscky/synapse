@@ -179,7 +179,7 @@ func complianceRouter(t *testing.T, cfg *plane.PlaneConfig, pool *pgxpool.Pool, 
 	var logs bytes.Buffer
 	logger := charmlog.NewWithOptions(&logs, charmlog.Options{Level: charmlog.DebugLevel, ReportTimestamp: false})
 
-	return plane.NewServer(cfg, pool, provisioner, nil, nil, nil, ledger.NewAuditor(pool), tenant.JWTMiddleware(cfg), logger).Routes(), &logs
+	return plane.NewServer(cfg, pool, provisioner, nil, nil, nil, ledger.NewAuditor(pool), tenant.JWTMiddleware(cfg), logger, nil).Routes(), &logs
 }
 
 // complianceRequest sends GET /v2/compliance/audit with the given token and raw

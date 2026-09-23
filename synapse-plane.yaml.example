@@ -5,9 +5,9 @@
 # value it wins over whatever is written below, which is how a real deployment
 # injects secrets without storing them on disk.
 #
-# The plane never logs the value of database-dsn, jwt-secret, admin-token, or
-# master-key. Startup logs report them as "set" or "unset" only, and validation
-# errors name the offending key without echoing it.
+# The plane never logs the value of database-dsn, jwt-secret, admin-token,
+# master-key, or stripe-webhook-secret. Startup logs report them as "set" or
+# "unset" only, and validation errors name the offending key without echoing it.
 
 # Bind address for the control plane HTTP server. No environment override.
 # Must stay loopback (127.0.0.1, localhost, or ::1): the plane refuses to
@@ -68,3 +68,20 @@ ledger-retention-days: 365
 # resolved from PATH at request time; with none installed, ?format=pdf answers
 # 503 with the fix in its body. No environment override.
 report-template: "ui/plane/compliance-report.html"
+
+# Signing secret of the Stripe webhook endpoint POST /v2/billing/webhook is
+# registered as. Overridden by STRIPE_WEBHOOK_SECRET -- note the variable name:
+# this is the one key whose environment variable is NOT SYNAPSE_-prefixed, because
+# it is the name Stripe's own dashboard hands out.
+#
+# It is the whole authentication for that route. Stripe cannot hold a Synapse
+# token, so no middleware guards the path; the Stripe-Signature header, checked
+# against this value, is what proves a delivery is real. Requests that fail the
+# check are answered 400 and reach no database.
+#
+# Leaving it blank is not fatal, and it is not silent either: startup reports the
+# key as "unset", and every delivery is then answered 503 without being processed
+# -- 503 rather than 400 because Stripe retries a non-2xx for about three days,
+# which is the window to configure the secret before the events are dropped.
+# Secret: never logged, never echoed in an error, never included in a rejection.
+stripe-webhook-secret: ""

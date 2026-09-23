@@ -68,7 +68,7 @@ func TestComplianceReportRequiresAVerifiedTenant(t *testing.T) {
 	verifier := &fakeVerifier{}
 
 	// No auth middleware: a verified tenant can never appear.
-	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, verifier, auditor, nil, nil).Routes()
+	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, verifier, auditor, nil, nil, nil).Routes()
 
 	rec := getComplianceReport(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"), "")
 

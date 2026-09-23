@@ -6,7 +6,7 @@
 #
 # Networking: internal/plane refuses to boot on anything but a loopback
 # listen-addr (PlaneConfig.Validate), and there is no environment override for
-# listen-addr -- only the four secret keys are overridable. A published Docker
+# listen-addr -- only the secret keys are overridable. A published Docker
 # port is DNAT'ed to the container's eth0 address, never to the container's own
 # 127.0.0.1, so a bridge-networked plane bound to 127.0.0.1:9090 is unreachable
 # from the host no matter what "ports:" says. The plane therefore runs with
@@ -67,6 +67,12 @@ services:
       # any other shape (tenant.masterKeyFromEnv) and provisioning fails with it,
       # so a "change-me-..." placeholder here would half-provision every tenant.
       SYNAPSE_MASTER_KEY: 1f8b0a4c2d9e73511f8b0a4c2d9e73511f8b0a4c2d9e73511f8b0a4c2d9e7351
+      # Phase 27: the Stripe webhook's signing secret, passed through with Stripe's
+      # own variable name (no SYNAPSE_ prefix). Blank is supported and documented:
+      # the plane boots, POST /v2/billing/webhook answers 503, and Stripe retries
+      # for about three days. Replace it with the value the Stripe dashboard shows
+      # for the endpoint pointing at https://<host>:9090/v2/billing/webhook.
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
 
 volumes:
   synapse_pg_data:

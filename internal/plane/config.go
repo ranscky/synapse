@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -49,22 +48,27 @@ const (
 	MinJWTSecretLen = 32
 )
 
-// Environment variables that override the four secret YAML keys. A non-empty
+// Environment variables that override the secret YAML keys. A non-empty
 // variable always wins over the file value, which is what lets production
 // inject secrets from the environment while a local dev YAML still works
 // when nothing is exported.
+//
+// All but one are SYNAPSE_-prefixed. EnvStripeWebhookSecret keeps Stripe's own
+// variable name instead, because that is the name every Stripe deployment, every
+// dashboard instruction, and every CI secret store already uses.
 const (
-	EnvDatabaseDSN = "SYNAPSE_DB_DSN"
-	EnvJWTSecret   = "SYNAPSE_JWT_SECRET"
-	EnvAdminToken  = "SYNAPSE_ADMIN_TOKEN"
-	EnvMasterKey   = "SYNAPSE_MASTER_KEY"
+	EnvDatabaseDSN         = "SYNAPSE_DB_DSN"
+	EnvJWTSecret           = "SYNAPSE_JWT_SECRET"
+	EnvAdminToken          = "SYNAPSE_ADMIN_TOKEN"
+	EnvMasterKey           = "SYNAPSE_MASTER_KEY"
+	EnvStripeWebhookSecret = "STRIPE_WEBHOOK_SECRET"
 )
 
 // PlaneConfig is the control plane's complete runtime configuration.
 //
-// The secret fields -- DatabaseDSN, JWTSecret, AdminToken, MasterKey -- must
-// never be logged. Use RedactedFields for any log line that reports config
-// state: it emits "set"/"unset" instead of the value.
+// The secret fields -- DatabaseDSN, JWTSecret, AdminToken, MasterKey,
+// StripeWebhookSecret -- must never be logged. Use RedactedFields for any log
+// line that reports config state: it emits "set"/"unset" instead of the value.
 type PlaneConfig struct {
 	// ListenAddr is the plane's HTTP bind address; loopback only.
 	ListenAddr string `yaml:"listen-addr"`
@@ -84,6 +88,18 @@ type PlaneConfig struct {
 	// its PDF from. Blank means DefaultReportTemplatePath. Not a secret, so it
 	// is reported verbatim.
 	ReportTemplatePath string `yaml:"report-template"`
+	// StripeWebhookSecret is the signing secret POST /v2/billing/webhook
+	// validates the Stripe-Signature header against, and the only credential
+	// that route has: no token guards it, because Stripe calls it directly.
+	// Secret: never logged -- not in config lines, not in errors, and not in
+	// the webhook's own rejections. Read from the environment as
+	// STRIPE_WEBHOOK_SECRET (EnvStripeWebhookSecret), which wins over this key.
+	//
+	// Empty is deliberately not fatal. A plane without it still boots and
+	// answers the webhook route fail-closed, which is AdminToken's precedent:
+	// the missing credential fails at the route that needs it rather than
+	// taking the whole control plane down at startup.
+	StripeWebhookSecret string `yaml:"stripe-webhook-secret"`
 }
 
 // DefaultConfig returns the configuration the plane boots with when no YAML
@@ -99,6 +115,7 @@ func DefaultConfig() *PlaneConfig {
 		LogLevel:            DefaultLogLevel,
 		LedgerRetentionDays: DefaultLedgerRetentionDays,
 		ReportTemplatePath:  DefaultReportTemplatePath,
+		StripeWebhookSecret: os.Getenv(EnvStripeWebhookSecret),
 	}
 }
 
@@ -168,6 +185,9 @@ func applyEnvOverrides(cfg *PlaneConfig) {
 	}
 	if v := os.Getenv(EnvMasterKey); v != "" {
 		cfg.MasterKey = v
+	}
+	if v := os.Getenv(EnvStripeWebhookSecret); v != "" {
+		cfg.StripeWebhookSecret = v
 	}
 }
 
@@ -244,53 +264,5 @@ func isLoopbackAddr(addr string) bool {
 	return strings.HasPrefix(host, "127.")
 }
 
-// RedactedFields returns charmbracelet/log key-value pairs describing the
-// loaded configuration. Secret fields are reported as "set" or "unset" and
-// their values are never included, which makes this the only safe way to log
-// config state.
-func (c *PlaneConfig) RedactedFields() []any {
-	return []any{
-		"listen_addr", c.ListenAddr,
-		"database_dsn", secretState(c.DatabaseDSN),
-		"jwt_secret", secretState(c.JWTSecret),
-		"admin_token", secretState(c.AdminToken),
-		"master_key", secretState(c.MasterKey),
-		"log_level", c.LogLevel,
-		"ledger_retention_days", c.LedgerRetentionDays,
-		"report_template", c.ReportTemplatePath,
-	}
-}
-
-// secretState reports whether a secret is configured without revealing it.
-func secretState(secret string) string {
-	if secret == "" {
-		return "unset"
-	}
-	return "set"
-}
-
-// UnsafePermissions returns the octal permissions of the config file at path
-// when it is readable by group or other, or "" when the permissions are
-// acceptable or the file cannot be stat'd. Callers log the returned value --
-// this package owns no logger, so the decision stays with the caller.
-//
-// Windows is exempt: os.FileMode permissions there are synthesized (0666 or
-// 0444 from the read-only attribute), so the check would report every Windows
-// config file as unsafe and `chmod 600` is not the fix on that platform.
-func UnsafePermissions(path string) string {
-	if runtime.GOOS == "windows" {
-		return ""
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return ""
-	}
-
-	perm := info.Mode().Perm()
-	if perm&0o044 == 0 {
-		return ""
-	}
-
-	return fmt.Sprintf("%04o", perm)
-}
+// RedactedFields, secretState, and UnsafePermissions live in config_redact.go,
+// with the reasoning for the split.

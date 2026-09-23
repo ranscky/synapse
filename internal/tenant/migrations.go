@@ -99,6 +99,36 @@ var migrations = []migration{
 )`,
 	},
 	{
+		// Phase 27: the three columns the billing webhook drives. status and
+		// stripe_customer_id are already in the CREATE TABLE above -- they were
+		// declared before anything wrote them -- so on a fresh database only
+		// grace_period_started_at is new. All three are restated here anyway, so
+		// a database created by an older release converges on the same shape and
+		// so this statement and that CREATE TABLE cannot drift apart.
+		//
+		// The per-column IF NOT EXISTS is what makes it re-runnable: PostgreSQL
+		// has no ALTER TABLE ... IF NOT EXISTS, so ADD COLUMN IF NOT EXISTS is
+		// the only idempotent spelling. Adding NOT NULL with a DEFAULT to a
+		// populated table is safe on PostgreSQL 11 and later, which stores the
+		// default in the catalog instead of rewriting every row.
+		name: "tenants_billing_columns",
+		sql: `ALTER TABLE ` + SchemaName + `.tenants
+	ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active',
+	ADD COLUMN IF NOT EXISTS grace_period_started_at timestamptz,
+	ADD COLUMN IF NOT EXISTS stripe_customer_id text`,
+	},
+	{
+		// The billing webhook's lookup key, and the invariant behind it: one
+		// Stripe customer belongs to exactly one tenant, so the UPDATE that
+		// drives a tenant's status can never flip two rows. Unique rather than
+		// plain because the webhook's WHERE clause assumes that, and it cannot
+		// fail on data that predates the phase: nothing has ever written this
+		// column, every existing row is NULL, and PostgreSQL treats NULLs as
+		// distinct in a unique index.
+		name: "tenants_stripe_customer_idx",
+		sql:  `CREATE UNIQUE INDEX IF NOT EXISTS tenants_stripe_customer_idx ON ` + SchemaName + `.tenants (stripe_customer_id)`,
+	},
+	{
 		// The index the metering write path's readers need: usage_events is
 		// queried by (tenant_id, created_at) window and by nothing else (see
 		// internal/ledger/report.go's totals query). It is added in the phase

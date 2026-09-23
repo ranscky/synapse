@@ -35,6 +35,7 @@ func TestRedactedFieldsHidesSecretValues(t *testing.T) {
 	cfg.JWTSecret = "jwt-value-that-must-not-be-logged"
 	cfg.AdminToken = "admin-value-that-must-not-be-logged"
 	cfg.MasterKey = "master-value-that-must-not-be-logged"
+	cfg.StripeWebhookSecret = "whsec-value-that-must-not-be-logged"
 
 	fields := redactedMap(t, cfg)
 
@@ -43,6 +44,7 @@ func TestRedactedFieldsHidesSecretValues(t *testing.T) {
 	assert.Equal(t, "set", fields["jwt_secret"])
 	assert.Equal(t, "set", fields["admin_token"])
 	assert.Equal(t, "set", fields["master_key"])
+	assert.Equal(t, "set", fields["stripe_webhook_secret"])
 
 	// ...while non-secret keys keep their real values.
 	assert.Equal(t, cfg.ListenAddr, fields["listen_addr"])
@@ -55,6 +57,8 @@ func TestRedactedFieldsHidesSecretValues(t *testing.T) {
 	assert.NotContains(t, rendered, cfg.JWTSecret)
 	assert.NotContains(t, rendered, cfg.AdminToken)
 	assert.NotContains(t, rendered, cfg.MasterKey)
+	assert.NotContains(t, rendered, cfg.StripeWebhookSecret)
+	assert.NotContains(t, rendered, "whsec")
 	assert.NotContains(t, rendered, "dbpass")
 }
 
@@ -67,6 +71,7 @@ func TestRedactedFieldsReportsUnsetSecrets(t *testing.T) {
 	assert.Equal(t, "unset", fields["jwt_secret"])
 	assert.Equal(t, "unset", fields["admin_token"])
 	assert.Equal(t, "unset", fields["master_key"])
+	assert.Equal(t, "unset", fields["stripe_webhook_secret"])
 }
 
 func TestUnsafePermissions(t *testing.T) {

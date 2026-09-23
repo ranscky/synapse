@@ -12,6 +12,7 @@ require (
 	github.com/pgvector/pgvector-go v0.2.3
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/stretchr/testify v1.11.1
+	github.com/stripe/stripe-go/v76 v76.25.0
 	golang.org/x/crypto v0.31.0
 	gopkg.in/yaml.v3 v3.0.1
 )

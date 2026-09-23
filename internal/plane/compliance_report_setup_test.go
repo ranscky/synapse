@@ -180,7 +180,7 @@ func newReportRouter(t *testing.T, cfg *plane.PlaneConfig, pool *pgxpool.Pool, p
 	logger := charmlog.NewWithOptions(&logs, charmlog.Options{Level: charmlog.DebugLevel, ReportTimestamp: false})
 
 	return plane.NewServer(cfg, pool, provisioner, nil, nil, reportChainVerifier{pool: pool},
-		ledger.NewAuditor(pool), tenant.JWTMiddleware(cfg), logger).Routes(), &logs
+		ledger.NewAuditor(pool), tenant.JWTMiddleware(cfg), logger, nil).Routes(), &logs
 }
 
 // reportRequest sends GET /v2/compliance/report with the given token and raw query, from

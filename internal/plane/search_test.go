@@ -55,7 +55,7 @@ func newSearchRouter(t *testing.T, cfg *plane.PlaneConfig, searcher plane.Memory
 	var logs bytes.Buffer
 	logger := charmlog.NewWithOptions(&logs, charmlog.Options{Level: charmlog.DebugLevel, ReportTimestamp: false})
 
-	return plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, searcher, nil, nil, tenant.JWTMiddleware(cfg), logger).Routes(), &logs
+	return plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, searcher, nil, nil, tenant.JWTMiddleware(cfg), logger, nil).Routes(), &logs
 }
 
 // searchPayload marshals a search body the way the edge node sends it. It is
@@ -146,7 +146,7 @@ func TestSearchMemoriesFailsClosedWithoutATokenMiddleware(t *testing.T) {
 	searcher := &fakeSearcher{}
 
 	cfg := newConfig(adminToken)
-	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, searcher, nil, nil, nil, logger).Routes()
+	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, searcher, nil, nil, nil, logger, nil).Routes()
 
 	rec := getSearch(router, "Bearer "+tenantToken(t, cfg), searchPayload(t, "session-1", "edge-agent-1", vector(1, 1), 20))
 

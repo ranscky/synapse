@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"synapse/internal/billing"
 	"synapse/internal/conflict"
 	"synapse/internal/ledger"
 	"synapse/internal/plane"
@@ -162,6 +163,16 @@ func main() {
 	// replaced by a fake in that endpoint's integration test.
 	complianceAuditor := ledger.NewAuditor(pool)
 
+	// Phase 27: the billing webhook's dependency. POST /v2/billing/webhook is
+	// Stripe's own entry point and carries no token -- the Stripe-Signature
+	// header is its authentication -- so what is wired here is the handler
+	// itself rather than a middleware. It is built here because this is the only
+	// place that can see both internal/billing and the pool the plane already
+	// opened, and because internal/billing reads the schema name from
+	// internal/tenant, which imports internal/plane: the reverse import would be
+	// a cycle, exactly as it would be for the ledger verifier above.
+	billingWebhook := billing.WebhookHandler(cfg, pool)
+
 	srv := plane.NewServer(
 		cfg,
 		pool,
@@ -172,6 +183,7 @@ func main() {
 		complianceAuditor,
 		tenant.JWTMiddleware(cfg),
 		logger,
+		billingWebhook,
 	)
 
 	server := &http.Server{

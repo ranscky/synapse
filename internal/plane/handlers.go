@@ -51,6 +51,12 @@ type Server struct {
 	auditor  ComplianceAuditor
 	auth     func(http.Handler) http.Handler
 	logger   *charmlog.Logger
+	// billingWebhook is POST /v2/billing/webhook's handler, built by cmd/plane
+	// from internal/billing. It is injected for the same reason auth is -- that
+	// package reads the schema name from internal/tenant, which imports this
+	// package, so importing it here would be a cycle -- and a nil value makes
+	// the route refuse every delivery rather than disappear.
+	billingWebhook http.HandlerFunc
 }
 
 // NewServer returns a Server serving the control plane routes. db, tenants,
@@ -80,6 +86,16 @@ type Server struct {
 // outright rather than answering from a dependency it does not have.
 //
 // logger may be nil, in which case this package logs nothing.
+//
+// billingWebhook is the fifth injected capability, and it is injected for a
+// reason of a different shape from the other four: internal/billing reads the
+// schema name from internal/tenant, which imports this package for PlaneConfig,
+// so an import of internal/billing here would be a cycle -- the same cycle the
+// auth field above exists to break. cmd/plane builds it -- calling
+// billing.WebhookHandler(cfg, pool), the one place the config and the pool are
+// both in hand -- and passes it in, which is what keeps the route in this
+// package's route table without the cycle. A nil value makes
+// POST /v2/billing/webhook answer 503 rather than not exist.
 func NewServer(
 	cfg *PlaneConfig,
 	db Database,
@@ -90,17 +106,19 @@ func NewServer(
 	auditor ComplianceAuditor,
 	auth func(http.Handler) http.Handler,
 	logger *charmlog.Logger,
+	billingWebhook http.HandlerFunc,
 ) *Server {
 	return &Server{
-		cfg:      cfg,
-		db:       db,
-		tenants:  tenants,
-		memories: memories,
-		searcher: searcher,
-		ledger:   ledger,
-		auditor:  auditor,
-		auth:     auth,
-		logger:   logger,
+		cfg:            cfg,
+		db:             db,
+		tenants:        tenants,
+		memories:       memories,
+		searcher:       searcher,
+		ledger:         ledger,
+		auditor:        auditor,
+		auth:           auth,
+		logger:         logger,
+		billingWebhook: billingWebhook,
 	}
 }
 
@@ -109,6 +127,14 @@ func NewServer(
 // and the three tenant-token compliance surfaces -- GET /v2/compliance/audit,
 // GET /v2/compliance/chain-integrity, and GET /v2/compliance/report -- are
 // behind a tenant token.
+//
+// POST /v2/billing/webhook is the second open route, and it is open for a reason
+// the others' tokens cannot cover: Stripe delivers to it, Stripe is not a tenant,
+// and Stripe cannot hold a Synapse credential. Its authentication is inside the
+// handler -- the Stripe-Signature header, validated against the signing secret
+// only Stripe and the plane know -- so the route without a middleware is not an
+// unprotected route, it is one whose credential is not a token. Every other
+// surface here keeps its token: nothing about this route's openness widens them.
 //
 // The chain-integrity surface is tenant-scoped rather than admin-guarded on
 // purpose: the chain it verifies is the caller's own (the tenant id comes from
@@ -133,6 +159,7 @@ func (s *Server) Routes() http.Handler {
 	router.With(s.requireJWT).Get(complianceChainIntegrityRoute, s.handleVerifyLedger)
 	router.With(s.requireJWT).Get(complianceReportRoute, s.handleComplianceReport)
 	router.With(s.requireJWT).Get(ledgerVerifyRoute, s.handleVerifyLedger)
+	router.Post(billingWebhookRoute, s.handleBillingWebhook)
 
 	return router
 }

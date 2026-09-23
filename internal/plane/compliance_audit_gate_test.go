@@ -71,7 +71,7 @@ func TestComplianceAuditRequiresAVerifiedTenant(t *testing.T) {
 	cfg := newConfig(adminToken)
 	auditor := &fakeAuditor{}
 
-	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, nil, auditor, nil, logger).Routes()
+	router := plane.NewServer(cfg, fakeDB{}, &fakeProvisioner{}, nil, nil, nil, auditor, nil, logger, nil).Routes()
 
 	rec := getComplianceAudit(router, "Bearer "+enterpriseToken(t, cfg, "enterprise"), "")
 

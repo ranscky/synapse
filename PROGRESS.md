@@ -7121,3 +7121,300 @@ along; and the two fidelity gaps that now sit next to each other — the ledgere
 (finding 2 above) and a compile that cannot say why it retrieved nothing (finding 10) — are the pair a
 reporting phase would close first, because this phase made the numbers they feed real.
 
+## Phase 27 — Stripe webhook handler (complete)
+
+`POST /v2/billing/webhook` is live on the control plane, and it is the first route in this project whose
+authentication is not a token. Three Stripe events drive one column — `synapse_global.tenants.status` —
+between `active`, `grace_period`, and `suspended`: `invoice.payment_succeeded` clears the grace period and
+sets `active`, `invoice.payment_failed` sets `grace_period` with `grace_period_started_at = now()`, and
+`customer.subscription.deleted` sets `suspended`. The `Stripe-Signature` header is validated against the
+signing secret before anything else happens, and a delivery that fails it is answered
+`400 {"error":"invalid_signature"}` and reaches no SQL at all — which the tests assert structurally, with a
+recording double, rather than by observing that a row happened not to change.
+
+Commit `feat: Phase 27 - Stripe webhook handler`
+
+New files:
+
+- `internal/billing/stripe.go` — 295 lines: `WebhookHandler` (the brief's `cfg, pool` signature) over
+  `newHandler` (the same handler over the narrow `rowQuerier` interface), the three status statements,
+  `customerOf`, `readBody`, `applyStatus`, the `StatusActive` / `StatusGracePeriod` / `StatusSuspended`
+  vocabulary, and `MaxWebhookBodyBytes`.
+- `internal/billing/doc.go` — 38 lines: the package comment alone. It moved out of stripe.go when that file
+  crossed the 300-line ceiling, which is the arrangement `internal/ledger/doc.go` already makes.
+- `internal/billing/respond.go` — 53 lines: `{"received":true}`, `{"error":"reason"}`, and the two writers the
+  package shares.
+- `internal/billing/stripe_test.go` — 260 lines: the four tests the phase is defined by, plus the payload and
+  signing helpers they share. Every accepted case is signed through `webhook.GenerateTestSignedPayload` and
+  validated by the handler's real `ConstructEventWithOptions` call, so nothing about the signature is stubbed.
+- `internal/billing/stripe_db_test.go` — 127 lines: the pool, `tenant.RunMigrations`, the seeded tenant row,
+  and `billingStatus` — the read-back that is the assertion in every database-backed case.
+- `internal/billing/stripe_unit_test.go` — 269 lines: `recordingDB` / `stubRow` and the five tests that run
+  with no database at all, which is what keeps the security property's evidence present in CI.
+- `internal/plane/billing.go` — 44 lines: `billingWebhookRoute` and `handleBillingWebhook`, split out of
+  handlers.go the way sync.go and search.go are.
+- `internal/plane/billing_route_test.go` — 69 lines: the route answers with no `Authorization` header and
+  delegates, and a plane built without a handler answers 503 rather than 404.
+- `internal/plane/config_redact.go` — 70 lines: `RedactedFields`, `secretState`, and `UnsafePermissions`,
+  moved out of config.go when the new field would have pushed it past 300.
+
+Changed:
+
+- `internal/plane/config.go` — 296 → 268 lines: `StripeWebhookSecret` / `stripe-webhook-secret`,
+  `EnvStripeWebhookSecret` (`STRIPE_WEBHOOK_SECRET`, the one variable that is not `SYNAPSE_`-prefixed, because
+  it is Stripe's own name), the `applyEnvOverrides` line, and the comment that counted four secret keys.
+- `internal/plane/handlers.go` — 227 → 254 lines: the tenth `NewServer` parameter and its `Server` field, the
+  route line, and the `Routes` docs that now name two open routes instead of one.
+- `internal/tenant/migrations.go` — 218 → 248 lines: `tenants_billing_columns` (the brief's three
+  `ADD COLUMN IF NOT EXISTS`) and `tenants_stripe_customer_idx`.
+- `cmd/plane/main.go` — 251 → 263 lines: `billing.WebhookHandler(cfg, pool)` built beside the ledger verifier
+  and the compliance auditor, and passed into `NewServer`.
+- Thirteen test call sites in `internal/plane/*_test.go` — one trailing `nil` each — plus
+  `internal/plane/config_test.go` (+52 lines: the new key in `sampleConfig`, the env-precedence test, the
+  fail-closed-Validate test, and `EnvStripeWebhookSecret` added to `clearSecretEnv` so a developer's exported
+  variable cannot change an outcome) and `internal/plane/redact_test.go` (+5 lines).
+- `synapse-plane.yaml.example` — 64 → 87 lines: the new key documented with its variable name, its
+  fail-closed behaviour, and the fact that its value never reaches a log.
+- `deploy/docker-compose.yml` — the plane service passes `STRIPE_WEBHOOK_SECRET` through (blank allowed), and
+  the header's "only the four secret keys are overridable" became "only the secret keys".
+- `go.mod` / `go.sum` — `github.com/stripe/stripe-go/v76 v76.25.0`, direct after `go mod tidy`.
+- `bin/synapse` — **not** staged, and left dirty by the demo build, as in Phases 22-26.
+
+### The brief's `stripe.ConstructEvent()` does not exist in v76, and its replacement needed one option changed
+
+`stripe-go` moved webhook handling into its own package: v76 has no `webhook.go` at the module root, and the
+function is `webhook.ConstructEvent(payload []byte, header, secret string) (stripe.Event, error)`
+(`webhook/client.go:68`). Same HMAC-SHA256 over `"<unix-ts>.<body>"`, same 300-second tolerance, same error
+semantics — one package over. The route therefore imports `stripe-go/v76/webhook` as well as the root package,
+and the brief's intent (validation is mandatory, and it is the only auth) is exactly what shipped.
+
+What did change is an option the brief's verbatim call would have kept. Plain `ConstructEvent` validates more
+than the signature: it fails when `event.APIVersion != stripe.APIVersion` (`webhook/client.go:206`), and v76
+pins that constant at `2023-10-16`. A Stripe account whose webhook endpoint is pinned to any other version —
+which today is most of them, since v76 is from April 2024 — would have had **every legitimately signed
+delivery rejected with 400**, and no amount of correct configuration on the Synapse side would have fixed it.
+So the handler calls `ConstructEventWithOptions(..., ConstructEventOptions{IgnoreAPIVersionMismatch: true})`:
+the signature and the timestamp tolerance are still enforced in full, and only the schema-version assertion is
+relaxed, which is safe because the one field this package reads (`data.object.customer`) is stable across
+those versions. The tests document the choice by *omitting* `api_version` from every payload they sign.
+
+The other library decision: the customer id comes from `json.Unmarshal(event.Data.Raw, &struct{ Customer
+*stripe.Customer })`, not from `event.GetObjectValue("customer")`. `Data.Raw` is exactly `data.object`, and
+`stripe.Customer` has its own `UnmarshalJSON` that accepts both shapes Stripe can send — a bare id string on an
+unexpanded object, a whole object on an expanded one (`customer.go`, `ParseID`). The map-based accessor would
+have stringified the expanded shape into a `map[...]` that is not an id.
+
+### internal/plane cannot import internal/billing, so the route is registered here and wired there
+
+`internal/billing` reads the schema name from `internal/tenant` (the arrangement `internal/ledger` and
+`internal/metering` already have: the schema is written down once, in the package that owns the migration), and
+`internal/tenant` imports `internal/plane` for `PlaneConfig`. So `plane -> billing` would be
+`plane -> billing -> tenant -> plane`. The route is still registered in `handlers.go`, and the handler is the
+tenth `NewServer` parameter, constructed in `cmd/plane` — the same shape and the same reasoning the `auth`
+field already carries one line above it. `plane.Server` holds a `Database{Ping}` rather than a pool, so the
+alternative (importing billing and calling `WebhookHandler(cfg, pool)` from the route) was never available
+anyway: this package has never had a pool to hand it. Verified with `go list`: `internal/billing` imports
+`internal/plane` and `internal/tenant`, and neither imports `internal/billing`.
+
+### The route is open, and that is not the same as unauthenticated
+
+`POST /v2/billing/webhook` has no `requireJWT` and no `requireAdmin`, which makes it the second open route in
+the plane after `GET /health`. That is deliberate and it is the only shape that can work: Stripe is not a
+tenant, holds no Synapse credential, and a middleware that demanded one would 401 every real delivery. Its
+credential is the `Stripe-Signature` header, checked inside the handler against a secret only Stripe and the
+plane hold. The tests pin the property from both sides — `internal/plane` proves the route answers with no
+`Authorization` header and hands the delivery to the injected handler, and `internal/billing` proves that the
+same route with a wrong or missing signature changes nothing.
+
+The status code the unconfigured plane gives is worth its own line: 503, not 400. A plane whose
+`stripe-webhook-secret` is empty can validate nothing, so it trusts nothing — but 400 would tell Stripe the
+delivery was bad, and Stripe would stop retrying something that was never the sender's fault. A 503 is
+retryable, and Stripe retries a non-2xx for about three days, which is the window an operator has to configure
+the secret without the events being lost. It is the `AdminToken` precedent (a missing credential fails closed
+at the route that needs it rather than refusing to boot) with one refinement the brief did not name.
+
+### `status` is written and nothing reads it yet
+
+This is the phase's honest boundary, recorded rather than papered over: a tenant marked `suspended` today keeps
+working. `internal/billing` has no request-serving path to hang enforcement on, and the middleware that would
+refuse a suspended tenant's token belongs with `internal/tenant/auth.go` — a later phase, and a small one. What
+exists now is the fact and the timestamp it started, in the registry, which is what a report or an enforcement
+gate needs to read.
+
+### Evidence
+
+The definition of done's command, with the compose database named explicitly so the four database-backed cases
+actually run (a fresh `-count=1` run, not a cached one):
+
+```text
+$ SYNAPSE_TEST_DB_DSN='postgres://synapse:synapse@127.0.0.1:5432/synapse?sslmode=disable' \
+    go test ./internal/billing/... -count=1 -v
+=== RUN   TestWebhookPaymentFailedSetsGracePeriod
+--- PASS: TestWebhookPaymentFailedSetsGracePeriod (0.07s)
+=== RUN   TestWebhookSubscriptionDeletedSuspendsTenant
+--- PASS: TestWebhookSubscriptionDeletedSuspendsTenant (0.06s)
+=== RUN   TestWebhookRejectsInvalidSignature
+=== RUN   TestWebhookRejectsInvalidSignature/signed_with_another_endpoint's_secret
+=== RUN   TestWebhookRejectsInvalidSignature/body_replaced_after_signing
+=== RUN   TestWebhookRejectsInvalidSignature/no_signature_header
+--- PASS: TestWebhookRejectsInvalidSignature (0.04s)
+    --- PASS: TestWebhookRejectsInvalidSignature/signed_with_another_endpoint's_secret (0.00s)
+    --- PASS: TestWebhookRejectsInvalidSignature/body_replaced_after_signing (0.00s)
+    --- PASS: TestWebhookRejectsInvalidSignature/no_signature_header (0.00s)
+=== RUN   TestWebhookPaymentSucceededClearsGracePeriod
+--- PASS: TestWebhookPaymentSucceededClearsGracePeriod (0.05s)
+=== RUN   TestWebhookIssuesNoSQLForARejectedDelivery
+=== RUN   TestWebhookIssuesNoSQLForARejectedDelivery/signed_with_another_endpoint's_secret
+=== RUN   TestWebhookIssuesNoSQLForARejectedDelivery/body_replaced_after_signing
+=== RUN   TestWebhookIssuesNoSQLForARejectedDelivery/no_signature_header
+=== RUN   TestWebhookIssuesNoSQLForARejectedDelivery/body_over_the_documented_ceiling
+--- PASS: TestWebhookIssuesNoSQLForARejectedDelivery (0.00s)
+    --- PASS: TestWebhookIssuesNoSQLForARejectedDelivery/signed_with_another_endpoint's_secret (0.00s)
+    --- PASS: TestWebhookIssuesNoSQLForARejectedDelivery/body_replaced_after_signing (0.00s)
+    --- PASS: TestWebhookIssuesNoSQLForARejectedDelivery/no_signature_header (0.00s)
+    --- PASS: TestWebhookIssuesNoSQLForARejectedDelivery/body_over_the_documented_ceiling (0.00s)
+=== RUN   TestWebhookWithoutASecretRefusesEveryDelivery
+--- PASS: TestWebhookWithoutASecretRefusesEveryDelivery (0.00s)
+=== RUN   TestWebhookDispatchesEachEventTypeToItsOwnStatement
+=== RUN   TestWebhookDispatchesEachEventTypeToItsOwnStatement/invoice.payment_succeeded
+=== RUN   TestWebhookDispatchesEachEventTypeToItsOwnStatement/invoice.payment_failed
+=== RUN   TestWebhookDispatchesEachEventTypeToItsOwnStatement/customer.subscription.deleted
+--- PASS: TestWebhookDispatchesEachEventTypeToItsOwnStatement (0.00s)
+    --- PASS: TestWebhookDispatchesEachEventTypeToItsOwnStatement/invoice.payment_succeeded (0.00s)
+    --- PASS: TestWebhookDispatchesEachEventTypeToItsOwnStatement/invoice.payment_failed (0.00s)
+    --- PASS: TestWebhookDispatchesEachEventTypeToItsOwnStatement/customer.subscription.deleted (0.00s)
+=== RUN   TestWebhookAcknowledgesWhatItCannotActOn
+=== RUN   TestWebhookAcknowledgesWhatItCannotActOn/an_event_type_this_phase_does_not_handle
+=== RUN   TestWebhookAcknowledgesWhatItCannotActOn/a_signed_event_whose_object_names_no_customer
+--- PASS: TestWebhookAcknowledgesWhatItCannotActOn (0.00s)
+    --- PASS: TestWebhookAcknowledgesWhatItCannotActOn/an_event_type_this_phase_does_not_handle (0.00s)
+    --- PASS: TestWebhookAcknowledgesWhatItCannotActOn/a_signed_event_whose_object_names_no_customer (0.00s)
+=== RUN   TestWebhookAnswersAnUnmatchedCustomerAndADatabaseFailureDifferently
+=== RUN   TestWebhookAnswersAnUnmatchedCustomerAndADatabaseFailureDifferently/no_tenant_claims_the_customer
+=== RUN   TestWebhookAnswersAnUnmatchedCustomerAndADatabaseFailureDifferently/the_database_refuses_the_write
+=== RUN   TestWebhookAnswersAnUnmatchedCustomerAndADatabaseFailureDifferently/a_plane_with_no_database_at_all
+--- PASS: TestWebhookAnswersAnUnmatchedCustomerAndADatabaseFailureDifferently (0.00s)
+    --- PASS: TestWebhookAnswersAnUnmatchedCustomerAndADatabaseFailureDifferently/no_tenant_claims_the_customer (0.00s)
+    --- PASS: TestWebhookAnswersAnUnmatchedCustomerAndADatabaseFailureDifferently/the_database_refuses_the_write (0.00s)
+    --- PASS: TestWebhookAnswersAnUnmatchedCustomerAndADatabaseFailureDifferently/a_plane_with_no_database_at_all (0.00s)
+PASS
+ok  	synapse/internal/billing	0.240s
+```
+
+The same command with the variable unset — the CI shape, `go test ./...` on three operating systems with no
+database — is not a silent pass: the four database-backed cases report `--- SKIP` and the five double-based ones
+still run, so what CI cannot check is visible as unchecked rather than hidden behind a green line:
+
+```text
+$ go test ./internal/billing/... -v
+--- SKIP: TestWebhookPaymentFailedSetsGracePeriod (0.00s)
+--- SKIP: TestWebhookSubscriptionDeletedSuspendsTenant (0.00s)
+--- SKIP: TestWebhookRejectsInvalidSignature (0.00s)
+--- SKIP: TestWebhookPaymentSucceededClearsGracePeriod (0.00s)
+--- PASS: TestWebhookIssuesNoSQLForARejectedDelivery (0.00s)
+--- PASS: TestWebhookWithoutASecretRefusesEveryDelivery (0.00s)
+--- PASS: TestWebhookDispatchesEachEventTypeToItsOwnStatement (0.01s)
+--- PASS: TestWebhookAcknowledgesWhatItCannotActOn (0.00s)
+--- PASS: TestWebhookAnswersAnUnmatchedCustomerAndADatabaseFailureDifferently (0.00s)
+PASS
+ok  	synapse/internal/billing	0.019s
+```
+
+The whole suite and the two packages this phase touched most:
+
+```text
+$ go test ./...
+(no failures: every package reports ok or no test files)
+$ go vet ./internal/plane/ ./internal/billing/ ./cmd/plane/
+(no output)
+$ grep stripe go.mod
+	github.com/stripe/stripe-go/v76 v76.25.0
+```
+
+**The live demo**, because a passing test can still be a test that agrees with the code rather than with Stripe.
+A real plane was booted on `127.0.0.1:9199` against the compose database, one tenant row was seeded with
+`stripe_customer_id = 'cus_phase27_demo'`, and each delivery was signed with `openssl` — an independent
+implementation of Stripe's scheme, `HMAC-SHA256(secret, "<unix-ts>.<body>")` as `t=...,v1=...`, not with
+stripe-go's own helper — and posted with `curl`:
+
+```text
+state before:        suspended | 2026-09-23 09:45:01.571846+00
+  invoice.payment_succeeded -> HTTP 200 {"received":true}
+after succeeded:     active | NULL
+  invoice.payment_failed -> HTTP 200 {"received":true}
+after failed:        grace_period | 2026-09-23 09:45:31.144804+00
+  customer.subscription.deleted -> HTTP 200 {"received":true}
+after deleted:       suspended | 2026-09-23 09:45:31.144804+00
+  invoice.payment_failed -> HTTP 400 {"error":"invalid_signature"}   (signed with whsec_attacker_secret)
+after forged sig:    suspended | 2026-09-23 09:45:31.144804+00
+  invoice.payment_failed -> HTTP 200 {"received":true}               (customer cus_phase27_unknown)
+```
+
+...with the plane's own log for that run, secret and signature absent from every line, and the brief's required
+`payment_failed` line carrying the tenant id:
+
+```text
+9:45AM INFO plane: Synapse Control Plane v2.0.0 listening addr=127.0.0.1:9199
+2026/09/23 09:45:30 INFO payment_succeeded tenant_id=1032dbd5-4091-4f80-b0ae-fd7a9ca1bba8
+2026/09/23 09:45:31 WARN payment_failed tenant_id=1032dbd5-4091-4f80-b0ae-fd7a9ca1bba8
+2026/09/23 09:45:31 INFO subscription_deleted tenant_id=1032dbd5-4091-4f80-b0ae-fd7a9ca1bba8
+2026/09/23 09:45:31 WARN stripe webhook rejected: signature validation failed
+2026/09/23 09:45:31 WARN stripe webhook matched no tenant event=payment_failed stripe_customer_id=cus_phase27_unknown
+```
+
+The plane's startup line for the same boot reported `stripe_webhook_secret=set` and nothing more, which is the
+redaction doing its job on the one line that prints the whole config. Four things that transcript shows and the
+tests cannot: the route is reachable on a freshly booted plane; recovery clears the timestamp (`active | NULL`)
+while suspension preserves it, which is the difference between the two statements; a forged signature is refused
+without touching the row it named; and an unknown customer is acknowledged with a warning instead of a retry
+storm.
+
+### Findings
+
+1. **`status` is recorded and enforced by nothing.** A `suspended` tenant's token still authenticates on every
+   route it did yesterday. The gate is small — `requireJWT` already reads the registry's `compliance_tier`, so
+   the status is a second column in a query that already runs — but it is a later phase's decision, and it will
+   want a status-to-policy mapping rather than an `if suspended`. Worth doing before anything bills: a webhook
+   that suspends a tenant nobody suspends is a legal posture without a technical one.
+2. **The plane is loopback-only, so Stripe cannot reach this route as shipped.** `PlaneConfig.Validate` refuses
+   a non-loopback `listen-addr`, which is the project's hard rule and stays; the consequence is that a real
+   deployment needs a reverse proxy or tunnel in front of it. That proxy is also where two more requirements
+   land that nothing enforces yet: TLS termination, and a request-body limit at least as large as
+   `MaxWebhookBodyBytes` (65536), or the ceiling here becomes the proxy's 413 instead of this handler's 400.
+3. **Every Stripe endpoint configured for other event types gets a 200 and an INFO line.** That is the right
+   answer to the retry contract (a non-2xx would make Stripe redeliver for three days and then drop the event),
+   but it means an operator who wants only these three events should subscribe to only these three, or the log
+   carries a line per delivery of every invoice draft. Nothing deduplicates by `event.id` either: Stripe can
+   redeliver the same event after a timeout, and the second delivery only re-stamps `grace_period_started_at`.
+4. **Nothing links a Stripe customer to a tenant yet.** The webhook matches on `stripe_customer_id`, and no code
+   writes that column — `POST /v2/tenants` does not accept it and there is no checkout flow to set it. The live
+   demo had to seed it with `psql`. Every delivery for a real account therefore logs `stripe webhook matched no
+   tenant` until the provisioning or checkout phase writes the link, which is the same shape of gap Phase 26
+   finding 9 recorded for `POST /v2/tenants`: a half-wired flow whose missing half is visible only from outside.
+5. **The four database-backed tests skip in CI.** That is `internal/store`'s documented convention and the
+   reason CI is green on three operating systems with no Postgres, and this phase added the double-based layer
+   underneath (five tests that always run) so that the security property itself is not part of what skips. What
+   stays CI-invisible is anything about the SQL: a wrong status literal or a broken `RETURNING id::text` would be
+   caught only by a run with `SYNAPSE_TEST_DB_DSN` set. `internal/metering` took the other branch — an
+   `integration` tag with a compose-DSN fallback, so its tests are never silently skipped and never run in CI
+   either. The two conventions now coexist; neither is wrong, but a reader has to know which package chose which.
+6. **`config.go` was four lines under the ceiling when this phase started.** It is v2 and therefore fair game,
+   and the split that kept it legal (`config_redact.go`) is honest — loading configuration and reporting on it
+   are different jobs — but it is worth naming that the next key added to `PlaneConfig` will have to look at that
+   file's length first. The struct declaration itself cannot be split, which is what makes this a recurring tax.
+7. **The signature header is logged nowhere, including on the failure paths.** The rejection line names neither
+   the event id nor the reason stripe-go gave, on the argument that its error text is not a contract about what
+   it quotes; an operator debugging a rejected delivery has Stripe's own delivery log for the header and can
+   compare secrets by hand. That trade is deliberate and belongs in the record, because the alternative —
+   logging the error text, as many integrations do — is one library release away from putting a header in a
+   shared log.
+
+### Next phase
+
+The smallest and earliest of what this phase leaves behind: enforcement of `tenants.status` in `requireJWT`
+(finding 1), the customer-id link that makes the webhook match anything (finding 4), and, if duplicate
+deliveries become observable, deduplication by `event.id` (finding 3). None of the three is large; the first two
+are prerequisites for a self-serve billing flow, and the reverse proxy and TLS from finding 2 are what make any
+of it reachable from Stripe at all.
+
+
