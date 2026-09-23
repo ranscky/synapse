@@ -193,12 +193,30 @@ func main() {
 	}
 	defer storeInstance.Close()
 
+	// writeBackend is what the write paths store through: the local store
+	// itself, or -- when a control plane is configured -- the decorator that
+	// queues each memory for it (see the comment below). proxy.NewProxy and
+	// mcp.NewServer both take interfaces, so the choice is made here, once,
+	// rather than inside either of them.
+	var writeBackend store.Backend = storeInstance
+
 	// v2 edge sync (Phase 8) and candidate pull (Phase 9). When a control plane
 	// is configured, one Syncer serves both directions: a background goroutine
 	// drains memories the local write path marks sync_pending and pushes them in
 	// batches, and -- further down, once the servers exist -- the compile path
 	// asks the same client for org-scoped candidates before falling back to the
 	// local store.
+	//
+	// Phase 29 is what makes the first half true. Nothing in the v1 write path
+	// ever set sync_pending (store.Write normalizes a blank status to the
+	// backend's local_only, and every writer leaves it blank), so the queue this
+	// goroutine drains was permanently empty. writeBackend above is the fix: the
+	// proxy's and the MCP server's writes go through sync.PendingWriter, which
+	// stamps what they store as sync_pending. The flusher deliberately keeps
+	// storeInstance -- it needs PendingSync and MarkSynced, which the decorator
+	// does not carry -- and internal/api keeps it too (NewAPIServer takes the
+	// concrete store), which is why a memory the compile path writes for itself
+	// is still local_only.
 	//
 	// The context is this process's own, cancelled by the deferred cancel on the
 	// shutdown path below; a failed push simply leaves rows pending for the next
@@ -211,6 +229,9 @@ func main() {
 		defer cancelSync()
 
 		syncer = sync.NewSyncer(*cfg)
+		// Every memory the two front ends below store is promised to this
+		// plane, so the flusher has something to drain (see PendingWriter).
+		writeBackend = sync.NewPendingWriter(storeInstance)
 		go syncer.RunBackground(syncCtx, storeInstance)
 	}
 
@@ -298,8 +319,11 @@ func main() {
 	// wired into the proxy below.
 	apiServer := api.NewAPIServer(storeInstance, embedderInstance, cfg, *persistTraces, sessionMgr)
 
-	// Create proxy with store and embedder
-	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, storeInstance, embedderInstance, cfg, sessionMgr, apiServer.RecordCompileTime)
+	// Create proxy with store and embedder. The store is writeBackend: a memory
+	// a proxied turn produces is queued for the control plane when this node has
+	// one, so the flusher below has traffic to push. The compile path's own
+	// write (apiServer, above) stays on the plain store -- see writeBackend.
+	proxyInstance, err := proxy.NewProxy(cfg.UpstreamURL, writeBackend, embedderInstance, cfg, sessionMgr, apiServer.RecordCompileTime)
 	if err != nil {
 		slog.Error("Failed to create proxy", "error", err)
 		os.Exit(1)
@@ -402,7 +426,7 @@ func main() {
 		// embedderInstance is passed too, so synapse_search_memories embeds a
 		// query with the same model the proxy embeds with -- the same model
 		// that produced the vectors it is comparing against.
-		mcpServer := mcp.NewServer(storeInstance, *cfg, apiServer, embedderInstance)
+		mcpServer := mcp.NewServer(writeBackend, *cfg, apiServer, embedderInstance)
 		// The same Syncer the two servers above hold: an edge node's search must
 		// see the org's memories, not only the rows in its own database, or it
 		// would surface a different half of the brain than the compile it is

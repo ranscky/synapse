@@ -7650,3 +7650,185 @@ a new tenant surface inherits the gate without being asked.
 
 
 
+
+## Phase 29 — multi-agent integration test (complete)
+
+### What this phase is
+
+One scenario, two agents, one shared brain, and no mocks between them. `internal/integration/multiagent_test.go`
+starts two real edge nodes -- each with its own SQLite store, its own HTTP surface, its own MCP server on a
+loopback port, and its own background sync client -- against one real control plane (`internal/plane`'s own
+router) listening on `127.0.0.1:9090` over the Phase 4 compose database. agent_a records a decision, agent_b
+compiles a fresh session and sees it as *another agent's* memory, agent_b contradicts it, and the contradiction
+is followed all the way out: onto the plane's own rows, into the next Memory Trace with a demoted score, into
+the tenant's HMAC chain, and out of the two compliance endpoints an enterprise tenant reads.
+
+The edge assembly is cmd/synapse's, constructor for constructor -- `store.NewStore` + `sync.NewSyncer` +
+`RunBackground` + `api.NewAPIServer` + `proxy.NewProxy` + `mcp.NewServer`, with `SetPlaneCandidates` on all
+three -- and the plane's is cmd/plane's, including the contradiction detector installed on the tenant
+`MemoryWriter`, which is the component that makes a cross-agent contradiction detectable at all. The only mock
+is the model upstream (`multiagent_upstream_test.go`: an OpenAI-shaped echo server that records every header it
+received); the only substitute is the embedder, because an ONNX session cannot be loaded per test, so it is a
+deterministic 384-axis unit-vector embedder that pgvector stores, indexes, and compares exactly as it compares
+real vectors.
+
+### The one production change this phase needed
+
+**Nothing in the write path ever set `sync_status = 'sync_pending'`.** `store.Write` normalizes a blank status to
+`local_only`, every writer leaves it blank, and `PendingSync` matches only `sync_pending` -- so an edge node's
+background flusher was draining a permanently empty queue and *no edge node has ever pushed a memory to a
+control plane*. Phases 8, 9, 10, and 25 each recorded that as a finding (Phase 25's finding 3 ends: "a one-line
+change at the write site and a policy question rather than a technical one"); this phase's step (a) is the
+assertion that cannot pass until it is fixed.
+
+The fix is `internal/sync/pending.go`: `sync.PendingWriter`, a `store.Backend` decorator that stamps a blank
+`SyncStatus` as `sync_pending` on the way in and delegates `Search`, `GetRecent`, and `MarkSuperseded`
+unchanged. `cmd/synapse/main.go` installs it on the two paths that take an interface -- the **proxy** and the
+**MCP server** -- while the flusher keeps the concrete `*store.Store` it needs for `PendingSync`/`MarkSynced`.
+`internal/api` keeps the concrete store, because `NewAPIServer` takes one (v1, frozen), which is why a memory
+`/v1/compile` writes for itself is still `local_only`: recorded as a finding below rather than papered over. No
+v1 internal was touched.
+
+### Definition of done, verbatim
+
+```text
+$ go test ./internal/integration/... -run TestMultiAgent -v -tags integration
+=== RUN   TestMultiAgent
+    multiagent_test.go:70: STEP 0: provisioned slug=ma-660dbf1c1a3 tenant_id=3d7e345a-fa2f-4c74-ad0b-10c90a705bd4 jwt=407 chars api_key=64 chars (never printed)
+    multiagent_test.go:76: STEP 0: control plane answering at http://127.0.0.1:9090 over the compose database
+    multiagent_test.go:94: STEP 0: agent_a and agent_b are up, each with its own store and flusher
+    multiagent_test.go:108: STEP a: five proxied turns through edge_a, then the plane's own table
+    multiagent_test.go:119: STEP a: proxied turn 1/5 through agent_a
+    multiagent_test.go:119: STEP a: proxied turn 2/5 through agent_a
+    multiagent_test.go:119: STEP a: proxied turn 3/5 through agent_a
+    multiagent_test.go:119: STEP a: proxied turn 4/5 through agent_a
+    multiagent_test.go:119: STEP a: proxied turn 5/5 through agent_a
+    multiagent_test.go:122: STEP a: agent_a has 10 memories queued for the plane
+    multiagent_test.go:134: STEP a: the plane holds 7 memories from agent_a
+    multiagent_test.go:143: STEP b: edge_a writes the decision through synapse_write_memory (decision, org)
+    multiagent_test.go:150: STEP b: stored memory 20ab8f79-dd6a-4e19-9bfd-ec96e63bfafd (sanitized=false conflict_detected=false)
+    multiagent_test.go:165: STEP b: the plane row is agent_id=agent_a visibility=org conflict_status=none
+    multiagent_test.go:174: STEP c: edge_b compiles a fresh session and reads the Memory Trace
+    multiagent_test.go:189: STEP c: trace req-1790159097954744304 entry id=20ab8f79-dd6a-4e19-9bfd-ec96e63bfafd agent_id=agent_a cross_agent=true conflict_status=none total=0.5000 included=true
+    multiagent_test.go:205: STEP d: edge_b writes the contradicting MySQL decision
+    multiagent_test.go:214: STEP d: stored memory f81e67d9-17f5-4363-bfd4-11a2789bf25c (this node's own conflict_detected=false); the cross-agent verdict is the plane's
+    multiagent_test.go:240: STEP d: the plane recorded it -- mysql f81e67d9-17f5-4363-bfd4-11a2789bf25c status=conflict with=20ab8f79-dd6a-4e19-9bfd-ec96e63bfafd; postgres 20ab8f79-dd6a-4e19-9bfd-ec96e63bfafd status=superseded_candidate with=f81e67d9-17f5-4363-bfd4-11a2789bf25c
+    multiagent_test.go:257: STEP e: a second fresh session through edge_b, after the conflict
+    multiagent_test.go:274: STEP e: superseded candidate 20ab8f79-dd6a-4e19-9bfd-ec96e63bfafd conflict=superseded_candidate with=f81e67d9-17f5-4363-bfd4-11a2789bf25c total=0.2500 (S=0.000 R=1.000 I=1.000 T=0.500) included=true
+    multiagent_test.go:277: STEP e: contradictory memory f81e67d9-17f5-4363-bfd4-11a2789bf25c conflict=conflict with=20ab8f79-dd6a-4e19-9bfd-ec96e63bfafd total=0.5000 (S=0.000 R=1.000 I=1.000 T=0.500) included=true
+    multiagent_test.go:281: STEP f: header names and values the model upstream actually received
+    multiagent_test.go:282: STEP f: 5 upstream requests, header names on the first: [Accept-Encoding Content-Length Content-Type User-Agent X-Forwarded-For] -- no Authorization, no x-api-key, no credential
+    multiagent_test.go:284: STEP g: synapse_global.ledger, counted for this tenant
+    multiagent_test.go:285: STEP g: 7 compilations performed, 7 ledger entries
+    multiagent_test.go:287: STEP h: chain_valid=true entries_checked=7 first_break_id=""
+    multiagent_test.go:287: STEP i: audit returned 7 entries (total=7 limit=50 offset=0); newest trace=req-1790159098984063979 memories=12
+    multiagent_test.go:289: PASS: two agents, one shared brain -- agent_a's decision reached agent_b's trace (cross_agent), agent_b's contradiction was recorded by the plane, and the enterprise tenant's chain holds 7 signed entries
+--- PASS: TestMultiAgent (4.12s)
+PASS
+ok  	synapse/internal/integration	4.151s
+```
+
+The line numbers in that transcript are the finished file's, and the identifiers change every run (each run
+provisions its own tenant, by design). The command was run four times back to back while the files above were
+being finished; the output pasted is the last of them.
+
+### The nine assertion groups, and where each one is pinned
+
+| Group | What it asserts | Where the fact lives |
+| --- | --- | --- |
+| a | five proxied turns through agent_a's node reach the plane | `SELECT count(*) FROM tenant_<slug>.memories WHERE agent_id='agent_a'` — the tenant's own table, read directly |
+| b | agent_a's decision is stored and pushed with `agent_id=agent_a`, `visibility=org`, `conflict_status=none` | `synapse_write_memory`'s reply (uuid, `sanitized`, `conflict_detected`) plus that row |
+| c | a fresh session compiled on agent_b's node contains agent_a's memory with `cross_agent=true` | the `Memory Trace` in `POST /v1/compile`'s response — the full manifest, so the provenance fields are visible |
+| d | the contradiction is detected: MySQL row `conflict` naming the Postgres row, Postgres row `superseded_candidate` naming MySQL | the plane's two rows, both directions, because the verdict is the plane's (see finding 2) |
+| e | both versions survive in the next trace, the contradicted one carries the marker, and the marker shows as a lower `score_total` | the trace's per-memory `conflict_status`, `conflict_with_id`, and four factor scores |
+| f | no `Authorization`, no `x-api-key`, and no Synapse credential reached the model upstream or any edge log line | every header the mock upstream received (names and values), plus the captured `slog` output of both nodes |
+| g | the enterprise tenant's ledger holds at least one entry per compilation | `SELECT count(*) FROM synapse_global.ledger WHERE tenant_id=…`, polled (the append is asynchronous) |
+| h | `GET /v2/compliance/chain-integrity` answers `chain_valid=true` | the walk, which re-derives every HMAC from the tenant's stored secret |
+| i | `GET /v2/compliance/audit` returns the entries, each carrying the trace it signed | the endpoint's `total` and its page, with the newest entry parsed back into a `TraceManifest` |
+
+Every assertion is `require`, so the first failure aborts the run — the brief's "fail fast", and the only reading
+of "use testify/assert" that is compatible with it. Each group logs a `STEP <letter>` line first, and the log
+lines carry counts, ids, statuses, and scores but never the JWT, the API key, or the master key (only their
+lengths, once).
+
+### Files
+
+**New:** `internal/sync/pending.go` (the decorator) and `internal/sync/pending_test.go` (its cases: blank becomes
+pending, a stated status is preserved, a nil backend is an error, and delegation for the other three methods);
+plus, under `internal/integration/`, `multiagent_test.go` (the scenario), `multiagent_setup_test.go` (database,
+tenant, plane router), `multiagent_edge_test.go` (the two nodes and the MCP client),
+`multiagent_tools_test.go` (the client verbs), `multiagent_probe_test.go` (the waits and direct reads),
+`multiagent_ledger_test.go` (the two adapters that mirror package main), `multiagent_upstream_test.go` (the
+recording echo server), and `multiagent_steps_test.go` (steps f–i as functions).
+
+**Edited:** `cmd/synapse/main.go` (`writeBackend`: the decorator on the proxy and MCP paths when
+`control-plane-url` is set) and `PROGRESS.md`.
+
+### Findings, limitations, and what this phase did not do
+
+1. **The fix this phase needed is a product policy that was made here.** `sync.PendingWriter` decides that a
+   memory written on a node *with a control plane configured* is promised to that control plane. That is the only
+   reading that makes an edge node's sync mean anything, but it is a decision that had been left open for
+   twenty-one phases and is now a line of code rather than a question. A `sync-enabled` key, or a per-write flag,
+   is open and small.
+2. **A node's own `conflict_detected` cannot see another node's memory.** `synapse_write_memory` compares the
+   memory it is about to store against the candidates *its own store* can read (`write_conflict.go`); the memory
+   agent_a wrote is on the plane, so agent_b's reply is `false`, and this test asserts that rather than the
+   brief's "conflict_detected in the response". The conflict *is* detected — by the plane, on the push, which is
+   where cross-agent candidates can meet — and step (d) pins both marked rows. Making the edge's reply capable of
+   the cross-agent verdict means letting that tool ask the plane for candidates (Phase 25's finding 2, still
+   open).
+3. **The brief's direction for the superseded candidate is inverted, and the test follows the code.** It expects
+   the *second* memory (MySQL) to be the `superseded_candidate` and to score lower. `pgconflict.go` marks the
+   older row as the candidate and the newer one as `conflict`, and the scorer penalizes only the candidate, so
+   the Postgres memory — written first, by agent_a — is the one demoted (0.2500 against 0.5000 in the transcript).
+   The test asserts that, with the discrepancy written down at the step and here. Asserting the brief's direction
+   would mean changing `internal/store` or `internal/conflict`, both v1 internals.
+4. **`POST /v2/tenants` can only mint a `team` compliance tier.** The provisioning handler hardcodes
+   `defaultComplianceTier` (`plane/tenants.go`), so a tenant created through the public API — however its plan is
+   set — gets 403 from all three compliance surfaces. This test therefore provisions through
+   `tenant.NewProvisioner` with `ComplianceTier: "enterprise"`, which is what internal/plane's own compliance
+   tests do, and the gap is real: "enterprise" compliance is currently unreachable for a customer who signed up
+   through the API.
+5. **`control-plane-api-key` must be the tenant JWT, as the config comment says.** The brief passes `<api_key>`
+   for the edges; the plane verifies a signed token on `/v2/sync/memories` and `/v2/memories/search`, and the API
+   key is only a bcrypt row, so the edges present `result.JWT`. The API key is still provisioned, and it is one of
+   the two secrets step (f) proves never leaves the machine.
+6. **A memory `/v1/compile` writes for itself is still `local_only`.** `api.NewAPIServer` takes the concrete
+   `*store.Store` (a v1 signature), so the decorator cannot be installed there; the proxy's and the MCP server's
+   writes do sync. Consequence in a deployment: a node whose only traffic is the compile playground never pushes
+   anything. Fixing it is an interface change in a frozen v1 package.
+7. **The plane binds a fixed port, so two concurrent runs of this package collide.** `127.0.0.1:9090` is what the
+   brief names and what a deployment uses; `SYNAPSE_TEST_PLANE_ADDR` moves it. The failure is a clear message
+   rather than a mysterious hang, and it is what a parallel `go test` invocation of the same package produces.
+8. **`store.NewStoreFromConfig` — the tenant-Postgres edge backend — still has no callers.** It returns
+   `store.Backend` and `api.NewAPIServer` wants a `*store.Store`, so the factory's Postgres branch cannot be
+   wired into the binary as it stands. Nothing here depends on it and nothing about it changed; it is named
+   because a reader of `factory.go` would reasonably conclude an edge can be pointed at a tenant schema.
+9. **The test provisions a tenant per run and never deletes it** — internal/plane's and internal/billing's
+   convention, now for a fifth package. Each run adds a row to `synapse_global.tenants`, a schema, and seven
+   ledger rows.
+
+### Also verified after the change
+
+`go vet -tags integration ./...` clean; the untagged suite (`go test ./... -count=1`) all `ok`, including
+`internal/sync` (the decorator's own package) and `internal/proxy`; the tagged suites that share this database —
+`internal/plane` (the compliance, ledger, and status gates), `internal/store` (conflict detection and isolation),
+`internal/ledger`, and `internal/metering` — all `ok`; and the DoD command four times in a row. The two
+flakes found while finishing the test are worth naming because both were real ordering facts rather than test
+noise: a flusher that has pushed one batch has not pushed the rest (so step (a) waits for the fifth memory, not
+the first), and the plane labels the older row of a contradiction in a second statement after inserting the newer
+one (so step (d) waits for both halves of the verdict).
+
+### Next phase
+
+Finding 4 is the next product-shaped gap: the provisioning endpoint cannot mint the tier that three endpoints it
+advertises are gated on, which makes Phase 21's gate untestable through the public API and unreachable for a real
+customer. After it, in rough order of value: letting the write tool ask the plane for candidates (finding 2),
+which is what would make a cross-agent conflict visible in the reply a caller reads; giving the sync decorator a
+config key rather than an unconditional decision (finding 1); and the interface change that would let the compile
+path queue its own writes (finding 6). Nothing in this phase blocks any of them.
+
+
+
+
