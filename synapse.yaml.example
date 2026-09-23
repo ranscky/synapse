@@ -4,6 +4,11 @@
 # Required: Upstream model server URL (must start with http:// or https://)
 upstream-url: "http://localhost:11434"
 
+# Optional label for the model the upstream serves (e.g. "llama3.1:8b"). Used
+# only in usage metering: every recorded usage event names the model the
+# savings were measured against. Leave blank to record no model.
+upstream-model: ""
+
 # Listen address for the proxy (must default to 127.0.0.1 for security)
 listen-addr: "127.0.0.1:8080"
 

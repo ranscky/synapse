@@ -670,6 +670,35 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		reductionPct = float64(candidatePoolTokens-totalTokens) / float64(candidatePoolTokens) * 100
 	}
 
+	// Phase 26: one usage event per successful compilation, for the tenant this
+	// node belongs to. Off the request path -- the sink is installed at boot
+	// and Record returns immediately -- so a metering database that is slow or
+	// gone cannot cost a compilation anything. TenantID is left empty on
+	// purpose: it comes from this node's own credential, which only
+	// cmd/synapse can read, and a value a request could influence must never
+	// reach a usage row. Both token counts are the pair the trace above
+	// records: the retrieved candidate pool against what the sieve emitted.
+	compiler.RecordUsage(compiler.UsageEvent{
+		AgentID:        p.config.AgentID,
+		SessionID:      sessionID,
+		RawTokens:      candidatePoolTokens,
+		CompiledTokens: totalTokens,
+		ReductionPct:   reductionPct,
+		Model:          p.config.UpstreamModel,
+		CreatedAt:      time.Now(),
+	})
+
+	// The savings summary as one line, and unlike the metering write above it
+	// is unconditional: this number is the product, and a user has to be able
+	// to see that the sieve did anything without reading a trace or a database.
+	// savings_usd is the same rate internal/compiler documents, quoted by
+	// compiler.SavingsUSD rather than computed a second time here.
+	slog.Info("compiled",
+		"raw", candidatePoolTokens,
+		"compiled", totalTokens,
+		"reduction_pct", fmt.Sprintf("%.1f%%", reductionPct),
+		"savings_usd", fmt.Sprintf("$%.4f", compiler.SavingsUSD(candidatePoolTokens, totalTokens)))
+
 	// 8. Log timing information
 	totalDuration := time.Since(startTime)
 	slog.Info("Pipeline completed",

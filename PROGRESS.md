@@ -6814,3 +6814,310 @@ touches `POST /v2/tenants` next; recording `GET /v2/compliance/chain-integrity`'
 (Phase 21 finding 1) is still small enough to ride along; and Phase 23's finding 3 (a compile with no
 memories is indistinguishable from a compile that failed to retrieve) is unchanged, now with its
 search-side twin (Phase 24 finding 2) and its write-side counterpart above (finding 5).
+
+## Phase 26 — Usage metering (complete)
+
+Every successful compilation now leaves one row in `synapse_global.usage_events`, written in a goroutine no
+request waits on, and every compilation through the edge node's live path logs one structured line that
+says what the sieve saved: `raw`, `compiled`, `reduction_pct`, `savings_usd`. The row is what the
+compliance report's two metering-facing fields are read from — `TotalCompilations` and
+`AvgReductionPct` — so for the first time in this project those numbers are written by the thing they
+describe rather than inferred from signed traces whose own `tokens_used` and `reduction_pct` are still
+zero (Phase 18 finding 1, Phase 20 finding 4).
+
+Commit `feat: Phase 26 - usage metering`
+
+New files:
+
+- `internal/metering/meter.go` — 201 lines: `UsageEvent` (the brief's eight fields), `Meter`, `NewMeter`,
+  `Record`, `canonicalID`, `nullableText`, the one INSERT this package owns, and the table name taken from
+  `internal/tenant` so it is written down once, exactly as `internal/ledger` takes `.ledger` and
+  `.compliance_access_log`.
+- `internal/metering/meter_test.go` — 233 lines: the definition of done (ten `Record` calls with ten
+  distinct tenant ids, then ten rows), the one-tenant variant with a `raw_tokens` sum, and the shared
+  helpers (`meterPool`, `newEvent`, `countForTenants`, `settle`).
+- `internal/metering/meter_row_test.go` — 154 lines: what a single row's columns have to hold, the index
+  the migration adds, and the malformed-tenant-id guard with the negative control that follows it.
+- `internal/metering/meter_guard_test.go` — 102 lines, no build tag: nil meter and nil pool inertness,
+  "Record returns before the write completes" against a non-routable address, and the two small mappings
+  (`canonicalID`, `nullableText`).
+- `internal/compiler/usage.go` — 159 lines: `UsageEvent`, the `UsageSink` interface, the `atomic.Pointer`
+  wiring, `SetUsageSink`, `RecordUsage`, and `SavingsUSD`, which is the one definition of the rate.
+- `internal/compiler/usage_test.go` — 165 lines: the seam's contract, including which side owns the
+  asynchrony — the assertion is that `RecordUsage` has already handed the event over when it returns, not
+  that it returns early.
+- `cmd/synapse/meter.go` — 116 lines: `meterSink` (the adapter that fills in this node's tenant) and
+  `enableMetering`, which mirrors `enableEnterpriseLedger`'s structure and fails the same soft way.
+
+Changed:
+
+- `internal/proxy/proxy.go` — 872 → 901 lines: two statements after `reductionPct` is computed — the
+  `compiler.RecordUsage` call and the `compiled` log line. This is the canonical completion point for live
+  traffic, and the only place in that file this phase touched.
+- `internal/api/api.go` — 762 → 783 lines: the same `RecordUsage` call in `runCompilePipeline`, guarded by
+  the `persist` flag the pipeline already had, which covers `POST /v1/compile` and MCP
+  `synapse_compile` (both ride `CompileContext`) and excludes the playground.
+- `internal/config/config.go` — 364 → 374 lines: `UpstreamModel` / `upstream-model`, the operator's label
+  for what the upstream serves, read only by the usage event.
+- `internal/tenant/migrations.go` — 206 → 218 lines: one idempotent migration, the
+  `usage_events_tenant_created_idx` index on `(tenant_id, created_at)` that PROGRESS.md's Phase 20
+  finding 6 said belonged to whichever phase started writing rows.
+- `cmd/synapse/main.go` — 728 → 747 lines: the metering block beside Phase 18's ledger block, inside the
+  same `control-plane-url` gate.
+- `synapse.yaml.example` — 134 → 139 lines: `upstream-model` documented next to `upstream-url`, and the
+  same three lines added to `synapse init`'s template in `cmd/synapse/main.go`.
+- `bin/synapse` — **not** staged, and left dirty by the demo build, as in Phases 22-25.
+
+### The numbers forced the two call sites, not `Compile`
+
+The brief said to wire metering "the same place Phase 18 wired the ledger", and the honest reading of that
+turned out to be the wiring, not the line. Phase 18 installed its sink from `cmd/synapse` but *called* it
+from inside `compiler.Compile`, which is where `internal/compiler/ledger.go` records — in its own words —
+that the ledgered trace "carries tokens_used 0 and reduction_pct 0, because both are still unset at the
+moment the trace is complete from this package's point of view", and that "editing the two v1 call sites
+to append after their own fixups is what would make those fields truthful, and that is a deliberate
+later-phase decision."
+
+Those two fields are this phase's entire payload. `raw_tokens` is the retrieved candidate pool's token
+count and `reduction_pct` is the difference between that pool and what the sieve emitted, and both of them
+exist only after `Compile` returns: `internal/proxy` and `internal/api` compute them from
+`budget.Fill`'s two return values and then write them back into the trace. A sink called from inside
+`Compile` could therefore only ever have written `raw_tokens 0 / compiled_tokens 0 / reduction_pct 0` —
+three stored falsehoods, once per compilation, in the table a compliance report reads. So the seam is
+Phase 18's (`SetUsageSink`, an interface declared in `internal/compiler`, installed once before the router
+serves), and the *call* is at the two places that own the numbers. This phase is the later-phase decision
+`ledger.go` predicted, and it leaves that file's own fidelity gap exactly where it was, now with a
+precedent next door.
+
+### What this phase added to v1 files, and why that was the only honest option
+
+`.clinerules` says a v1 internal may not be touched "unless a v2 bug explicitly requires it". Four v1 files
+changed here, and each change is one statement or one field:
+
+- `internal/proxy/proxy.go` (live traffic) and `internal/api/api.go` (`/v1/compile` and MCP): one
+  `compiler.RecordUsage(...)` call each. Without them there are no truthful numbers to record — see above —
+  so the alternative was not a smaller change to v1 but a different, dishonest feature.
+- `internal/tenant/migrations.go`: the `(tenant_id, created_at)` index the report's totals query needs.
+  Phase 20 finding 6 recorded that this belonged to the phase that starts writing rows, and this is it.
+- `internal/config/config.go`: `upstream-model`, because the brief names `cfg.UpstreamModel` and no such
+  field existed. It is the operator's label for what the upstream serves — nothing about proxying reads
+  it, it never reaches the upstream, and it is never taken from a request — and it exists so a usage row
+  can say which model a saving was measured against. Blank records `NULL`, not the empty string.
+
+Everything else is additive: `internal/compiler` gained one new file and one file each in
+`internal/metering` and `cmd/synapse`. No v2 package is imported by the scoring pipeline, no behaviour
+changed for a node that does not meter, and the log line is the one edit that every node now emits.
+
+
+
+
+### The decisions the brief did not make
+
+**Metering is not plan-gated, and the ledger still is.** `enableMetering` asks for the same two things
+`enableEnterpriseLedger` asks for — a credential that names a tenant, and a database — and deliberately
+does not ask about the plan. `usage_events` is where the compliance report's compilation count and mean
+reduction come from for every tenant, so an `oss` or `team` tenant that was not metered would read zero
+compilations for work it actually did. The ledger's enterprise gate is right for the ledger, which is a
+signed chain an enterprise SKU includes; it is wrong here, and the difference is written down in both the
+function and `internal/compiler/usage.go` rather than left to look like an oversight.
+
+**The playground is not metered; MCP is.** `runCompilePipeline` already had the switch that means "real
+traffic": the `persist` flag. It is true for `POST /v1/compile` and for the MCP surface's
+`synapse_compile` — both of which `CompileContext` drives — and false for `/api/playground/compile`,
+which is this operator's own UI. Metering it would bill a tenant for its own dashboard, so the call sits
+behind `persist` and the reason is in the comment there.
+
+**A node with no credential names no tenant, so it does not meter.** The tenant id comes from the node's
+own control-plane credential through `resolveLedgerPlan`, the function Phase 18 already wrote, so "this
+node's tenant" has one definition rather than two that could disagree. TenantID is left empty by both v1
+call sites and filled in by the adapter: nothing a request carries can reach a billing column.
+
+**`session_id` is stored and never logged or returned.** The column exists because "which session spent
+this" is a real billing question; `Record`'s only log line carries the error and nothing else, which is
+why `internal/metering`'s failure path cannot leak a session handle even if a database error quotes one.
+The integration test asserts the value is in the row, so a later "we never return it, so why store it"
+cleanup cannot quietly remove it.
+
+**Failures are dropped, not retried.** `Record` never returns an error and never retries: a retry would
+have to buffer usage data this process has no store for, or block a caller, and the next compilation
+writes its own row anyway — the same reasoning the ledger sink documents for a failed append. The
+consequence is honest and recorded below as finding 4.
+
+**The write is asynchronous; the seam is not.** `RecordUsage` calls the sink and returns when the sink
+returns; the goroutine, the 3-second ceiling, and the absent error live in `metering.Meter.Record`.
+Putting the goroutine in the seam would have cost one unaccounted goroutine per compilation and would have
+handed the sink a copy of a struct both callers keep writing to.
+
+### Evidence
+
+The definition of done's command, verbatim (a fresh run, not a cached one):
+
+```text
+$ go test ./internal/metering/... -count=1 -v -tags integration
+=== RUN   TestRecordWithNoPoolIsInert
+--- PASS: TestRecordWithNoPoolIsInert (0.00s)
+=== RUN   TestRecordReturnsBeforeTheWriteCompletes
+2026/09/23 09:20:13 WARN metering: record failed err="context deadline exceeded"
+--- PASS: TestRecordReturnsBeforeTheWriteCompletes (3.20s)
+=== RUN   TestCanonicalIDAcceptsAUUIDAndRefusesAnythingElse
+=== RUN   TestCanonicalIDAcceptsAUUIDAndRefusesAnythingElse/refuses_
+=== RUN   TestCanonicalIDAcceptsAUUIDAndRefusesAnythingElse/refuses_not-a-uuid
+=== RUN   TestCanonicalIDAcceptsAUUIDAndRefusesAnythingElse/refuses_1234
+=== RUN   TestCanonicalIDAcceptsAUUIDAndRefusesAnythingElse/refuses_6f9c1e5a-3b7d-4c21-9a5e-8d0f4b2c7e3
+--- PASS: TestCanonicalIDAcceptsAUUIDAndRefusesAnythingElse (0.00s)
+    --- PASS: TestCanonicalIDAcceptsAUUIDAndRefusesAnythingElse/refuses_ (0.00s)
+    --- PASS: TestCanonicalIDAcceptsAUUIDAndRefusesAnythingElse/refuses_not-a-uuid (0.00s)
+    --- PASS: TestCanonicalIDAcceptsAUUIDAndRefusesAnythingElse/refuses_1234 (0.00s)
+    --- PASS: TestCanonicalIDAcceptsAUUIDAndRefusesAnythingElse/refuses_6f9c1e5a-3b7d-4c21-9a5e-8d0f4b2c7e3 (0.00s)
+=== RUN   TestNullableTextMapsNothingToNull
+--- PASS: TestNullableTextMapsNothingToNull (0.00s)
+=== RUN   TestRecordStoresEveryColumn
+--- PASS: TestRecordStoresEveryColumn (0.22s)
+=== RUN   TestUsageEventsTableHasTheReportIndex
+--- PASS: TestUsageEventsTableHasTheReportIndex (0.08s)
+=== RUN   TestRecordDropsAMalformedTenantID
+2026/09/23 09:20:14 WARN metering: record failed err="metering: tenant id must be a uuid"
+--- PASS: TestRecordDropsAMalformedTenantID (0.14s)
+=== RUN   TestRecordWritesOneRowPerEvent
+--- PASS: TestRecordWritesOneRowPerEvent (0.34s)
+=== RUN   TestRecordWritesEveryEventForOneTenant
+--- PASS: TestRecordWritesEveryEventForOneTenant (0.17s)
+PASS
+ok  	synapse/internal/metering	4.181s
+```
+
+Two lines in that output are this phase's own claims being demonstrated rather than asserted: the
+`context deadline exceeded` warning belongs to the asynchrony test — the write it never waited for fails
+three seconds later, under its own ceiling, and the warning names the error and nothing else — and the
+`tenant id must be a uuid` warning is the guard that keeps one bad credential from becoming a failed
+INSERT per compilation for as long as the node runs.
+
+The ten-events count is scoped to the ten tenant ids the test mints
+(`WHERE tenant_id = ANY($1::uuid[])`), so no other run's rows can satisfy it, and the same test asserts
+each tenant has exactly one row — "ten rows" cannot be ten rows for one tenant. The one-tenant variant
+additionally sums `raw_tokens`, which is what would catch a column overwritten in place; a count alone
+would not.
+
+One real compilation through the proxy, against Ollama's `gemma4:31b-cloud`, on a live edge node whose boot
+log also says the sink is installed:
+
+```text
+9:16AM INFO synapse: Usage metering enabled: every compiled request records a usage event
+9:16AM INFO synapse: compiled raw=7477 compiled=2927 reduction_pct=60.9% savings_usd=$0.0682
+```
+
+and the rows that compilation and its neighbours produced, read back from the database (the tenant is the
+one `POST /v2/tenants` had just provisioned, `352b78e2-ded0-40ae-9033-2ba34059ddc4`):
+
+```text
+ rows | min_raw | max_raw | avg_reduction_pct |      model       |     agent
+------+---------+---------+-------------------+------------------+----------------
+    3 |       0 |    7477 |              20.3 | gemma4:31b-cloud | phase26-agent
+
+          created_at           | raw_tokens | compiled_tokens |   reduction_pct   |      model
+-------------------------------+------------+-----------------+-------------------+------------------
+ 2026-09-23 09:16:48.368398+00 |          0 |               0 |                 0 | gemma4:31b-cloud
+ 2026-09-23 09:16:46.201872+00 |          0 |               0 |                 0 | gemma4:31b-cloud
+ 2026-09-23 09:16:42.932411+00 |       7477 |            2927 | 60.85328340243413 | gemma4:31b-cloud
+```
+
+The two `raw_tokens 0` rows are not a bug in the write path: those requests were made before a stable
+`Authorization` header was sent, so each had a session of its own and nothing to retrieve (finding 10).
+The `session_id` column is deliberately not selected above — it is in the rows, and it is in no log line
+and no response — and `psql`'s own output is the only place these numbers appear outside the database.
+
+The same database shows the index the migration added, `usage_events_tenant_created_idx`, alongside the
+primary key, and the plane's boot in that run logged `migrations complete schema=synapse_global` — so the
+new statement applies cleanly on a real boot and is a no-op on the ones after it.
+
+Also run and green: `go build ./...`, `go vet ./...`, every untagged package (`go test ./... -count=1`, 21
+packages), and the integration-tagged suites of `internal/ledger`, `internal/tenant`, `internal/plane` and
+`internal/store` — the four packages whose database the new migration statement touches:
+
+```text
+$ go test ./internal/ledger/... ./internal/tenant/... ./internal/plane/... ./internal/store/... -count=1 -tags integration
+ok  	synapse/internal/ledger	15.710s
+ok  	synapse/internal/tenant	0.946s
+ok  	synapse/internal/plane	17.144s
+ok  	synapse/internal/store	7.711s
+```
+
+### Findings
+
+1. **`avg_reduction_pct` is a real number now, for the windows that metering covers.** Phase 20 finding 4
+   recorded that the report read `0.00%` because nothing wrote `usage_events` and the ledgered traces it
+   fell back to carry `reduction_pct 0`. A metering node's window now answers from rows that hold the
+   number the edge node computed: the demo's three rows average `20.3`, and `TotalCompilations` prefers the
+   same source. It is a real number and not yet a complete one — a window that predates this phase still
+   falls back to traces with zeroes, and the report has no field that says which of the two it used, which
+   is the other half of Phase 20 finding 4 and is still open.
+2. **Phase 18's trace fidelity gap is untouched and now has a template.** The ledger still signs
+   `tokens_used 0` and `reduction_pct 0`, because its append still happens inside `Compile`. The fix is two
+   lines at the same two call sites this phase edited, in the same shape as `compiler.RecordUsage` — which
+   means the two artifacts a compliance officer can compare (a signed trace and a metering row for the same
+   compilation) currently disagree by construction, and the fix is now cheap enough to be a phase of its
+   own.
+3. **A node with a DSN and a credential but no `control-plane-url` meters nothing.** `cmd/synapse` only
+   reaches `enableMetering` inside the `control-plane-url` gate, because that is where Phase 18 put its
+   block and because `database-dsn` is documented as meaningful only alongside a control plane. The write
+   path itself does not care — `enableMetering` opens its own pool from the DSN — so widening the gate is a
+   one-line decision for whoever wants a standalone node to meter.
+4. **A metering outage loses events silently.** There is no spool, no retry, and no reconciliation: a
+   database that is down at compile time produces a warning and no row, so `usage_events` under-counts
+   rather than over-counts. Nothing bills from this table yet, which is what makes the trade acceptable
+   today; before anything invoices from it, the missing piece is either a durable local spool or a
+   plane-side rollup from the sync stream, which already carries every compiled trace for an enterprise
+   tenant.
+5. **`Meter` holds a concrete pool, so the "never blocks" guard is a timing test.** The brief specifies
+   `pool *pgxpool.Pool`, which leaves no seam to inject a slow executor; the untagged guard therefore
+   asserts against a non-routable address (TEST-NET-1) that `Record` returns in under a second while its
+   write is still outstanding, with the three-second ceiling documented as the reason the bound is loose.
+   An `Executor` interface would make the property structural, and is worth adding when a second
+   implementation exists — not before, since a one-implementation interface is only indirection.
+6. **An enterprise node now holds two pools to one database.** Phase 18's ledger wiring and this phase's
+   metering wiring each open their own `store.OpenPGPool` and each own its lifetime. Two or three
+   connections are not a problem; it is the kind of duplication that quietly becomes four pools as more v2
+   sinks are added, and one shared edge pool is the small refactor that prevents it.
+7. **Nothing reads `agent_id`, `session_id`, or `model` yet.** The report reads only `count(*)` and
+   `avg(reduction_pct)`, which is why the new index is on `(tenant_id, created_at)` alone: that is the only
+   predicate anything runs. The three other columns are the substrate for the billing and
+   session-attribution work that comes after, and they were far cheaper to record now than to backfill.
+8. **Observed during the demo, and pre-existing rather than caused here: `cmd/synapse` never calls
+   `store.NewStoreFromConfig`.** With `control-plane-url`, a credential, `agent-id`, `team-id`, and
+   `database-dsn` all set, the node logged
+   `Store initialized db_path=/home/ranscky/.local/share/synapse/synapse.db` — the SQLite store — while
+   metering wrote to Postgres. `NewStoreFromConfig`, the function whose documented job is "the local SQLite
+   store when no control plane is configured, or a tenant-scoped Postgres store when one is", has no caller
+   anywhere in `cmd` or `internal`. Metering does not depend on which store is in use, so this phase could
+   proceed without answering it, but a node that believes it is storing memories in its tenant's Postgres
+   schema while writing them to a local file is a wiring bug worth fixing before metering feeds anything
+   that matters. It is the first thing this phase's demo found by accident, and it belongs to whoever owns
+   `cmd/synapse`'s store construction.
+9. **A failed provisioning leaves a tenant row behind, so a retry answers 409 with a tenant that has no
+   secret.** The demo's first `POST /v2/tenants` failed with HTTP 500 (`SYNAPSE_MASTER_KEY` was missing from
+   the plane's environment even though the config file carried `master-key`, because `internal/tenant`
+   reads that key from the environment only), and the retry with the same slug answered 409: the registry
+   row had already been written, while the wrapped secret and the minted token never were. That is Phase
+   2/16's provisioning order showing up as an operational shape — the endpoint is not atomic across those
+   three writes, and an operator who hits it can neither reuse the slug nor see the half-provisioned tenant
+   from outside. A compensating delete, or writing the registry row last, is the fix; the demo's own
+   recovery was a second slug.
+10. **A compile with no candidates still looks exactly like a compile whose session is new.** The demo
+    needed a stable `Authorization` header before any memory was retrieved: without one, `deriveSessionID`
+    falls back to a per-conversation fingerprint, so a dozen distinct messages are a dozen sessions and
+    `original_candidates=0` on every request — the same log line an empty store produces (Phase 23 finding
+    3). The metering rows for those requests faithfully record `raw_tokens 0`, which is correct and useless
+    for telling the two cases apart; a `candidates_considered`-style field (Phase 24 finding 2) would fix
+    both.
+
+Nothing carried over from Phases 17-25 has moved except the one item this phase was named for. The
+external anchor for each tenant's chain head (Phase 17 finding 2, Phase 18 finding 6, Phase 20 finding 8)
+is still what makes "the chain was deleted" and "nothing was ever appended" the same answer;
+`tenant.RunMigrations`' advisory lock (Phase 20 finding 1) is still the smallest — and still unfixed after
+a phase that ran migrations against a live database; the compliance-tier provisioning field still belongs
+with whichever phase next touches `POST /v2/tenants`, which is also where finding 9 above lands; recording
+`GET /v2/compliance/chain-integrity`'s successful reads (Phase 21 finding 1) is still small enough to ride
+along; and the two fidelity gaps that now sit next to each other — the ledgered trace's zeroed tokens
+(finding 2 above) and a compile that cannot say why it retrieved nothing (finding 10) — are the pair a
+reporting phase would close first, because this phase made the numbers they feed real.
+

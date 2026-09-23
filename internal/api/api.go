@@ -373,6 +373,27 @@ func (a *APIServer) runCompilePipeline(ctx context.Context, sessionID string, me
 		compileResult.Trace.ReductionPct = float64(compileResult.Trace.CandidatePoolTokens-totalTokens) / float64(compileResult.Trace.CandidatePoolTokens) * 100
 	}
 
+	// Phase 26: usage metering, on the same terms the live proxy path uses --
+	// one event per compilation the tenant asked for, written off the request
+	// path by the sink internal/compiler holds. persist is the "real traffic"
+	// switch this pipeline already has: it is true for POST /v1/compile and for
+	// the MCP surface's synapse_compile (both of which CompileContext drives)
+	// and false for the playground, which is this operator's own UI rather than
+	// a tenant's compilation -- metering it would bill a tenant for its own
+	// dashboard. The token counts are the same pair the live path reports, read
+	// from the trace this pipeline just finished annotating.
+	if persist {
+		compiler.RecordUsage(compiler.UsageEvent{
+			AgentID:        a.config.AgentID,
+			SessionID:      sessionID,
+			RawTokens:      compileResult.Trace.CandidatePoolTokens,
+			CompiledTokens: totalTokens,
+			ReductionPct:   compileResult.Trace.ReductionPct,
+			Model:          a.config.UpstreamModel,
+			CreatedAt:      time.Now(),
+		})
+	}
+
 	return compileResult, nil
 }
 

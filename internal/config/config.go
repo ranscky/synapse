@@ -25,6 +25,15 @@ const EnvPlaneKey = "SYNAPSE_PLANE_KEY"
 // Config represents the application configuration
 type Config struct {
 	UpstreamURL              string   `yaml:"upstream-url"`
+	// UpstreamModel is the operator's own label for the model the upstream
+	// serves (e.g. "llama3.1:8b"). Nothing about proxying reads it: the proxy
+	// is provider-agnostic and forwards whatever the client asked for, so this
+	// value never reaches the upstream and is never taken from a request. Its
+	// one reader is the usage event (internal/compiler's UsageEvent, written by
+	// internal/metering), which records it so a tenant's usage rows say which
+	// model the savings were measured against. Blank -- the default -- records
+	// no model rather than an empty one.
+	UpstreamModel            string   `yaml:"upstream-model"`
 	AllowedUpstreamHosts     []string `yaml:"allowed-upstream-hosts"`
 	ListenAddr               string   `yaml:"listen-addr"`
 	TokenBudget              int      `yaml:"token-budget"`
@@ -190,6 +199,7 @@ func DefaultConfig() *Config {
 	
 	return &Config{
 		UpstreamURL:              "", // Must be provided via config or flag
+		UpstreamModel:            "", // Blank: usage rows record no model rather than an empty one
 		ListenAddr:               "127.0.0.1:8080",
 		TokenBudget:              3000,
 		EmbedderType:             "onnx",

@@ -99,6 +99,18 @@ var migrations = []migration{
 )`,
 	},
 	{
+		// The index the metering write path's readers need: usage_events is
+		// queried by (tenant_id, created_at) window and by nothing else (see
+		// internal/ledger/report.go's totals query). It is added in the phase
+		// that started writing rows rather than in a phase that read an empty
+		// table -- PROGRESS.md's Phase 20 finding 6 named this phase for it.
+		// Named explicitly for the reason ledger_tenant_created_idx is: CREATE
+		// INDEX has no unnamed form, so the name is what makes IF NOT EXISTS
+		// possible.
+		name: "usage_events_tenant_created_idx",
+		sql:  `CREATE INDEX IF NOT EXISTS usage_events_tenant_created_idx ON ` + SchemaName + `.usage_events (tenant_id, created_at)`,
+	},
+	{
 		// The audit ledger: one row per compiled request, append-only. tenant_id
 		// and request_id carry no foreign key on purpose -- the ledger has to be
 		// able to record a request for a tenant row that has since been frozen or

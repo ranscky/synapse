@@ -233,6 +233,20 @@ func main() {
 			defer closeLedger()
 			slog.Info("Audit ledger enabled: every compiled trace is appended for this enterprise tenant")
 		}
+
+		// Phase 26: the same node records one usage event per successful
+		// compilation, for every plan rather than for enterprise alone (see
+		// cmd/synapse/meter.go). It needs the same two things the ledger needs
+		// -- a credential that names a tenant and a database -- and it fails
+		// the same soft way: a node that cannot be metered still compiles.
+		closeMeter, meteringEnabled, err := enableMetering(*cfg)
+		switch {
+		case err != nil:
+			slog.Warn("Usage metering disabled", "error", err)
+		case meteringEnabled:
+			defer closeMeter()
+			slog.Info("Usage metering enabled: every compiled request records a usage event")
+		}
 	}
 
 	// If the configured model path isn't found relative to the current
@@ -596,6 +610,11 @@ func runInitCommand(explicitPath string, interactive bool) {
 
 # Required: Upstream model server URL (must start with http:// or https://)
 upstream-url: "` + upstreamURL + `"
+
+# Optional label for the model the upstream serves (e.g. "llama3.1:8b"). Used
+# only in usage metering, which records the model each saving was measured
+# against. Leave blank to record no model.
+upstream-model: ""
 
 # Listen address for the proxy (must default to 127.0.0.1 for security)
 listen-addr: "127.0.0.1:8080"
