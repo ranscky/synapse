@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +82,39 @@ func writeFakeTool(t *testing.T, dir, name, script string) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(script), 0o700))
 }
 
+// rendererStubUnsupportedReason is why the PATH-based stubs above cannot stand in for a
+// renderer on Windows.
+//
+// The stubs are `#!/bin/sh` programs with no filename extension, because that is what
+// exec.LookPath resolves from the bare candidate names findPDFTool searches for on a
+// POSIX host: PATH is the real mechanism a deployment relies on, and a script sitting in
+// a directory on PATH is exactly an installed renderer. Windows has no equivalent
+// lookup -- LookPath there requires the candidate to carry one of PATHEXT's extensions
+// (.exe, .bat, .cmd, ...) -- so an extensionless file on PATH is never found, and the
+// endpoint answers 503 for a reason that is a fact about this fixture rather than about
+// the endpoint. A .bat stub would not remove the difference: cmd.exe cannot be handed
+// the Chromium argument shape this package builds without a parser of its own, and its
+// output redirection appends the CRLF the assertions above would then have to special
+// case per platform. Making the test platform-conditional is the honest form of that,
+// and the rendering path stays covered by the ubuntu and macos CI legs -- the
+// deployments this endpoint targets in the first place.
+const rendererStubUnsupportedReason = "POSIX-only fixture: the fake renderer is an " +
+	"extensionless `#!/bin/sh` script, which exec.LookPath cannot resolve on Windows " +
+	"(it requires a PATHEXT extension), so the endpoint answers 503 before any render " +
+	"is attempted; the render path is covered by the ubuntu and macos CI legs"
+
+// skipRendererStubOnWindows skips a test whose only means of exercising the endpoint is
+// the POSIX renderer stub above. Tests that need no renderer -- the 503 case and the
+// template cases -- call nothing here and run on every platform, so a Windows leg still
+// covers everything on this endpoint that does not depend on a fake executable.
+func skipRendererStubOnWindows(t *testing.T) {
+	t.Helper()
+
+	if runtime.GOOS == "windows" {
+		t.Skip(rendererStubUnsupportedReason)
+	}
+}
+
 // wkhtmltopdfStub is a stand-in wkhtmltopdf: record the arguments, copy the input
 // document where the test can read it, write the output file it was given.
 //
@@ -129,6 +163,8 @@ func chromiumStub(argvLog, htmlCopy string) string {
 // arguments are read back and asserted to be the flags this build defines plus two paths
 // inside a temp directory, with no query value in sight.
 func TestComplianceReportPDFRendersThroughTheInstalledRenderer(t *testing.T) {
+	skipRendererStubOnWindows(t)
+
 	dir := t.TempDir()
 	t.Setenv("PATH", dir)
 
@@ -207,6 +243,8 @@ func TestComplianceReportPDFRendersThroughTheInstalledRenderer(t *testing.T) {
 // the argument shape is different enough (a flag carrying the output path, a file:// URL
 // for the input) that it is worth asserting rather than assuming.
 func TestComplianceReportPDFRendersThroughChromium(t *testing.T) {
+	skipRendererStubOnWindows(t)
+
 	dir := t.TempDir()
 	t.Setenv("PATH", dir)
 
@@ -243,6 +281,8 @@ func TestComplianceReportPDFRendersThroughChromium(t *testing.T) {
 // window: built from the parsed window's own halves, formatted here rather than echoed
 // from the query, so no caller-supplied text can reach a Content-Disposition header.
 func TestComplianceReportPDFNamesABoundedWindow(t *testing.T) {
+	skipRendererStubOnWindows(t)
+
 	dir := t.TempDir()
 	t.Setenv("PATH", dir)
 
@@ -294,6 +334,8 @@ func TestComplianceReportPDFAnswers503WithoutARenderer(t *testing.T) {
 // this package's generic 500 -- the path is deployment configuration -- and the failure
 // reaches the log with the format, so an operator can see which request failed and why.
 func TestComplianceReportPDFRefusesAMissingTemplate(t *testing.T) {
+	skipRendererStubOnWindows(t)
+
 	dir := t.TempDir()
 	t.Setenv("PATH", dir)
 

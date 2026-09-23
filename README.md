@@ -345,6 +345,8 @@ With those set, the node keeps storing memories locally *and* syncs them to the 
 
 The value in `control-plane-api-key` must be the **JWT** provisioning returned, not the plaintext `api_key`: the sync and search routes verify a signed token, and `api_key` is stored as a bcrypt row. Never commit a DSN or a key — `database-dsn` (or `SYNAPSE_DB_DSN`) carries a database password.
 
+If the tenant's compliance tier is `enterprise`, the node also starts appending its compiled traces to the plane's audit ledger, and that writer needs the plane's `SYNAPSE_MASTER_KEY` (the same 64-hex-character value the plane runs with) to unwrap the tenant's signing secret. Without it the node logs `ledger: append failed ... SYNAPSE_MASTER_KEY is required to wrap tenant secrets` and serves the request anyway — a failed ledger append never fails a compile — but the chain that tenant's compliance report reads will have a hole in it.
+
 ### 3. Provision a tenant
 
 ```bash
@@ -454,6 +456,16 @@ The Digital Omnibus on AI moved the high-risk deadline out; it did **not** move 
 - **A queryable audit history.** `GET /v2/compliance/audit` pages a tenant's own signed entries, newest first, over a caller-chosen window, and records an access row for every read — refused reads included.
 - **A PDF compliance report.** `GET /v2/compliance/report?format=pdf` renders the JSON report — period, volume, memory-type mix, contradiction and supersession handling, chain verdict, Article 50 statement — as a print-ready A4 document.
 
+#### The PDF needs an HTML-to-PDF renderer on the plane's host
+
+The endpoint does not bundle a renderer. It looks for one on the host's `PATH`, in this order: `wkhtmltopdf`, `chromium`, `chromium-browser`, `google-chrome`, `google-chrome-stable`. With none installed it answers, rather than failing obscurely:
+
+```json
+503 {"error":"pdf_tool_unavailable","message":"install wkhtmltopdf to enable PDF reports"}
+```
+
+The self-hosted compose image does **not** include one, so `format=pdf` answers that 503 out of the box; the JSON report at the same route (`format=json`, the default) needs no renderer and always works. To get PDFs from the compose stack, either install `wkhtmltopdf`/`chromium` in the plane's runtime image, or run the plane binary directly on a host that already has a browser. Every actual render was measured against `google-chrome` and produced a two-page A4 document in 3.7–12.6 seconds, bounded by the endpoint's own 60-second ceiling.
+
 ### Retention
 
 `ledger-retention-days` in `synapse-plane.yaml` (default `365`) declares the window your reporting and archival tooling treats as online history. The ledger table is append-only and is never updated or deleted, so this value never removes a row; a policy that needs longer must archive rather than rely on the plane. Recommended windows are in [COMPLIANCE.md](COMPLIANCE.md#retention-policy-recommendations).
@@ -486,6 +498,27 @@ go build -o synapse ./cmd/synapse
 
 CI runs on every push/PR to `main` across all three OSes, installs ONNX Runtime and downloads the real model so the ONNX inference path is actually exercised rather than silently falling back to hash-based embeddings. Tagged pushes (`v*`) trigger the release workflow, which builds and bundles a self-contained archive per platform.
 
+### Testing a dev build: the Homebrew binary shadows it
+
+If you installed Synapse with Homebrew, the release binary lives in Homebrew's prefix — `/opt/homebrew/bin/synapse` on Apple Silicon, `/home/linuxbrew/.linuxbrew/bin/synapse` on Linux, `/usr/local/bin/synapse` on Intel macOS — and that directory comes **before** the repository on `PATH`. A bare `synapse ...` therefore runs the *installed* release build, not the one you just produced with `go build -o synapse ./cmd/synapse`:
+
+```bash
+which synapse
+# /home/linuxbrew/.linuxbrew/bin/synapse   <- not your dev build
+```
+
+The symptom is that a change appears to have no effect: a new flag is missing from `--help`, a log line never shows up, a fix doesn't take. Nothing is wrong with the build — it was never the binary that ran.
+
+```bash
+./synapse --config ./synapse.yaml    # run the dev build explicitly
+# or put the repo first for this shell:
+export PATH="$PWD:$PATH"
+# or remove the installed copy entirely:
+brew uninstall synapse
+```
+
+This bites hardest right after `brew install synapse` on a machine that is also a development checkout, because both binaries are valid and only one of them is new.
+
 ---
 
 ## Known limitations
@@ -500,6 +533,7 @@ Being upfront about what's not finished yet:
 - **Intel macOS is not in the pre-built release matrix** — the release archives target Apple Silicon (arm64) only; Intel Mac users build manually per [Option 3 — Manual build](#option-3--manual-build).
 - **A newly provisioned tenant cannot read the compliance surfaces.** `POST /v2/tenants` always mints the `team` compliance tier, so `/v2/compliance/audit`, `/v2/compliance/chain-integrity`, and `/v2/compliance/report` answer `403` for it. Minting an enterprise tier over HTTP is an open item — see [COMPLIANCE.md](COMPLIANCE.md#before-you-start-the-tier-gate).
 - **Resetting the SQLite store means deleting three files** — `synapse.db`, `synapse.db-wal`, and `synapse.db-shm`. Deleting only the main file leaves SQLite broken. See [Resetting the store](#resetting-the-store).
+- **A Homebrew install shadows a dev build.** `brew install synapse` puts a release binary in Homebrew's prefix, which precedes the repository on `PATH`, so a bare `synapse` can run the installed copy instead of the one you just built. See [Testing a dev build](#testing-a-dev-build-the-homebrew-binary-shadows-it).
 - **Single-developer project, pre-v1** — no design partners or production deployments yet.
 - **`allowed-upstream-hosts` allowlist** is optional and off by default; if security matters for your deployment, set it explicitly.
 

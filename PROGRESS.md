@@ -7928,3 +7928,152 @@ the cold start real rather than simulated; a third push policy between distilled
 session's own compile selected, bounded by the budget — which is the pool shape a real agent's write-back produces;
 and reconciling the README's quoted number with what the tool prints (finding 1).
 
+
+---
+
+## Phase 31 — README v2 and COMPLIANCE.md (complete)
+
+### What this phase is
+
+Two documents, and the release's account of itself. `README.md` grew by 187 lines into the v2 story: the
+Global Brain setup walkthrough (start the plane, point a node at it, provision a tenant), the MCP setup
+section including the OpenMemory MCP comparison that names the score breakdown as the difference, the signed
+ledger and the three compliance surfaces, the Homebrew quickstart with its `brew trust` step, and a Known
+limitations section that says out loud what is not finished. `COMPLIANCE.md` is new — 241 lines, written for
+the compliance officer rather than the developer: what the ledger records, what chain integrity does and does
+not prove, the one-turn-late supersession property, retention recommendations, and the Article 50 statement
+verbatim.
+
+### Note on this entry
+
+Written in Phase 32. The Phase 31 build session closed without a PROGRESS.md entry, which this project's phase
+discipline asks for ("Update PROGRESS.md after each phase before closing"). Nothing here is recalled from that
+session: it is what commit `ad95c0d` and the two files themselves show, recorded so the log has no hole
+between Phase 30 and Phase 32.
+
+### Next phase
+
+Phase 32: the final QA checklist before the v2.0.0 tag.
+
+
+---
+
+## Phase 32 — final QA checklist (complete)
+
+### What this phase is
+
+The checklist that gates `v2.0.0`: twenty-three items covering both platforms' builds and suites, the compose
+stack's start-up cost, cross-tenant isolation, the offline fallback, multi-agent provenance, conflict
+detection and its demotion, the ledger's chain integrity at a hundred entries and under tampering, the
+ledger's append-only grants at the database, the compliance PDF, the compliance tier gate, the MCP tools'
+result shapes, the header-redaction guarantee, both benchmark targets, the suspended-tenant and webhook
+paths, and the four documentation disclosures. Every item was run and its real output recorded; the two that
+needed code are the first two findings below.
+
+### The one code defect the checklist found
+
+**CI was red, and had been since Phase 20.** The last two runs on `main` failed, and the six commits after
+them — Phases 26 through 31 — had never been pushed, so CI had never compiled them at all. The failing job
+was `test (windows-latest)`, and the cause was not the plane: four tests in
+`internal/plane/compliance_report_pdf_test.go` fake an HTML-to-PDF renderer by writing an extensionless
+`#!/bin/sh` script into a temp directory and pointing `PATH` at it. Windows' `exec.LookPath` requires a
+`PATHEXT` extension, so the stub was never found and the endpoint answered `503 pdf_tool_unavailable` — for a
+reason that was a fact about the fixture rather than about the endpoint. The four renderer-dependent tests now
+call `skipRendererStubOnWindows`, whose skip message names the mechanism; the 503 case and the three template
+cases — everything on that endpoint that needs no fake executable — still run on Windows. The render path
+itself stays covered by the ubuntu and macos legs, which are the deployments this endpoint targets.
+
+`go test ./...` on Linux amd64 and the Windows cross-compile of the affected package both pass locally, and
+the ubuntu/macos/windows matrix was re-run on the push that carries this phase.
+
+### The checklist, item by item
+
+Every number below is from a run on this machine (Linux amd64, Go 1.26.2) unless the row says CI.
+
+| # | Item | Result |
+|---|---|---|
+| 1 | `go build ./...` clean, both platforms | clean locally; Windows cross-vet clean; CI re-run on the phase push |
+| 2 | `go test ./...` clean, both platforms | `exit 0`, every package `ok` locally; CI re-run on the phase push |
+| 3 | `docker compose up` → `/health` 200 in < 2 min | **28 s**, `{"status":"ok","version":"2.0.0","db":"connected"}` |
+| 4 | Cross-tenant isolation | `TestCrossTenantIsolation` PASS — 5 subtests, 10 random queries all empty |
+| 5 | Offline fallback | compile **200** with the plane stopped, `WARN ... falling back to local search plane_unavailable=true`; `sync_pending=2` → `synced=6` after restart |
+| 6 | Multi-agent `cross_agent=true` | `TestMultiAgent` PASS — `STEP c: entry id=89e1d199… agent_id=agent_a cross_agent=true` |
+| 7 | Conflict → superseded candidate at 0.5× | `TestMultiAgent` STEP e: candidate `total=0.2500` vs conflicting `total=0.5000`; new reversed-order test: `0.900000 × 0.5 = 0.450000` |
+| 8 | 100-entry chain verifies | `{"entries_checked":100,"chain_valid":true}` |
+| 9 | Tamper entry 47 | `{"entries_checked":47,"chain_valid":false,"first_break_id":"0a93107c-…"}` — entry 47's own id |
+| 10 | `UPDATE` on the ledger refused | `UPDATE refused: SQLSTATE 42501: permission denied for table ledger` |
+| 11 | Compliance PDF downloads | `HTTP 200`, `Content-Type: application/pdf`, **58 216 bytes** (empty period) and **54 452 bytes** (populated), `file`: *PDF document, version 1.4, 2 page(s)*, text extracted with `pdftotext` |
+| 12 | `/v2/compliance/*` 403 for non-enterprise | `TestComplianceGate` PASS — 9/9 (three surfaces × enterprise/business/team) |
+| 13 | MCP search returns the breakdown | over a real stdio MCP session: `score_s`, `score_r`, `score_i`, `score_t`, `score_total`, `trace_id` |
+| 14 | MCP compile returns `compiled_messages` | over the same session: `synapse_compile` → `compiled_messages`, `tokens_used=292`, `reduction_pct=36.66`, `trace_id`. A real Cline session cannot be driven from a script; the README's MCP setup section is the reproduction |
+| 15 | No `Authorization`/`x-api-key` in log output | 0 matches of either name in a header-value position; the 14 matches in `-v` output are all subtest names (`TestSanitizeHeaders/Remove_Authorization_header`) |
+| 16 | v1 established ≥ 40% | `Raw: 5569 \| Compiled: 2999 \| Reduction: 46.1%` |
+| 17 | Global Brain ≥ 55% | `Raw: 5569 \| Compiled: 381 \| Reduction: 93.2%`, uplift +47.0% |
+| 18 | Suspended tenant 402 | `TestTenantStatusSuspendedTenantIsRefusedWith402` PASS |
+| 19 | Invalid Stripe signature 400 | `TestWebhookRejectsInvalidSignature` PASS — 3 subtests, 0 skips |
+| 20 | SQLite WAL cleanup documented | present, README §Resetting the store |
+| 21 | Stale-Homebrew-binary warning | added, README §Development (and a Known limitations bullet) |
+| 22 | Apple Silicon disclosure | present |
+| 23 | Intel macOS disclosure | present |
+
+### Findings
+
+1. **The conflict item's wording is order-dependent, not wrong** — and the checklist got Option 1: no
+   production change. It reads "Postgres vs MySQL memory → MySQL is superseded_candidate, scored 0.5x", but
+   the shipped rule is directional: the memory persisted *first* becomes the candidate and the memory written
+   *second* is `conflict`. With Postgres written first, Postgres is the candidate — which is what
+   `TestMultiAgent` and `TestConflictMarksBothMemories` both assert, and which one live trace shows as
+   `0.2500` against the challenger's `0.5000`. Reversing the product's rule to satisfy the checklist literally
+   would demote the *current* decision and rank the stale one above it, which is the wrong answer for a
+   context compiler. The checklist is satisfied instead by `conflict_order_test.go`, which writes MySQL first
+   and asserts MySQL is the candidate at exactly `0.5 ×` the other's score — the same rule, the other order.
+2. **The same breakdown has two wire names.** `synapse_search_memories` returns `score_s`/`score_r`/`score_i`/
+   `score_t` (matching the checklist); `synapse_compile` returns `score_semantic`/`score_recency`/
+   `score_importance`/`score_task_alignment`. Both carry `score_total` and are documented, but an editor
+   rendering both tools sees two shapes for one concept. Also, the tool is
+   `synapse_search_memories`, not `synapse_search`.
+3. **The checklist's Global Brain command cannot work as written.** `--plane` requires `--api-key` (the tenant
+   JWT); without it `globalBrainOptionsFromFlags` fails and the process exits. The measured run was
+   `--plane http://127.0.0.1:9090 --api-key <jwt>`.
+4. **The compose plane image ships no HTML-to-PDF renderer**, so `GET /v2/compliance/report?format=pdf`
+   answers `503 pdf_tool_unavailable` out of the box on the stack the README tells self-hosters to start. The
+   README now says so explicitly, names the five programs it looks for, and points at the two workarounds;
+   bundling `chromium` in `deploy/Dockerfile.plane` is the alternative and is left as a product decision.
+   Item 11's render was produced by the plane binary on a host with `google-chrome`
+   (`renderer=google-chrome bytes=58216` in the plane's own log).
+5. **`internal/store.NewStoreFromConfig` is dead code.** `cmd/synapse` calls `store.NewStore(cfg.DBPath)`
+   unconditionally, so a node with `control-plane-url` set still stores its memories locally in SQLite — which
+   is exactly the behaviour the checklist's "compilation continues from local sqlite-vec" assumes, and the
+   opposite of what `synapse.yaml.example` states ("Set it and the process stores memories in the named
+   tenant's Postgres schema instead of the local SQLite file") and of `factory.go`'s own doc comment. One of
+   the two has to move; the example file is the one that is wrong today.
+6. **An edge node whose tenant is `enterprise` needs `SYNAPSE_MASTER_KEY`** or every compile logs
+   `ledger: append failed ... SYNAPSE_MASTER_KEY is required to wrap tenant secrets`. The request still
+   succeeds — a failed ledger append never fails a compile, by design — but the tenant's chain silently gets a
+   hole, which is the one thing an audit ledger exists to prevent. Now documented in the README's Global
+   Brain setup; the compose stack already passes the key to the plane.
+7. **Item 11 cannot be verified through the public API alone.** `POST /v2/tenants` hard-codes the `team`
+   compliance tier (`defaultComplianceTier`), and the gate reads the *token claim*, so no tenant created over
+   HTTP can reach a compliance surface — updating the registry row is not enough. The live curl therefore used
+   a dev-signed token carrying `compliance_tier: enterprise`. This is Phase 21's and Phase 30's finding again,
+   now with a cost attached: a release-blocking checklist item needed out-of-band token minting to be checked.
+8. **Phase 31 closed without a PROGRESS.md entry**, against the project's own phase discipline. Written
+   retroactively from commit `ad95c0d` and the two artifacts, and marked as such.
+9. **`bin/synapse` is a tracked 16 MB binary** and was dirty in the working tree from a rebuild to 25 MB; it
+   was restored rather than committed. `/bin/plane` is in `.gitignore` and `bin/synapse` is not, so the
+   repository carries one build artifact and ignores its sibling — the tracked one should probably follow it
+   out of the tree.
+10. **The README's MCP setup spawns `"command":"synapse"`**, which on this machine resolves to the Homebrew
+    binary (`/home/linuxbrew/.linuxbrew/bin/synapse`) rather than a dev build — the stale-binary gotcha
+    finding 5 records, landing on the one config file a developer is most likely to edit. An absolute path in
+    the example would remove the trap.
+
+### Next phase
+
+The highest-value follow-up is the one three phases have now run into: a supported way to provision an
+enterprise compliance tier, because until it exists the compliance surfaces cannot be exercised through the
+public API at all — not by a customer, and not by a checklist. After it, in rough order: wiring
+`NewStoreFromConfig` (or deleting it and correcting `synapse.yaml.example`, finding 5); deciding whether the
+plane image bundles a PDF renderer (finding 4); the two wire names for one score breakdown (finding 2); and
+the tracked `bin/synapse` artifact (finding 9).
+

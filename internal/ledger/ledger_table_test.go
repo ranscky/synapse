@@ -185,6 +185,11 @@ func requirePermissionDenied(ctx context.Context, t *testing.T, pool *pgxpool.Po
 		"%s must fail with insufficient_privilege (42501), got %s: %s", operation, pgErr.Code, pgErr.Message)
 	assert.Contains(t, pgErr.Message, "permission denied",
 		"%s must be refused for lack of privilege, got %q", operation, pgErr.Message)
+
+	// Logged as well as asserted. The refusal's own text is the artifact a reviewer of
+	// this guarantee asks to see, and an all-green suite would otherwise report only
+	// that some statement was expected to fail.
+	t.Logf("%s refused: SQLSTATE %s: %s", operation, pgErr.Code, pgErr.Message)
 }
 
 // TestLedgerTablePermissions is the Phase 15 guarantee checked against a real
